@@ -1,4 +1,5 @@
 name: Android Build
+# Rebuild after permanent signing secrets were configured
 
 on:
   push:
