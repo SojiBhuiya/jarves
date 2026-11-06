@@ -46,6 +46,10 @@ jobs:
 
       - name: Build signed release APK
         if: steps.signing.outputs.available == 'true'
+        env:
+          JARVES_KEYSTORE_PASSWORD: ${{ secrets.JARVES_KEYSTORE_PASSWORD }}
+          JARVES_KEY_ALIAS: ${{ secrets.JARVES_KEY_ALIAS }}
+          JARVES_KEY_PASSWORD: ${{ secrets.JARVES_KEY_PASSWORD }}
         run: gradle assembleRelease
 
       - name: Upload debug APK
