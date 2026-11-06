@@ -57,8 +57,9 @@ class MainActivity : ComponentActivity() {
 private fun JarvesApp() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    // null means DataStore has not emitted yet; an empty string means first launch.
     val savedName by context.jarvesDataStore.data
-        .map { preferences -> preferences[ASSISTANT_NAME] }
+        .map { preferences -> preferences[ASSISTANT_NAME].orEmpty() }
         .collectAsState(initial = null)
 
     var nameInput by remember(savedName) { mutableStateOf(savedName.orEmpty()) }
