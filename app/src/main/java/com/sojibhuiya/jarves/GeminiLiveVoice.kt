@@ -159,25 +159,41 @@ class GeminiLiveVoice(
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 setupTimeout?.cancel(false)
+                val diagnostics = diagnosticSummary()
                 stopAudio()
                 running.set(false)
                 val http = response?.let { "HTTP ${it.code}: ${it.message}" }
-                onError("Gemini Live সংযোগ ব্যর্থ: ${http ?: t.message ?: "network error"}")
+                onError("Gemini Live সংযোগ ব্যর্থ: ${http ?: t.message ?: "network error"}\n$diagnostics")
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 setupTimeout?.cancel(false)
-                if (running.get()) onError("Gemini সংযোগ বন্ধ করছে (code $code): ${reason.ifBlank { "কারণ জানায়নি" }}")
+                // Wait for onClosed so the final diagnostic is displayed only once.
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 setupTimeout?.cancel(false)
+                val diagnostics = diagnosticSummary()
                 stopAudio()
                 running.set(false)
-                if (code != 1000 && reason.isNotBlank()) onError("Gemini session বন্ধ (code $code): $reason")
-                else onStatus("Live session বন্ধ হয়েছে")
+                if (code != 1000 || reason.isNotBlank()) {
+                    onError("Gemini session বন্ধ (code $code): ${reason.ifBlank { "কারণ জানায়নি" }}\n$diagnostics")
+                } else {
+                    onStatus("Live session বন্ধ হয়েছে\n$diagnostics")
+                }
             }
         })
+    }
+
+    private fun diagnosticSummary(): String {
+        val chunks = audioChunksSent.get()
+        val bytes = audioBytesSent.get()
+        val micState = when (recorder?.recordingState) {
+            AudioRecord.RECORDSTATE_RECORDING -> "চালু"
+            AudioRecord.RECORDSTATE_STOPPED -> "বন্ধ"
+            else -> "চালু হয়নি/অজানা"
+        }
+        return "Audio chunks: $chunks | Bytes: $bytes | Microphone: $micState"
     }
 
     private fun fail(message: String) {
