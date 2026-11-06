@@ -14,7 +14,10 @@ import okhttp3.WebSocketListener
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Gemini Live audio-to-audio transport.
@@ -36,6 +39,12 @@ class GeminiLiveVoice(
 
     private val running = AtomicBoolean(false)
     private val setupDone = AtomicBoolean(false)
+    private val audioChunksSent = AtomicLong(0)
+    private val audioBytesSent = AtomicLong(0)
+    private val setupTimer = Executors.newSingleThreadScheduledExecutor { task ->
+        Thread(task, "gemini-setup-timeout").apply { isDaemon = true }
+    }
+    @Volatile private var setupTimeout: ScheduledFuture<*>? = null
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .build()
@@ -83,8 +92,15 @@ class GeminiLiveVoice(
                         .put("inputAudioTranscription", JSONObject())
                         .put("outputAudioTranscription", JSONObject()))
                 if (!webSocket.send(setup.toString())) {
-                    fail("Gemini setup পাঠানো যায়নি")
+                    fail("Gemini setup পাঠানো যায়নি: WebSocket send queue বন্ধ")
+                    return
                 }
+                setupTimeout?.cancel(false)
+                setupTimeout = setupTimer.schedule({
+                    if (running.get() && !setupDone.get()) {
+                        fail("১৫ সেকেন্ডেও Gemini setupComplete আসেনি। নেটওয়ার্ক, model access এবং Live API response পরীক্ষা করুন।")
+                    }
+                }, 15, TimeUnit.SECONDS)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -101,6 +117,8 @@ class GeminiLiveVoice(
 
                     if (root.has("setupComplete")) {
                         setupDone.set(true)
+                        setupTimeout?.cancel(false)
+                        setupTimeout = null
                         startAudioPlayback()
                         startAudioCapture()
                         onStatus("সংযুক্ত। এখন কথা বলুন")
@@ -140,6 +158,7 @@ class GeminiLiveVoice(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                setupTimeout?.cancel(false)
                 stopAudio()
                 running.set(false)
                 val http = response?.let { "HTTP ${it.code}: ${it.message}" }
@@ -147,10 +166,12 @@ class GeminiLiveVoice(
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                setupTimeout?.cancel(false)
                 if (running.get()) onError("Gemini সংযোগ বন্ধ করছে (code $code): ${reason.ifBlank { "কারণ জানায়নি" }}")
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                setupTimeout?.cancel(false)
                 stopAudio()
                 running.set(false)
                 if (code != 1000 && reason.isNotBlank()) onError("Gemini session বন্ধ (code $code): $reason")
@@ -160,6 +181,8 @@ class GeminiLiveVoice(
     }
 
     private fun fail(message: String) {
+        setupTimeout?.cancel(false)
+        setupTimeout = null
         if (running.getAndSet(false)) {
             try { socket?.close(1002, "Session setup failed") } catch (_: Exception) {}
             stopAudio()
@@ -188,6 +211,10 @@ class GeminiLiveVoice(
             }
             recorder = audioRecord
             audioRecord.startRecording()
+            if (audioRecord.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                throw IllegalStateException("AudioRecord startRecording-এর পরও recording state active হয়নি")
+            }
+            onStatus("সংযুক্ত। মাইক্রোফোন চালু, অডিও পাঠানো হচ্ছে…")
 
             captureThread = Thread({
                 val buffer = ByteArray(CHUNK_BYTES)
@@ -201,7 +228,26 @@ class GeminiLiveVoice(
                                 .put("mimeType", "audio/pcm;rate=16000")
                                 .put("data", payload))
                         )
-                        socket?.send(message.toString())
+                        val activeSocket = socket
+                        if (activeSocket == null || !activeSocket.send(message.toString())) {
+                            fail("মাইক্রোফোন অডিও WebSocket-এ পাঠানো যায়নি। পাঠানো chunk: ${audioChunksSent.get()}")
+                            break
+                        }
+                        val chunks = audioChunksSent.incrementAndGet()
+                        audioBytesSent.addAndGet(count.toLong())
+                        if (chunks % 50L == 0L) {
+                            onStatus("সংযুক্ত। মাইক্রোফোন থেকে $chunks audio chunks পাঠানো হয়েছে (${audioBytesSent.get()} bytes)")
+                        }
+                    } else if (count < 0) {
+                        val reason = when (count) {
+                            AudioRecord.ERROR -> "AudioRecord.ERROR"
+                            AudioRecord.ERROR_BAD_VALUE -> "AudioRecord.ERROR_BAD_VALUE"
+                            AudioRecord.ERROR_INVALID_OPERATION -> "AudioRecord.ERROR_INVALID_OPERATION"
+                            AudioRecord.ERROR_DEAD_OBJECT -> "AudioRecord.ERROR_DEAD_OBJECT"
+                            else -> "AudioRecord read error $count"
+                        }
+                        fail("Microphone read ব্যর্থ: $reason। পাঠানো chunk: ${audioChunksSent.get()}")
+                        break
                     }
                 }
             }, "gemini-live-mic").apply { isDaemon = true; start() }
@@ -258,6 +304,9 @@ class GeminiLiveVoice(
     }
 
     private fun stopAudio() {
+        setupTimeout?.cancel(false)
+        setupTimeout = null
+        setupTimer.shutdownNow()
         try { recorder?.stop() } catch (_: Exception) {}
         try { recorder?.release() } catch (_: Exception) {}
         recorder = null
