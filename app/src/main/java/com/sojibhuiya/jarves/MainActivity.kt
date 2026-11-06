@@ -256,7 +256,7 @@ private fun HomeScreen(assistantName: String, onEditName: () -> Unit) {
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) {
-            startBanglaListening(speechRecognizer) { speechStatus = it; isListening = true }
+            startBanglaListening(speechRecognizer) { speechStatus = it }
         } else {
             speechStatus = "ভয়েস ইনপুটের জন্য মাইক্রোফোন অনুমতি দিতে হবে"
         }
