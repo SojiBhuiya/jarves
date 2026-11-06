@@ -174,7 +174,7 @@ class GeminiLiveVoice(
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 setupTimeout?.cancel(false)
                 val http = response?.let { "HTTP ${it.code}: ${it.message}" }
-                val message = "Gemini Live সংযোগ ব্যর্থ: ${http ?: t.message ?: "network error"}\\n${diagnosticSummary()}"
+                val message = "Gemini Live সংযোগ ব্যর্থ: ${http ?: t.message ?: "network error"}\n${diagnosticSummary()}"
                 running.set(false)
                 stopAudio()
                 if (terminalErrorReported.compareAndSet(false, true)) onError(message)
@@ -182,7 +182,7 @@ class GeminiLiveVoice(
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 setupTimeout?.cancel(false)
-                onStatus("Gemini server সংযোগ বন্ধ করছে (code $code): ${reason.ifBlank { "কারণ জানায়নি" }}\\n${diagnosticSummary()}")
+                onStatus("Gemini server সংযোগ বন্ধ করছে (code $code): ${reason.ifBlank { "কারণ জানায়নি" }}\n${diagnosticSummary()}")
                 // Wait for onClosed; preserve any earlier terminal error.
             }
 
@@ -194,9 +194,9 @@ class GeminiLiveVoice(
                 if (!terminalErrorReported.get()) {
                     if (code != 1000 || reason.isNotBlank()) {
                         terminalErrorReported.set(true)
-                        onError("Gemini session বন্ধ (code $code): ${reason.ifBlank { "কারণ জানায়নি" }}\\n$diagnostics")
+                        onError("Gemini session বন্ধ (code $code): ${reason.ifBlank { "কারণ জানায়নি" }}\n$diagnostics")
                     } else {
-                        onStatus("Live session বন্ধ হয়েছে\\n$diagnostics")
+                        onStatus("Live session বন্ধ হয়েছে\n$diagnostics")
                     }
                 }
             }
@@ -218,7 +218,7 @@ class GeminiLiveVoice(
         setupTimeout?.cancel(false)
         setupTimeout = null
         if (running.getAndSet(false)) {
-            val detailedMessage = "$message\\n${diagnosticSummary()}"
+            val detailedMessage = "$message\n${diagnosticSummary()}"
             terminalErrorReported.set(true)
             try { socket?.close(1002, "Session setup failed") } catch (_: Exception) {}
             stopAudio()
