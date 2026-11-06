@@ -43,6 +43,10 @@ class GeminiLiveVoice(
     private val audioBytesSent = AtomicLong(0)
     private val terminalErrorReported = AtomicBoolean(false)
     @Volatile private var setupCompleteReceived = false
+    @Volatile private var websocketOpened = false
+    @Volatile private var setupMessageSent = false
+    @Volatile private var serverMessageCount = 0
+    @Volatile private var lastServerMessageKeys = "none"
     @Volatile private var microphoneInitialized = false
     @Volatile private var microphoneStarted = false
     @Volatile private var microphoneStateDetail = "not created"
@@ -71,6 +75,10 @@ class GeminiLiveVoice(
         terminalErrorReported.set(false)
         setupDone.set(false)
         setupCompleteReceived = false
+        websocketOpened = false
+        setupMessageSent = false
+        serverMessageCount = 0
+        lastServerMessageKeys = "none"
         microphoneInitialized = false
         microphoneStarted = false
         microphoneStateDetail = "not created"
@@ -84,7 +92,8 @@ class GeminiLiveVoice(
 
         socket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                onStatus("Gemini সার্ভারে সংযোগ হয়েছে, সেটআপ হচ্ছে…")
+                websocketOpened = true
+                onStatus("WebSocket opened: HTTP ${response.code}, protocol ${response.protocol}; setup পাঠানো হচ্ছে…")
                 val setup = JSONObject()
                     .put("setup", JSONObject()
                         .put("model", "models/$MODEL")
@@ -108,6 +117,8 @@ class GeminiLiveVoice(
                     fail("Gemini setup পাঠানো যায়নি: WebSocket send queue বন্ধ")
                     return
                 }
+                setupMessageSent = true
+                onStatus("Setup message পাঠানো হয়েছে; Gemini response-এর অপেক্ষায়…")
                 setupTimeout?.cancel(false)
                 setupTimeout = setupTimer.schedule({
                     if (running.get() && !setupDone.get()) {
@@ -119,6 +130,8 @@ class GeminiLiveVoice(
             override fun onMessage(webSocket: WebSocket, text: String) {
                 try {
                     val root = JSONObject(text)
+                    serverMessageCount += 1
+                    lastServerMessageKeys = root.keys().asSequence().toList().joinToString(",").ifBlank { "empty JSON" }
 
                     val apiError = root.optJSONObject("error")
                     if (apiError != null) {
@@ -211,7 +224,7 @@ class GeminiLiveVoice(
             AudioRecord.RECORDSTATE_STOPPED -> "stopped"
             else -> "unavailable"
         }
-        return "SetupComplete: $setupCompleteReceived | Mic initialized: $microphoneInitialized | Mic started: $microphoneStarted | Mic state: $micState ($microphoneStateDetail) | Audio chunks: $chunks | Bytes: $bytes"
+        return "WebSocket opened: $websocketOpened | Setup sent: $setupMessageSent | Server messages: $serverMessageCount | Last message keys: $lastServerMessageKeys | SetupComplete: $setupCompleteReceived | Mic initialized: $microphoneInitialized | Mic started: $microphoneStarted | Mic state: $micState ($microphoneStateDetail) | Audio chunks: $chunks | Bytes: $bytes"
     }
 
     private fun fail(message: String) {
