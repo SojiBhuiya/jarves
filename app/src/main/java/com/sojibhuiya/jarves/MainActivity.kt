@@ -1,10 +1,18 @@
 package com.sojibhuiya.jarves
 
+import android.Manifest
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -38,6 +46,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -60,7 +69,6 @@ class MainActivity : ComponentActivity() {
 private fun AssistantApp() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    // null means DataStore has not emitted yet; an empty string means first launch.
     val savedName by context.jarvesDataStore.data
         .map { preferences -> preferences[ASSISTANT_NAME].orEmpty() }
         .collectAsState(initial = null)
@@ -172,6 +180,10 @@ private fun NameSetup(
 @Composable
 private fun HomeScreen(assistantName: String, onEditName: () -> Unit) {
     val context = LocalContext.current
+    var recognizedText by remember { mutableStateOf("") }
+    var speechStatus by remember { mutableStateOf("মাইক্রোফোনে কথা বলতে নিচের বাটনে চাপ দিন") }
+    var isListening by remember { mutableStateOf(false) }
+
     val ttsReady = remember { mutableStateOf(false) }
     val textToSpeech = remember(context) {
         TextToSpeech(context) { status ->
@@ -179,10 +191,74 @@ private fun HomeScreen(assistantName: String, onEditName: () -> Unit) {
         }
     }
 
+    val speechRecognizer = remember(context) {
+        if (SpeechRecognizer.isRecognitionAvailable(context)) {
+            SpeechRecognizer.createSpeechRecognizer(context)
+        } else {
+            null
+        }
+    }
+
     DisposableEffect(textToSpeech) {
         onDispose {
             textToSpeech.stop()
             textToSpeech.shutdown()
+        }
+    }
+
+    DisposableEffect(speechRecognizer) {
+        if (speechRecognizer != null) {
+            speechRecognizer.setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) {
+                    isListening = true
+                    speechStatus = "শুনছি… এখন কথা বলুন"
+                }
+                override fun onBeginningOfSpeech() {
+                    speechStatus = "আপনার কথা শুনছি…"
+                }
+                override fun onRmsChanged(rmsdB: Float) {}
+                override fun onBufferReceived(buffer: ByteArray?) {}
+                override fun onEndOfSpeech() {
+                    isListening = false
+                    speechStatus = "কথা বুঝে নিচ্ছি…"
+                }
+                override fun onError(error: Int) {
+                    isListening = false
+                    speechStatus = when (error) {
+                        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "মাইক্রোফোনের অনুমতি পাওয়া যায়নি"
+                        SpeechRecognizer.ERROR_NO_MATCH -> "কথা বুঝতে পারিনি। আবার চেষ্টা করুন"
+                        SpeechRecognizer.ERROR_NETWORK,
+                        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "নেটওয়ার্ক সমস্যা হয়েছে"
+                        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "একটু অপেক্ষা করে আবার চেষ্টা করুন"
+                        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "কোনো কথা শোনা যায়নি"
+                        else -> "ভয়েস ইনপুটে সমস্যা হয়েছে। আবার চেষ্টা করুন"
+                    }
+                }
+                override fun onResults(results: Bundle?) {
+                    isListening = false
+                    val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    recognizedText = matches?.firstOrNull().orEmpty()
+                    speechStatus = if (recognizedText.isNotBlank()) "আপনার কথাটি লেখা হয়েছে" else "কথা বুঝতে পারিনি। আবার চেষ্টা করুন"
+                }
+                override fun onPartialResults(partialResults: Bundle?) {
+                    val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    partial?.firstOrNull()?.let { recognizedText = it }
+                }
+                override fun onEvent(eventType: Int, params: Bundle?) {}
+            })
+        }
+        onDispose {
+            speechRecognizer?.destroy()
+        }
+    }
+
+    val microphonePermission = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            startBanglaListening(speechRecognizer) { speechStatus = it; isListening = true }
+        } else {
+            speechStatus = "ভয়েস ইনপুটের জন্য মাইক্রোফোন অনুমতি দিতে হবে"
         }
     }
 
@@ -211,6 +287,46 @@ private fun HomeScreen(assistantName: String, onEditName: () -> Unit) {
         Text("কীভাবে আপনাকে সাহায্য করতে পারি?",
             color = Color(0xFFB8C9D8), fontSize = 15.sp)
         Spacer(Modifier.height(24.dp))
+
+        Button(
+            onClick = {
+                if (speechRecognizer == null) {
+                    speechStatus = "এই ফোনে Speech Recognition service পাওয়া যায়নি"
+                } else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                    startBanglaListening(speechRecognizer) { speechStatus = it; isListening = true }
+                } else {
+                    microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
+                }
+            },
+            enabled = !isListening,
+            modifier = Modifier.fillMaxWidth().height(52.dp),
+            shape = RoundedCornerShape(14.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = Color(0xFF0B6685),
+                contentColor = Color.White
+            )
+        ) {
+            Text(if (isListening) "Listening…" else "🎙 Speak to Assistant", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+        }
+
+        Spacer(Modifier.height(10.dp))
+        Text(speechStatus, color = Color(0xFF9FB3C5), fontSize = 13.sp)
+        if (recognizedText.isNotBlank()) {
+            Spacer(Modifier.height(10.dp))
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+                color = Color(0xFF10283A)
+            ) {
+                Column(Modifier.padding(14.dp)) {
+                    Text("আপনি বলেছেন:", color = Color(0xFF55D9FF), fontSize = 12.sp)
+                    Spacer(Modifier.height(6.dp))
+                    Text(recognizedText, color = Color.White, fontSize = 16.sp)
+                }
+            }
+        }
+
+        Spacer(Modifier.height(18.dp))
         Button(
             onClick = {
                 val banglaLocale = Locale("bn", "BD")
@@ -221,12 +337,7 @@ private fun HomeScreen(assistantName: String, onEditName: () -> Unit) {
                 } else {
                     "হ্যালো! আমি $assistantName। কীভাবে আপনাকে সাহায্য করতে পারি?"
                 }
-                textToSpeech.speak(
-                    greeting,
-                    TextToSpeech.QUEUE_FLUSH,
-                    null,
-                    "assistant_greeting"
-                )
+                textToSpeech.speak(greeting, TextToSpeech.QUEUE_FLUSH, null, "assistant_greeting")
             },
             enabled = ttsReady.value,
             modifier = Modifier.fillMaxWidth().height(52.dp),
@@ -251,5 +362,29 @@ private fun HomeScreen(assistantName: String, onEditName: () -> Unit) {
         ) {
             Text("Settings · Change assistant name", color = Color(0xFFBDEEFF))
         }
+    }
+}
+
+private fun startBanglaListening(
+    recognizer: SpeechRecognizer?,
+    onStarted: (String) -> Unit
+) {
+    if (recognizer == null) {
+        onStarted("এই ফোনে Speech Recognition service পাওয়া যায়নি")
+        return
+    }
+    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+        putExtra(RecognizerIntent.EXTRA_LANGUAGE, "bn-BD")
+        putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "bn-BD")
+        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+        putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+        putExtra(RecognizerIntent.EXTRA_PROMPT, "বাংলায় কথা বলুন")
+    }
+    try {
+        recognizer.startListening(intent)
+        onStarted("মাইক্রোফোন চালু হচ্ছে…")
+    } catch (_: Exception) {
+        onStarted("ভয়েস ইনপুট শুরু করা যায়নি। আবার চেষ্টা করুন")
     }
 }
