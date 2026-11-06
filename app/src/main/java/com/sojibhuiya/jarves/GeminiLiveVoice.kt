@@ -39,7 +39,6 @@ class GeminiLiveVoice(
     private val setupDone = AtomicBoolean(false)
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(20, TimeUnit.SECONDS)
         .build()
 
     @Volatile private var socket: WebSocket? = null
