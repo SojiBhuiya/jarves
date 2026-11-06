@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.util.Base64
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -25,6 +26,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -64,6 +67,8 @@ private fun AgiApp() {
     var assistantTranscript by remember { mutableStateOf("") }
     var connected by remember { mutableStateOf(false) }
     var engine by remember { mutableStateOf<GeminiLiveVoice?>(null) }
+
+    BackHandler(enabled = screen == "settings") { screen = "home" }
 
     val assistantName = prefs?.get(ASSISTANT_NAME).orEmpty()
     val geminiEnabled = prefs?.get(GEMINI_ENABLED) ?: false
@@ -226,7 +231,7 @@ private fun HomeScreen(
             Text(if (connected) "■ Stop Live Voice" else "🎙 Start Live Conversation")
         }
         Spacer(Modifier.height(12.dp))
-        Text(status, color = Color(0xFF9FB3C5), fontSize = 13.sp)
+        CopyableText(status, color = Color(0xFF9FB3C5))
         if (userTranscript.isNotBlank()) {
             Spacer(Modifier.height(16.dp))
             MessageCard("আপনি বলেছেন", userTranscript)
@@ -241,12 +246,23 @@ private fun HomeScreen(
 }
 
 @Composable
+private fun CopyableText(value: String, color: Color) {
+    val clipboard = LocalClipboardManager.current
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(value, color = color, fontSize = 13.sp, modifier = Modifier.weight(1f).padding(vertical = 4.dp))
+        TextButton(onClick = { clipboard.setText(AnnotatedString(value)) }, enabled = value.isNotBlank()) {
+            Text("Copy", color = Color(0xFF55D9FF))
+        }
+    }
+}
+
+@Composable
 private fun MessageCard(title: String, message: String) {
     Surface(Modifier.fillMaxWidth(), color = Color(0xFF10283A), shape = RoundedCornerShape(14.dp)) {
         Column(Modifier.padding(14.dp)) {
             Text(title, color = Color(0xFF55D9FF), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(6.dp))
-            Text(message, color = Color.White, fontSize = 15.sp)
+            CopyableText(message, color = Color.White)
         }
     }
 }
@@ -302,7 +318,7 @@ private fun SettingsScreen(
         ) { Text("Create Gemini API Key") }
         if (status.isNotBlank()) {
             Spacer(Modifier.height(12.dp))
-            Text(status, color = Color(0xFF66D9A8), fontSize = 13.sp)
+            CopyableText(status, color = Color(0xFF66D9A8))
         }
         Spacer(Modifier.height(18.dp))
         Text(
