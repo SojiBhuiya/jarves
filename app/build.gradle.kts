@@ -16,6 +16,22 @@ android {
         versionName = "0.1.0"
     }
 
+    signingConfigs {
+        create("release") {
+            storeFile = rootProject.file("jarves-release.jks")
+            storePassword = System.getenv("JARVES_KEYSTORE_PASSWORD")
+            keyAlias = System.getenv("JARVES_KEY_ALIAS")
+            keyPassword = System.getenv("JARVES_KEY_PASSWORD")
+        }
+    }
+
+    buildTypes {
+        getByName("release") {
+            signingConfig = signingConfigs.getByName("release")
+            isMinifyEnabled = false
+        }
+    }
+
     buildFeatures {
         compose = true
     }
