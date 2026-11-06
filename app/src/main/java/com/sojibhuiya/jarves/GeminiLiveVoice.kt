@@ -14,6 +14,7 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -45,6 +46,9 @@ class GeminiLiveVoice(
     @Volatile private var recorder: AudioRecord? = null
     @Volatile private var player: AudioTrack? = null
     @Volatile private var captureThread: Thread? = null
+    private val playbackQueue = LinkedBlockingQueue<ByteArray>()
+    private val playbackActive = AtomicBoolean(false)
+    @Volatile private var playbackThread: Thread? = null
 
     fun start() {
         if (apiKey.isBlank()) {
@@ -87,6 +91,7 @@ class GeminiLiveVoice(
                     val root = JSONObject(text)
                     if (root.has("setupComplete")) {
                         setupDone.set(true)
+                        startAudioPlayback()
                         startAudioCapture()
                         onStatus("সংযুক্ত। এখন কথা বলুন")
                     }
@@ -94,9 +99,8 @@ class GeminiLiveVoice(
                     val serverContent = root.optJSONObject("serverContent")
                     if (serverContent != null) {
                         if (serverContent.optBoolean("interrupted", false)) {
-                            player?.pause()
-                            player?.flush()
-                            player?.play()
+                            playbackQueue.clear()
+                            try { player?.pause(); player?.flush(); player?.play() } catch (_: Exception) {}
                             onStatus("আপনার কথা শুনছি…")
                         }
 
@@ -111,7 +115,7 @@ class GeminiLiveVoice(
                             for (i in 0 until parts.length()) {
                                 val inline = parts.optJSONObject(i)?.optJSONObject("inlineData")
                                 val encoded = inline?.optString("data").orEmpty()
-                                if (encoded.isNotBlank()) playAudio(Base64.decode(encoded, Base64.DEFAULT))
+                                if (encoded.isNotBlank()) playbackQueue.offer(Base64.decode(encoded, Base64.DEFAULT))
                             }
                         }
                         if (serverContent.optBoolean("turnComplete", false)) {
@@ -183,34 +187,42 @@ class GeminiLiveVoice(
         }
     }
 
-    private fun playAudio(pcm: ByteArray) {
-        try {
-            var track = player
-            if (track == null) {
-                val minBuffer = AudioTrack.getMinBufferSize(
-                    OUTPUT_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
-                )
-                track = AudioTrack.Builder()
-                    .setAudioAttributes(AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_ASSISTANT)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build())
-                    .setAudioFormat(AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(OUTPUT_RATE)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                        .build())
-                    .setBufferSizeInBytes(maxOf(minBuffer * 2, OUTPUT_RATE))
-                    .setTransferMode(AudioTrack.MODE_STREAM)
-                    .build()
-                player = track
-                track.play()
+    // Blocking AudioTrack writes must stay off OkHttp's WebSocket reader thread.
+    private fun startAudioPlayback() {
+        if (!playbackActive.compareAndSet(false, true)) return
+        playbackThread = Thread({
+            try {
+                while (running.get() && playbackActive.get()) {
+                    val pcm = playbackQueue.poll(100, TimeUnit.MILLISECONDS) ?: continue
+                    try {
+                        var track = player
+                        if (track == null) {
+                            val minBuffer = AudioTrack.getMinBufferSize(
+                                OUTPUT_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+                            )
+                            track = AudioTrack.Builder()
+                                .setAudioAttributes(AudioAttributes.Builder()
+                                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+                                .setAudioFormat(AudioFormat.Builder()
+                                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                    .setSampleRate(OUTPUT_RATE)
+                                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
+                                .setBufferSizeInBytes(maxOf(minBuffer * 2, OUTPUT_RATE))
+                                .setTransferMode(AudioTrack.MODE_STREAM).build()
+                            player = track
+                            track.play()
+                        }
+                        if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
+                        track.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING)
+                    } catch (e: Exception) {
+                        onError("Audio playback error: ${e.message ?: "unknown"}")
+                    }
+                }
+            } catch (_: InterruptedException) {
+                // Normal shutdown.
             }
-            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
-            track.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING)
-        } catch (e: Exception) {
-            onError("Audio playback error: ${e.message ?: "unknown"}")
-        }
+        }, "gemini-live-playback").apply { isDaemon = true; start() }
     }
 
     fun stop() {
@@ -227,6 +239,10 @@ class GeminiLiveVoice(
         try { recorder?.stop() } catch (_: Exception) {}
         try { recorder?.release() } catch (_: Exception) {}
         recorder = null
+        playbackActive.set(false)
+        playbackQueue.clear()
+        playbackThread?.interrupt()
+        playbackThread = null
         try { player?.pause(); player?.flush(); player?.release() } catch (_: Exception) {}
         player = null
         setupDone.set(false)
