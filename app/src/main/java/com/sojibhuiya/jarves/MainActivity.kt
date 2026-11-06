@@ -103,8 +103,9 @@ private fun AgiApp() {
         if (granted) startLive() else status = "Live Voice ব্যবহারের জন্য Microphone permission দিন"
     }
 
+    val latestEngine = rememberUpdatedState(engine)
     DisposableEffect(Unit) {
-        onDispose { engine?.stop() }
+        onDispose { latestEngine.value?.stop() }
     }
 
     val background = Brush.verticalGradient(listOf(Color(0xFF071321), Color(0xFF02060D)))
