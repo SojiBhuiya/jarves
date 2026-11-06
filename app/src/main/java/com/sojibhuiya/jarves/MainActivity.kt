@@ -1,6 +1,8 @@
 package com.sojibhuiya.jarves
 
+import android.content.Context
 import android.os.Bundle
+import android.speech.tts.TextToSpeech
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
@@ -22,6 +24,7 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -31,17 +34,17 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
-import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.rememberCoroutineScope
-import android.content.Context
+import java.util.Locale
 
 private val Context.jarvesDataStore by preferencesDataStore(name = "jarves_settings")
 private val ASSISTANT_NAME = stringPreferencesKey("assistant_name")
@@ -49,12 +52,12 @@ private val ASSISTANT_NAME = stringPreferencesKey("assistant_name")
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { JarvesApp() }
+        setContent { AssistantApp() }
     }
 }
 
 @Composable
-private fun JarvesApp() {
+private fun AssistantApp() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     // null means DataStore has not emitted yet; an empty string means first launch.
@@ -77,12 +80,7 @@ private fun JarvesApp() {
             ) {
                 when {
                     savedName == null -> {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text("JARVES", color = Color(0xFFEAF7FF), fontSize = 30.sp,
-                                fontWeight = FontWeight.Bold, letterSpacing = 5.sp)
-                            Spacer(Modifier.height(20.dp))
-                            Text("Loading your assistant…", color = Color(0xFFB8C9D8))
-                        }
+                        Text("Loading your assistant…", color = Color(0xFFB8C9D8))
                     }
                     savedName.isNullOrBlank() || editingName -> {
                         NameSetup(
@@ -102,7 +100,7 @@ private fun JarvesApp() {
                     }
                     else -> {
                         HomeScreen(
-                            assistantName = savedName ?: "Jarves",
+                            assistantName = savedName.orEmpty(),
                             onEditName = {
                                 nameInput = savedName.orEmpty()
                                 editingName = true
@@ -127,9 +125,6 @@ private fun NameSetup(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Text("JARVES", color = Color(0xFFEAF7FF), fontSize = 30.sp,
-            fontWeight = FontWeight.Bold, letterSpacing = 5.sp)
-        Spacer(Modifier.height(28.dp))
         Text(
             text = if (isFirstLaunch) "Give your assistant a name" else "Change assistant name",
             color = Color(0xFFEAF7FF), fontSize = 22.sp, fontWeight = FontWeight.SemiBold
@@ -146,7 +141,7 @@ private fun NameSetup(
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
             label = { Text("Assistant name") },
-            placeholder = { Text("e.g. Jarves") },
+            placeholder = { Text("Choose a name") },
             shape = RoundedCornerShape(14.dp),
             colors = OutlinedTextFieldDefaults.colors(
                 focusedTextColor = Color.White,
@@ -176,14 +171,26 @@ private fun NameSetup(
 
 @Composable
 private fun HomeScreen(assistantName: String, onEditName: () -> Unit) {
+    val context = LocalContext.current
+    val ttsReady = remember { mutableStateOf(false) }
+    val textToSpeech = remember(context) {
+        TextToSpeech(context) { status ->
+            ttsReady.value = status == TextToSpeech.SUCCESS
+        }
+    }
+
+    DisposableEffect(textToSpeech) {
+        onDispose {
+            textToSpeech.stop()
+            textToSpeech.shutdown()
+        }
+    }
+
     Column(
         modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Text("JARVES", color = Color(0xFFEAF7FF), fontSize = 30.sp,
-            fontWeight = FontWeight.Bold, letterSpacing = 5.sp)
-        Spacer(Modifier.height(36.dp))
         Surface(
             modifier = Modifier.height(150.dp),
             shape = CircleShape,
@@ -198,15 +205,47 @@ private fun HomeScreen(assistantName: String, onEditName: () -> Unit) {
             }
         }
         Spacer(Modifier.height(28.dp))
-        Text("Hello, I'm $assistantName", color = Color(0xFFEAF7FF),
-            fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+        Text("হ্যালো! আমি $assistantName।", color = Color(0xFFEAF7FF),
+            fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
-        Text("Your assistant is getting ready.", color = Color(0xFFB8C9D8), fontSize = 15.sp)
-        Spacer(Modifier.height(8.dp))
-        Text("Voice features are not connected yet.", color = Color(0xFF71869A), fontSize = 12.sp)
-        Spacer(Modifier.height(28.dp))
+        Text("কীভাবে আপনাকে সাহায্য করতে পারি?",
+            color = Color(0xFFB8C9D8), fontSize = 15.sp)
+        Spacer(Modifier.height(24.dp))
+        Button(
+            onClick = {
+                val banglaLocale = Locale("bn", "BD")
+                val languageResult = textToSpeech.setLanguage(banglaLocale)
+                val greeting = if (languageResult < TextToSpeech.LANG_AVAILABLE) {
+                    textToSpeech.language = Locale.US
+                    "Hello! I'm $assistantName. How can I help you?"
+                } else {
+                    "হ্যালো! আমি $assistantName। কীভাবে আপনাকে সাহায্য করতে পারি?"
+                }
+                textToSpeech.speak(
+                    greeting,
+                    TextToSpeech.QUEUE_FLUSH,
+                    null,
+                    "assistant_greeting"
+                )
+            },
+            enabled = ttsReady.value,
+            modifier = Modifier.fillMaxWidth().height(52.dp),
+            shape = RoundedCornerShape(14.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = Color(0xFF087FA5),
+                contentColor = Color.White
+            )
+        ) {
+            Text("Speak Greeting", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+        }
+        if (!ttsReady.value) {
+            Spacer(Modifier.height(8.dp))
+            Text("Preparing phone voice…", color = Color(0xFF71869A), fontSize = 12.sp)
+        }
+        Spacer(Modifier.height(18.dp))
         Button(
             onClick = onEditName,
+            modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(12.dp),
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF12364D))
         ) {
