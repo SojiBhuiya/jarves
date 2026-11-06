@@ -5,7 +5,6 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
-import android.media.AudioManager
 import android.util.Base64
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -32,7 +31,7 @@ class GeminiLiveVoice(
         private const val MODEL = "gemini-3.8-live"
         private const val INPUT_RATE = 16000
         private const val OUTPUT_RATE = 24000
-        private const val CHUNK_BYTES = 640 // 20 ms at 16 kHz, mono, PCM16
+        private const val CHUNK_BYTES = 640
     }
 
     private val running = AtomicBoolean(false)
@@ -63,6 +62,7 @@ class GeminiLiveVoice(
 
         socket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                onStatus("Gemini সার্ভারে সংযোগ হয়েছে, সেটআপ হচ্ছে…")
                 val setup = JSONObject()
                     .put("setup", JSONObject()
                         .put("model", "models/$MODEL")
@@ -82,12 +82,23 @@ class GeminiLiveVoice(
                             ))))
                         .put("inputAudioTranscription", JSONObject())
                         .put("outputAudioTranscription", JSONObject()))
-                webSocket.send(setup.toString())
+                if (!webSocket.send(setup.toString())) {
+                    fail("Gemini setup পাঠানো যায়নি")
+                }
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 try {
                     val root = JSONObject(text)
+
+                    val apiError = root.optJSONObject("error")
+                    if (apiError != null) {
+                        val code = apiError.optInt("code", 0)
+                        val message = apiError.optString("message", "Unknown Gemini API error")
+                        fail("Gemini API error ${if (code > 0) "($code) " else ""}$message")
+                        return
+                    }
+
                     if (root.has("setupComplete")) {
                         setupDone.set(true)
                         startAudioPlayback()
@@ -124,22 +135,36 @@ class GeminiLiveVoice(
 
                     if (root.has("goAway")) onStatus("সংযোগ পুনরায় চালু করতে হবে")
                 } catch (e: Exception) {
-                    onError("Live response পড়তে সমস্যা: ${e.message ?: "unknown"}")
+                    fail("Live response পড়তে সমস্যা: ${e.message ?: "unknown"}")
                 }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 stopAudio()
                 running.set(false)
-                onError("Gemini Live সংযোগ ব্যর্থ: ${t.message ?: "network error"}")
+                val http = response?.let { "HTTP ${it.code}: ${it.message}" }
+                onError("Gemini Live সংযোগ ব্যর্থ: ${http ?: t.message ?: "network error"}")
+            }
+
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                if (running.get()) onError("Gemini সংযোগ বন্ধ করছে (code $code): ${reason.ifBlank { "কারণ জানায়নি" }}")
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 stopAudio()
                 running.set(false)
-                onStatus("Live session বন্ধ হয়েছে")
+                if (code != 1000 && reason.isNotBlank()) onError("Gemini session বন্ধ (code $code): $reason")
+                else onStatus("Live session বন্ধ হয়েছে")
             }
         })
+    }
+
+    private fun fail(message: String) {
+        if (running.getAndSet(false)) {
+            try { socket?.close(1002, "Session setup failed") } catch (_: Exception) {}
+            stopAudio()
+            onError(message)
+        }
     }
 
     private fun startAudioCapture() {
@@ -181,12 +206,10 @@ class GeminiLiveVoice(
                 }
             }, "gemini-live-mic").apply { isDaemon = true; start() }
         } catch (e: Exception) {
-            onError("Microphone error: ${e.message ?: "unknown"}")
-            stop()
+            fail("Microphone error: ${e.message ?: "unknown"}")
         }
     }
 
-    // Blocking AudioTrack writes must stay off OkHttp's WebSocket reader thread.
     private fun startAudioPlayback() {
         if (!playbackActive.compareAndSet(false, true)) return
         playbackThread = Thread({
