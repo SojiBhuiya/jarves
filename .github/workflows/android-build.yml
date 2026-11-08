@@ -29,6 +29,9 @@ jobs:
       - name: Build debug APK
         run: gradle assembleDebug
 
+      - name: Run unit tests
+        run: gradle testDebugUnitTest
+
       - name: Prepare release signing key
         id: signing
         env:
