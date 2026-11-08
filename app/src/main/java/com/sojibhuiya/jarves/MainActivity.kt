@@ -65,6 +65,7 @@ private fun AgiApp() {
     var userTranscript by remember { mutableStateOf("") }
     var assistantTranscript by remember { mutableStateOf("") }
     var connected by remember { mutableStateOf(false) }
+    var connecting by remember { mutableStateOf(false) }
     var engine by remember { mutableStateOf<GeminiLiveVoice?>(null) }
 
     BackHandler(enabled = screen == "settings") { screen = "home" }
@@ -75,25 +76,38 @@ private fun AgiApp() {
     val hasKey = encryptedKey.isNotBlank()
 
     fun startLive() {
+        if (engine != null || connecting) return
         if (!geminiEnabled) { status = "Settings থেকে Gemini চালু করুন"; return }
         if (!hasKey) { status = "Settings থেকে Gemini API Key যোগ করুন"; return }
         val key = runCatching { SecretVault.decrypt(encryptedKey) }.getOrElse {
             status = "সংরক্ষিত API Key পড়া যায়নি। নতুন Key দিন।"
             return
         }
+        connecting = true
         val live = GeminiLiveVoice(
             apiKey = key,
             assistantName = assistantName,
             onStatus = { value -> scope.launch {
                 status = value
                 connected = value.contains("সংযুক্ত") || value.contains("শুনছি") || value.contains("কথা")
+                connecting = !connected && !value.contains("বন্ধ") && !value.contains("ব্যর্থ")
+                if (value.contains("বন্ধ")) {
+                    connected = false
+                    connecting = false
+                    engine = null
+                }
             } },
             onTranscript = { text, isAssistant ->
                 scope.launch {
                     if (isAssistant) assistantTranscript = text else userTranscript = text
                 }
             },
-            onError = { message -> scope.launch { status = message; connected = false } }
+            onError = { message -> scope.launch {
+                status = message
+                connected = false
+                connecting = false
+                engine = null
+            } }
         )
         engine = live
         live.start()
@@ -147,7 +161,12 @@ private fun AgiApp() {
                         },
                         onToggle = { enabled ->
                             scope.launch {
-                                if (!enabled) engine?.stop()
+                                if (!enabled) {
+                                    engine?.stop()
+                                    engine = null
+                                    connected = false
+                                    connecting = false
+                                }
                                 context.agiDataStore.edit { it[GEMINI_ENABLED] = enabled }
                                 status = if (enabled) "Gemini Live চালু করা হয়েছে" else "Gemini বন্ধ হয়েছে"
                             }
@@ -158,15 +177,17 @@ private fun AgiApp() {
                         geminiEnabled = geminiEnabled,
                         hasKey = hasKey,
                         connected = connected,
+                        connecting = connecting,
                         status = status,
                         userTranscript = userTranscript,
                         assistantTranscript = assistantTranscript,
                         onOpenSettings = { screen = "settings"; assistantNameInput = assistantName },
                         onVoiceClick = {
-                            if (connected) {
+                            if (engine != null) {
                                 engine?.stop()
                                 engine = null
                                 connected = false
+                                connecting = false
                             } else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                                 startLive()
                             } else micPermission.launch(Manifest.permission.RECORD_AUDIO)
@@ -197,6 +218,7 @@ private fun HomeScreen(
     geminiEnabled: Boolean,
     hasKey: Boolean,
     connected: Boolean,
+    connecting: Boolean,
     status: String,
     userTranscript: String,
     assistantTranscript: String,
@@ -218,20 +240,20 @@ private fun HomeScreen(
                 .clickable(onClick = onVoiceClick),
             contentAlignment = Alignment.Center
         ) {
-            Text(if (connected) "◉" else "◎", color = Color(0xFF55D9FF), fontSize = 76.sp)
+            Text(if (connected) "◉" else if (connecting) "…" else "◎", color = Color(0xFF55D9FF), fontSize = 76.sp)
         }
         Spacer(Modifier.height(24.dp))
         Text("হ্যালো! আমি $assistantName।", color = Color(0xFFEAF7FF), fontSize = 23.sp, fontWeight = FontWeight.SemiBold)
         Text("কীভাবে আপনাকে সাহায্য করতে পারি?", color = Color(0xFFB8C9D8), fontSize = 15.sp)
         Spacer(Modifier.height(14.dp))
         Text(
-            when { !geminiEnabled -> "Gemini: OFF"; !hasKey -> "Gemini API Key প্রয়োজন"; connected -> "LIVE VOICE CONNECTED"; else -> "Gemini Live প্রস্তুত" },
+            when { !geminiEnabled -> "Gemini: OFF"; !hasKey -> "Gemini API Key প্রয়োজন"; connected -> "LIVE VOICE CONNECTED"; connecting -> "CONNECTING TO GEMINI LIVE"; else -> "Gemini Live প্রস্তুত" },
             color = if (connected) Color(0xFF66D9A8) else Color(0xFFFFC36B),
             fontSize = 12.sp
         )
         Spacer(Modifier.height(16.dp))
         Button(onClick = onVoiceClick, modifier = Modifier.fillMaxWidth().height(52.dp)) {
-            Text(if (connected) "■ Stop Live Voice" else "🎙 Start Live Conversation")
+            Text(if (connected || connecting) "■ Stop Live Voice" else "🎙 Start Live Conversation")
         }
         Spacer(Modifier.height(12.dp))
         SelectableText(status, color = Color(0xFF9FB3C5))

@@ -3,7 +3,7 @@ name: Android Build
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "fix/gemini-live-session-lifecycle" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
@@ -28,6 +28,9 @@ jobs:
 
       - name: Build debug APK
         run: gradle assembleDebug
+
+      - name: Run unit tests
+        run: gradle testDebugUnitTest
 
       - name: Prepare release signing key
         id: signing
