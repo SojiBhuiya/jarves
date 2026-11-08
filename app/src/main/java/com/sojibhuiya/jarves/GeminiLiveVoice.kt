@@ -129,7 +129,7 @@ class GeminiLiveVoice(
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                onMessage(webSocket, bytes.utf8())
+                onMessage(webSocket, LiveFrameDecoder.decode(bytes.toByteArray()))
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
