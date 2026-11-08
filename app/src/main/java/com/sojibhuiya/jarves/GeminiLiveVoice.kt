@@ -11,6 +11,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okio.ByteString
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.LinkedBlockingQueue
@@ -127,6 +128,10 @@ class GeminiLiveVoice(
                 }, 15, TimeUnit.SECONDS)
             }
 
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                onMessage(webSocket, bytes.utf8())
+            }
+
             override fun onMessage(webSocket: WebSocket, text: String) {
                 try {
                     val root = JSONObject(text)
@@ -187,7 +192,9 @@ class GeminiLiveVoice(
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 setupTimeout?.cancel(false)
                 val http = response?.let { "HTTP ${it.code}: ${it.message}" }
-                val message = "Gemini Live সংযোগ ব্যর্থ: ${http ?: t.message ?: "network error"}\n${diagnosticSummary()}"
+                val causes = generateSequence(t as Throwable?) { it.cause }
+                    .take(5).joinToString(" <- ") { cause -> "${cause.javaClass.simpleName}: ${cause.message ?: "no message"}" }
+                val message = "Gemini Live সংযোগ ব্যর্থ: ${http ?: t.message ?: "network error"}\nCause: $causes\n${diagnosticSummary()}"
                 running.set(false)
                 stopAudio()
                 if (terminalErrorReported.compareAndSet(false, true)) onError(message)
@@ -201,6 +208,10 @@ class GeminiLiveVoice(
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 setupTimeout?.cancel(false)
+                if (running.get() && !setupCompleteReceived) {
+                    fail("Gemini setupComplete আসার আগেই server session বন্ধ করেছে (code $code): ${reason.ifBlank { "কারণ জানায়নি" }}")
+                    return
+                }
                 val diagnostics = diagnosticSummary()
                 running.set(false)
                 stopAudio()
