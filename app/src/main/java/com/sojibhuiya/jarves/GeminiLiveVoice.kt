@@ -192,7 +192,7 @@ class GeminiLiveVoice(
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 setupTimeout?.cancel(false)
                 val http = response?.let { "HTTP ${it.code}: ${it.message}" }
-                val causes = generateSequence(t as Throwable?) { it.cause }
+                val causes = generateSequence(t) { it.cause }
                     .take(5).joinToString(" <- ") { cause -> "${cause.javaClass.simpleName}: ${cause.message ?: "no message"}" }
                 val message = "Gemini Live সংযোগ ব্যর্থ: ${http ?: t.message ?: "network error"}\nCause: $causes\n${diagnosticSummary()}"
                 running.set(false)
