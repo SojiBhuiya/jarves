@@ -90,7 +90,7 @@ private fun AgiApp() {
             onStatus = { value -> scope.launch {
                 status = value
                 connected = value.contains("সংযুক্ত") || value.contains("শুনছি") || value.contains("কথা")
-                connecting = value.contains("সংযোগ হচ্ছে") || value.contains("অপেক্ষায়")
+                connecting = !connected && !value.contains("বন্ধ") && !value.contains("ব্যর্থ")
                 if (value.contains("বন্ধ")) {
                     connected = false
                     connecting = false
