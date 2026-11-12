@@ -19,6 +19,25 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import com.sojibhuiya.jarves.intelligence.FreshnessClassifier
+import com.sojibhuiya.jarves.intelligence.GroundedSource
+import com.sojibhuiya.jarves.intelligence.GroundedSearchClient
+import com.sojibhuiya.jarves.intelligence.GroundingParser
+import com.sojibhuiya.jarves.intelligence.LiveSearchTool
+import com.sojibhuiya.jarves.intelligence.LiveToolProtocol
+import com.sojibhuiya.jarves.intelligence.SearchFunctionCall
+import com.sojibhuiya.jarves.intelligence.SearchToolRunner
+import com.sojibhuiya.jarves.intelligence.GroundingAvailability
+import com.sojibhuiya.jarves.intelligence.GroundingPolicy
+import com.sojibhuiya.jarves.intelligence.GroundingReport
+import com.sojibhuiya.jarves.intelligence.LiveCloseFlow
+import com.sojibhuiya.jarves.intelligence.LiveRejection
+import com.sojibhuiya.jarves.intelligence.LiveState
+import com.sojibhuiya.jarves.intelligence.LiveSessionConfig
+import com.sojibhuiya.jarves.intelligence.LiveSessionPlan
+import com.sojibhuiya.jarves.intelligence.Rejection
+import com.sojibhuiya.jarves.intelligence.SessionAction
+import com.sojibhuiya.jarves.intelligence.TimeContext
 
 /**
  * Gemini Live audio-to-audio transport.
@@ -29,13 +48,58 @@ class GeminiLiveVoice(
     private val assistantName: String,
     private val onStatus: (String) -> Unit,
     private val onTranscript: (String, Boolean) -> Unit,
-    private val onError: (String) -> Unit
+    private val onError: (String) -> Unit,
+    /** Web sources returned by Google Search grounding for the latest turn. */
+    private val onGrounding: (List<GroundedSource>) -> Unit = {},
+    /**
+     * Explicit connection state. The UI must never infer state from Bengali status text, so every
+     * transition is reported here.
+     */
+    private val onState: (LiveState) -> Unit = {},
+    /**
+     * Design 4 search backend. `null` means voice-only: no function tool is declared and the app
+     * never makes a REST search call.
+     */
+    private val searchClient: GroundedSearchClient? = null
 ) {
     companion object {
-        private const val MODEL = "gemini-3.8-live"
-        private const val INPUT_RATE = 16000
-        private const val OUTPUT_RATE = 24000
-        private const val CHUNK_BYTES = 640
+        /**
+         * Endpoint, model and audio settings are the already working Gemini Live configuration.
+         * They are constants so the provider adapter and the unit tests reference the exact
+         * same values instead of duplicating (and drifting from) them.
+         */
+        const val WEBSOCKET_ENDPOINT =
+            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+        const val MODEL = "gemini-3.8-live"
+        const val INPUT_RATE = 16000
+        const val OUTPUT_RATE = 24000
+        const val CHUNK_BYTES = 640
+        const val VOICE_NAME = "Aoede"
+
+        /** How often the live session's date/time context is re-checked (also on midnight crossing). */
+        const val TIME_SYNC_INTERVAL_MILLIS = 30 * 60 * 1000L
+
+        /**
+         * Shown when the session had to restart without the Google Search tool. Honest: voice
+         * works, live verification does not.
+         */
+        const val SEARCH_UNAVAILABLE_STATUS =
+            "\u098f\u0987 \u0995\u09bf-\u09a4\u09c7 Live Web Search \u09b8\u09ae\u09b0\u09cd\u09a5\u09bf\u09a4 \u09a8\u09af\u09bc (\u09af\u09c7\u09ae\u09a8 free tier)\u0964 \u09ad\u09af\u09bc\u09c7\u09b8 \u099a\u09be\u09b2\u09c1 \u09b0\u09be\u0996\u09be \u09b9\u099a\u09cd\u099b\u09c7 \u2014 \u09b2\u09be\u0987\u09ad \u09a4\u09a5\u09cd\u09af \u09af\u09be\u099a\u09be\u0987 \u0995\u09b0\u09be \u09af\u09be\u09ac\u09c7 \u09a8\u09be\u0964"
+
+        /** Shown when the server refused `behavior: NON_BLOCKING` and the function went blocking. */
+        const val NON_BLOCKING_UNSUPPORTED_STATUS =
+            "\u09b8\u09be\u09b0\u09cd\u09ad\u09be\u09b0 NON_BLOCKING \u09b8\u09ae\u09b0\u09cd\u09a5\u09a8 \u0995\u09b0\u09c7 \u09a8\u09be \u2014 \u09b8\u09be\u09b0\u09cd\u099a \u099a\u09be\u09b2\u09c1 \u0986\u099b\u09c7, \u0995\u09bf\u09a8\u09cd\u09a4\u09c1 \u09ab\u09b2 \u0986\u09b8\u09be \u09aa\u09b0\u09cd\u09af\u09a8\u09cd\u09a4 \u0985\u09aa\u09c7\u0995\u09cd\u09b7\u09be \u0995\u09b0\u09a4\u09c7 \u09b9\u09ac\u09c7"
+
+        /** Connected status when live search verification is unavailable. */
+        const val CONNECTED_WITHOUT_SEARCH_STATUS =
+            "\u09b8\u0982\u09af\u09c1\u0995\u09cd\u09a4\u0964 \u098f\u0996\u09a8 \u0995\u09a5\u09be \u09ac\u09b2\u09c1\u09a8 (\u09b2\u09be\u0987\u09ad \u09b8\u09be\u09b0\u09cd\u099a \u099b\u09be\u09a1\u09bc\u09be \u2014 \u09b2\u09be\u0987\u09ad \u09a4\u09a5\u09cd\u09af \u09af\u09be\u099a\u09be\u0987 \u0995\u09b0\u09be \u09af\u09be\u09ac\u09c7 \u09a8\u09be)"
+
+        /** Identifies this build in the on-device diagnostic block. */
+        const val FIX_TAG = "refusal-2"
+
+        /** Connected status when live search verification is available. */
+        const val CONNECTED_WITH_SEARCH_STATUS =
+            "\u09b8\u0982\u09af\u09c1\u0995\u09cd\u09a4\u0964 \u098f\u0996\u09a8 \u0995\u09a5\u09be \u09ac\u09b2\u09c1\u09a8 (\u09b2\u09be\u0987\u09ad \u09b8\u09be\u09b0\u09cd\u099a \u099a\u09be\u09b2\u09c1)"
     }
 
     private val running = AtomicBoolean(false)
@@ -51,6 +115,34 @@ class GeminiLiveVoice(
     @Volatile private var microphoneInitialized = false
     @Volatile private var microphoneStarted = false
     @Volatile private var microphoneStateDetail = "not created"
+    /** Which close callback fired last: onClosing / onClosed / onFailure / none. */
+    @Volatile private var closeCallback = "none"
+    /** Whether the close frame was echoed back, completing the closing handshake. */
+    @Volatile private var closeEchoed = false
+
+    // ---- Real-time intelligence state
+    /** Whether the setup message asked for Google Search grounding. */
+    @Volatile private var groundingRequested = true
+    /** Cleared if the server rejects the tool, so the session can continue without it. */
+    @Volatile private var groundingAvailable = true
+    @Volatile private var groundingFallbackUsed = false
+    /** Which tool the setup declares. Design 4 uses a function, never `googleSearch`. */
+    @Volatile private var searchToolMode: LiveSearchTool = LiveSearchTool.NONE
+    /** Cleared once the server rejects `NON_BLOCKING`, so later sessions declare a blocking function. */
+    @Volatile private var nonBlockingAccepted = true
+    /** Runs `search_web` calls off the WebSocket thread; one per live session. */
+    @Volatile private var searchRunner: SearchToolRunner? = null
+    /** Set once a tool-refusal retry starts, so the retry can never repeat. */
+    private val retryInFlight = AtomicBoolean(false)
+    /** True once this session actually produced grounding metadata. */
+    @Volatile private var groundingSeen = false
+    /** User speech accumulated for the current turn, used by the freshness classifier. */
+    private val turnUserSpeech = StringBuilder()
+    @Volatile private var groundingForTurn = false
+    @Volatile private var noticeSentForTurn = false
+    @Volatile private var lastTimeSyncMillis = 0L
+    @Volatile private var lastTimeSyncDateKey = ""
+    @Volatile private var timeSyncTask: ScheduledFuture<*>? = null
     private val setupTimer = Executors.newSingleThreadScheduledExecutor { task ->
         Thread(task, "gemini-setup-timeout").apply { isDaemon = true }
     }
@@ -58,6 +150,44 @@ class GeminiLiveVoice(
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .build()
+
+    /**
+     * Handles the end of the current socket exactly once, from `onClosing`, `onClosed` or
+     * `onFailure`. Using *both* close callbacks is what makes the fallback reachable: OkHttp only
+     * calls `onClosed` after both peers close, so a server-initiated close would otherwise never be
+     * decided on.
+     */
+    private val closeFlow = LiveCloseFlow(
+        echoClose = { _, _ ->
+            // Completes the closing handshake so OkHttp releases the connection, and so the
+            // decision below is never blocked waiting for onClosed.
+            closeEchoed = true
+            runCatching { socket?.close(1000, "close acknowledged") }
+        },
+        retryWithoutSearch = { source -> retryWithoutSearch(source) },
+        reportFailure = { code, reason ->
+            if (!setupCompleteReceived) {
+                fail(
+                    "Gemini setupComplete \u0986\u09b8\u09be\u09b0 \u0986\u0997\u09c7\u0987 server session \u09ac\u09a8\u09cd\u09a7 \u0995\u09b0\u09c7\u099b\u09c7 " +
+                        "(code $code): ${reason.ifBlank { "no reason given" }}"
+                )
+            } else {
+                closeRunning()
+                if (terminalErrorReported.compareAndSet(false, true)) {
+                    onError(
+                        "Gemini session \u09ac\u09a8\u09cd\u09a7 (code $code): " +
+                            "${reason.ifBlank { "no reason given" }}\n${diagnosticSummary()}"
+                    )
+                }
+            }
+        },
+        reportStopped = {
+            if (closeRunning()) {
+                onStatus("Live session \u09ac\u09a8\u09cd\u09a7 \u09b9\u09df\u09c7\u099b\u09c7\n${diagnosticSummary()}")
+                onState(LiveState.ENDED)
+            }
+        }
+    )
 
     @Volatile private var socket: WebSocket? = null
     @Volatile private var recorder: AudioRecord? = null
@@ -85,37 +215,70 @@ class GeminiLiveVoice(
         microphoneStateDetail = "not created"
         audioChunksSent.set(0)
         audioBytesSent.set(0)
+        // ---- Design 4 ----------------------------------------------------------------
+        // The session now declares a `search_web` FUNCTION, not the `googleSearch` tool, so the
+        // legacy "Live grounding was refused for this credential" memo must not disable it: the
+        // memo guards a path that no longer exists, and honouring it would block working REST
+        // search for six hours after an unrelated refusal. The memo is left intact for the legacy
+        // fallback in retryWithoutSearch().
+        val hasSearchBackend = searchClient != null
+        groundingFallbackUsed = false
+        searchToolMode = when {
+            !hasSearchBackend -> LiveSearchTool.NONE
+            nonBlockingAccepted -> LiveSearchTool.FUNCTION_NON_BLOCKING
+            else -> LiveSearchTool.FUNCTION_BLOCKING
+        }
+        groundingRequested = hasSearchBackend
+        groundingAvailable = hasSearchBackend
+        retryInFlight.set(false)
+        closeFlow.reset()
+        closeCallback = "none"
+        closeEchoed = false
+        groundingSeen = false
+        groundingForTurn = false
+        noticeSentForTurn = false
+        turnUserSpeech.setLength(0)
+        lastTimeSyncMillis = 0L
+        lastTimeSyncDateKey = ""
+        startSearchRunner()
         onStatus("Gemini Live-এ সংযোগ হচ্ছে…")
+        onState(LiveState.CONNECTING)
+        startTimeSyncLoop()
+        connect()
+    }
 
+    /** Opens the WebSocket and sends setup (called again, once, if grounding is rejected). */
+    private fun connect() {
+        // A new socket gets a fresh one-time guard; late callbacks from the previous socket are
+        // dropped by the identity check in every callback below.
+        closeFlow.reset()
+        closeCallback = "none"
+        closeEchoed = false
         val request = Request.Builder()
-            .url("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey")
+            .url("$WEBSOCKET_ENDPOINT?key=$apiKey")
             .build()
 
         socket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (socket !== webSocket) return
                 websocketOpened = true
                 onStatus("WebSocket opened: HTTP ${response.code}, protocol ${response.protocol}; setup পাঠানো হচ্ছে…")
-                val setup = JSONObject()
-                    .put("setup", JSONObject()
-                        .put("model", "models/$MODEL")
-                        .put("generationConfig", JSONObject()
-                            .put("responseModalities", org.json.JSONArray().put("AUDIO"))
-                            .put("speechConfig", JSONObject()
-                                .put("voiceConfig", JSONObject()
-                                    .put("prebuiltVoiceConfig", JSONObject().put("voiceName", "Aoede")))))
-                        .put("systemInstruction", JSONObject()
-                            .put("parts", org.json.JSONArray().put(JSONObject().put(
-                                "text",
-                                "You are $assistantName, a warm and capable personal voice assistant. " +
-                                    "Speak naturally and conversationally. Understand and respond in Bengali, " +
-                                    "English, Banglish, or the language the user uses. Prefer natural Bangla " +
-                                    "when the user speaks Bangla. Keep responses clear and useful. " +
-                                    "This is a live voice conversation. Do not say you are reading a transcript."
-                            ))))
-                        .put("inputAudioTranscription", JSONObject())
-                        .put("outputAudioTranscription", JSONObject()))
-                if (!webSocket.send(setup.toString())) {
-                    fail("Gemini setup পাঠানো যায়নি: WebSocket send queue বন্ধ")
+                val snapshot = TimeContext.snapshot()
+                lastTimeSyncMillis = System.currentTimeMillis()
+                lastTimeSyncDateKey = snapshot.dateKey
+                val instruction = LiveSessionConfig.systemInstruction(
+                    assistantName = assistantName,
+                    time = snapshot,
+                    searchTool = searchToolMode
+                )
+                val setup = LiveSessionConfig.setupJson(
+                    model = MODEL,
+                    voiceName = VOICE_NAME,
+                    systemInstruction = instruction,
+                    searchTool = searchToolMode
+                )
+                if (!webSocket.send(setup)) {
+                    fail("Gemini setup পাঠানো যায়নি: WebSocket send queue বন্ধ")
                     return
                 }
                 setupMessageSent = true
@@ -129,10 +292,12 @@ class GeminiLiveVoice(
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                if (socket !== webSocket) return
                 onMessage(webSocket, LiveFrameDecoder.decode(bytes.toByteArray()))
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (socket !== webSocket) return
                 try {
                     val root = JSONObject(text)
                     serverMessageCount += 1
@@ -142,6 +307,18 @@ class GeminiLiveVoice(
                     if (apiError != null) {
                         val code = apiError.optInt("code", 0)
                         val message = apiError.optString("message", "Unknown Gemini API error")
+                        // A tool refusal can also arrive in-band as a text error frame.
+                        val rejection = LiveRejection.classify(
+                            code, message, toolsRequested = groundingAvailable
+                        )
+                        if (rejection == Rejection.TOOL_REFUSED &&
+                            !setupDone.get() &&
+                            groundingAvailable &&
+                            !groundingFallbackUsed
+                        ) {
+                            retryWithoutSearch("text error frame")
+                            return
+                        }
                         fail("Gemini API error ${if (code > 0) "($code) " else ""}$message")
                         return
                     }
@@ -153,7 +330,36 @@ class GeminiLiveVoice(
                         setupTimeout = null
                         startAudioPlayback()
                         startAudioCapture()
-                        onStatus("সংযুক্ত। এখন কথা বলুন")
+                        onStatus(
+                            if (groundingAvailable) CONNECTED_WITH_SEARCH_STATUS
+                            else CONNECTED_WITHOUT_SEARCH_STATUS
+                        )
+                        onState(
+                            if (groundingAvailable) LiveState.CONNECTED_GROUNDED
+                            else LiveState.CONNECTED_WITHOUT_SEARCH
+                        )
+                    }
+
+                    // ---- Design 4: the model asks the APP to search ------------------
+                    if (LiveToolProtocol.mightContainToolCall(text)) {
+                        val cancelled = LiveToolProtocol.parseCancellations(text)
+                        if (cancelled.isNotEmpty()) {
+                            searchRunner?.cancel(cancelled)
+                            onStatus("সার্চ বাতিল হয়েছে — আপনি কথা বলেছেন")
+                        }
+                        val calls = LiveToolProtocol.parseSearchCalls(text)
+                        if (calls.isNotEmpty()) handleSearchCalls(calls)
+                    }
+
+                    if (GroundingParser.mightContainGrounding(text)) {
+                        val report = GroundingParser.fromServerMessage(text)
+                        if (report.hasSources) {
+                            groundingForTurn = true
+                            groundingSeen = true
+                            onGrounding(report.sources)
+                            GroundingPolicy.sourceSummary(GroundingPolicy.assess(report))
+                                ?.let { onStatus(it) }
+                        }
                     }
 
                     val serverContent = root.optJSONObject("serverContent")
@@ -165,7 +371,10 @@ class GeminiLiveVoice(
                         }
 
                         serverContent.optJSONObject("inputTranscription")?.optString("text")
-                            ?.takeIf { it.isNotBlank() }?.let { onTranscript(it, false) }
+                            ?.takeIf { it.isNotBlank() }?.let { chunk ->
+                                turnUserSpeech.append(' ').append(chunk)
+                                onTranscript(chunk, false)
+                            }
 
                         serverContent.optJSONObject("outputTranscription")?.optString("text")
                             ?.takeIf { it.isNotBlank() }?.let { onTranscript(it, true) }
@@ -180,6 +389,7 @@ class GeminiLiveVoice(
                         }
                         if (serverContent.optBoolean("turnComplete", false)) {
                             onStatus("শুনছি… আপনি কথা বলতে পারেন")
+                            finishTurn(webSocket)
                         }
                     }
 
@@ -190,41 +400,114 @@ class GeminiLiveVoice(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                if (socket !== webSocket) return
+                closeCallback = "onFailure"
                 setupTimeout?.cancel(false)
+                val httpCode = response?.code ?: 0
                 val http = response?.let { "HTTP ${it.code}: ${it.message}" }
                 val causes = generateSequence(t) { it.cause }
-                    .take(5).joinToString(" <- ") { cause -> "${cause.javaClass.simpleName}: ${cause.message ?: "no message"}" }
-                val message = "Gemini Live সংযোগ ব্যর্থ: ${http ?: t.message ?: "network error"}\nCause: $causes\n${diagnosticSummary()}"
-                running.set(false)
-                stopAudio()
-                if (terminalErrorReported.compareAndSet(false, true)) onError(message)
+                    .take(5).joinToString(" <- ") { cause ->
+                        "${cause.javaClass.simpleName}: ${cause.message ?: "no message"}"
+                    }
+                val message = "Gemini Live \u09b8\u0982\u09af\u09cb\u0997 \u09ac\u09cd\u09af\u09b0\u09cd\u09a5: " +
+                    "${http ?: t.message ?: "network error"}\nCause: $causes\n${diagnosticSummary()}"
+                // One decision, shared with the close-frame path. A 429 upgrade refusal while
+                // search is declared is recoverable exactly once; everything else is terminal.
+                closeFlow.handleFailure(
+                    httpCode = httpCode,
+                    message = message,
+                    hadSearchTool = groundingRequested && groundingAvailable && setupMessageSent,
+                    setupComplete = setupCompleteReceived,
+                    fallbackUsed = groundingFallbackUsed
+                )
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                if (socket !== webSocket) return
+                closeCallback = "onClosing"
                 setupTimeout?.cancel(false)
-                onStatus("Gemini server সংযোগ বন্ধ করছে (code $code): ${reason.ifBlank { "কারণ জানায়নি" }}\n${diagnosticSummary()}")
-                // Wait for onClosed; preserve any earlier terminal error.
+                // THE FIX. OkHttp calls onClosed only after BOTH peers have closed, so a
+                // server-initiated close (which is what Gemini sends) never reaches a handler that
+                // lives on onClosed alone. Decide here instead: the flow echoes the close once and
+                // then acts, so nothing waits indefinitely.
+                if (LiveRejection.isNonBlockingRejection(reason) && !setupCompleteReceived) {
+                    retryWithBlockingFunction("close frame $code")
+                    return
+                }
+                closeFlow.handleCloseFrame(
+                    code = code,
+                    reason = reason,
+                    hadSearchTool = groundingRequested && groundingAvailable && setupMessageSent,
+                    setupComplete = setupCompleteReceived,
+                    fallbackUsed = groundingFallbackUsed
+                )
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                if (socket !== webSocket) return
+                closeCallback = "onClosed"
                 setupTimeout?.cancel(false)
-                if (running.get() && !setupCompleteReceived) {
-                    fail("Gemini setupComplete আসার আগেই server session বন্ধ করেছে (code $code): ${reason.ifBlank { "কারণ জানায়নি" }}")
+                // Same handler as onClosing. The one-time guard makes the second call a no-op, so a
+                // close is never decided twice and never retried twice.
+                if (LiveRejection.isNonBlockingRejection(reason) && !setupCompleteReceived) {
+                    retryWithBlockingFunction("close frame $code")
                     return
                 }
-                val diagnostics = diagnosticSummary()
-                running.set(false)
-                stopAudio()
-                if (!terminalErrorReported.get()) {
-                    if (code != 1000 || reason.isNotBlank()) {
-                        terminalErrorReported.set(true)
-                        onError("Gemini session বন্ধ (code $code): ${reason.ifBlank { "কারণ জানায়নি" }}\n$diagnostics")
-                    } else {
-                        onStatus("Live session বন্ধ হয়েছে\n$diagnostics")
-                    }
-                }
+                closeFlow.handleCloseFrame(
+                    code = code,
+                    reason = reason,
+                    hadSearchTool = groundingRequested && groundingAvailable && setupMessageSent,
+                    setupComplete = setupCompleteReceived,
+                    fallbackUsed = groundingFallbackUsed
+                )
             }
         })
+    }
+
+    /**
+     * Runs after every model turn: if the user asked something time-sensitive and the answer came
+     * back with no live sources, ask the model to say so before moving on. Also keeps the date/time
+     * context fresh.
+     */
+    private fun finishTurn(webSocket: WebSocket) {
+        val spoken = turnUserSpeech.toString().trim()
+        turnUserSpeech.setLength(0)
+        val needsLiveSources = FreshnessClassifier.needsLiveSources(spoken)
+        if (needsLiveSources && !groundingForTurn && !noticeSentForTurn) {
+            noticeSentForTurn = true
+            webSocket.send(
+                LiveSessionConfig.clientContentJson(
+                    GroundingPolicy.fallbackNotice(groundingAvailable)
+                )
+            )
+        }
+        groundingForTurn = false
+        noticeSentForTurn = false
+        maybeSyncTimeContext(webSocket)
+    }
+
+    /**
+     * Re-sends the current date/time when the session crosses midnight or has been running for a
+     * while, so a long conversation never answers with a stale date.
+     */
+    private fun maybeSyncTimeContext(webSocket: WebSocket? = socket) {
+        val target = webSocket ?: return
+        if (!setupDone.get()) return
+        val now = System.currentTimeMillis()
+        val snapshot = TimeContext.snapshot()
+        val dayChanged = snapshot.dateKey != lastTimeSyncDateKey
+        val stale = now - lastTimeSyncMillis > TIME_SYNC_INTERVAL_MILLIS
+        if (!dayChanged && !stale) return
+        lastTimeSyncMillis = now
+        lastTimeSyncDateKey = snapshot.dateKey
+        runCatching { target.send(LiveSessionConfig.clientContentJson(TimeContext.refreshMessage(snapshot))) }
+    }
+
+    private fun startTimeSyncLoop() {
+        timeSyncTask?.cancel(false)
+        timeSyncTask = setupTimer.scheduleWithFixedDelay({
+            if (running.get() && setupDone.get()) maybeSyncTimeContext()
+        }, TIME_SYNC_INTERVAL_MILLIS, TIME_SYNC_INTERVAL_MILLIS, TimeUnit.MILLISECONDS)
     }
 
     private fun diagnosticSummary(): String {
@@ -235,7 +518,144 @@ class GeminiLiveVoice(
             AudioRecord.RECORDSTATE_STOPPED -> "stopped"
             else -> "unavailable"
         }
-        return "WebSocket opened: $websocketOpened | Setup sent: $setupMessageSent | Server messages: $serverMessageCount | Last message keys: $lastServerMessageKeys | SetupComplete: $setupCompleteReceived | Mic initialized: $microphoneInitialized | Mic started: $microphoneStarted | Mic state: $micState ($microphoneStateDetail) | Audio chunks: $chunks | Bytes: $bytes"
+        return "WebSocket opened: $websocketOpened | Setup sent: $setupMessageSent | " +
+            "Server messages: $serverMessageCount | Last message keys: $lastServerMessageKeys | " +
+            "SetupComplete: $setupCompleteReceived | Mic initialized: $microphoneInitialized | " +
+            "Mic started: $microphoneStarted | Mic state: $micState ($microphoneStateDetail) | " +
+            "Audio chunks: $chunks | Bytes: $bytes | Callback: $closeCallback | " +
+            "Echo: $closeEchoed | Search: ${if (groundingAvailable) "on" else "off"} " +
+            "(tool=$searchToolMode, legacyFallback=$groundingFallbackUsed) | build: $FIX_TAG"
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Design 4: the model calls `search_web` -> app searches over REST -> toolResponse
+    // -------------------------------------------------------------------------------------
+
+    /**
+     * Sends one `toolResponse` frame. This is the single send path used by the search runner; it
+     * is deliberately narrow so the existing pause/reconnect/retry logic is untouched.
+     *
+     * @return `false` when the session is already over — the caller must not retry.
+     */
+    fun sendToolResponse(json: String): Boolean {
+        if (!running.get()) return false
+        val target = socket ?: return false
+        return runCatching { target.send(json) }.getOrDefault(false)
+    }
+
+    /** Creates the per-session search runner. No-op when no backend was injected (voice only). */
+    private fun startSearchRunner() {
+        searchRunner?.shutdown()
+        searchRunner = null
+        val backend = searchClient ?: return
+        searchRunner = SearchToolRunner(
+            client = backend,
+            onResult = { call, answer, scheduling ->
+                // The result is always sent, success or failure: a silent call would leave the
+                // model waiting and the user without an answer.
+                sendToolResponse(
+                    LiveToolProtocol.toolResponseJson(call.callId, answer.asToolResult(), scheduling)
+                )
+                if (answer.isSuccess) {
+                    if (answer.sources.isNotEmpty()) runCatching { onGrounding(answer.sources) }
+                    runCatching { onStatus("সার্চ শেষ — ফল জানানো হচ্ছে") }
+                } else {
+                    runCatching { onStatus("সার্চ করা যায়নি") }
+                }
+            },
+            onEvent = { line -> runCatching { onStatus(line) } }
+        )
+    }
+
+    /**
+     * Answers every `search_web` call. Never blocks the WebSocket reader thread: the runner only
+     * schedules coroutines. With no backend injected the model is answered immediately so it is
+     * never left waiting for a response that will never come.
+     */
+    private fun handleSearchCalls(calls: List<SearchFunctionCall>) {
+        val runner = searchRunner
+        if (runner == null) {
+            calls.forEach { call ->
+                sendToolResponse(
+                    LiveToolProtocol.toolResponseJson(
+                        callId = call.callId,
+                        result = "Web search is not available in this session. Tell the user you " +
+                            "cannot search right now, and do not invent facts or links."
+                    )
+                )
+            }
+            return
+        }
+        onStatus("ওয়েব সার্চ শুরু হচ্ছে…")
+        calls.forEach { runner.handle(it) }
+    }
+
+    /**
+     * Recovery when the server refuses `behavior: NON_BLOCKING`: reconnect once with the same
+     * function declared as a normal (blocking) function, and report exactly what the server said.
+     * Search keeps working; the user simply cannot talk over it. Runs at most once per process
+     * because [nonBlockingAccepted] stays false afterwards.
+     */
+    private fun retryWithBlockingFunction(serverSaid: String) {
+        if (!running.get()) return
+        if (!nonBlockingAccepted) return
+        if (!retryInFlight.compareAndSet(false, true)) return
+        nonBlockingAccepted = false
+        searchToolMode = LiveSearchTool.FUNCTION_BLOCKING
+        onStatus("$NON_BLOCKING_UNSUPPORTED_STATUS (server: $serverSaid)")
+        onState(LiveState.CONNECTING)
+        setupTimeout?.cancel(false)
+        setupTimeout = null
+        setupCompleteReceived = false
+        setupMessageSent = false
+        websocketOpened = false
+        serverMessageCount = 0
+        lastServerMessageKeys = "none"
+        searchRunner?.shutdown()
+        searchRunner = null
+        val rejected = socket
+        socket = null
+        runCatching { rejected?.close(1000, "retry with blocking function") }
+        if (running.get()) connect()
+    }
+
+    /**
+     * The single recovery path for a Google Search tool refusal (F2).
+     *
+     * Closes the rejected socket cleanly, then reconnects **exactly once** without the `tools`
+     * field, and remembers the refusal for this credential so later sessions skip it. The
+     * [retryInFlight] latch and [groundingFallbackUsed] make a second retry impossible, and no
+     * caller can reach this after `setupComplete`.
+     */
+    private fun retryWithoutSearch(source: String) {
+        if (!running.get()) return
+        if (!retryInFlight.compareAndSet(false, true)) return
+        groundingFallbackUsed = true
+        groundingAvailable = false
+        searchToolMode = LiveSearchTool.NONE
+        GroundingAvailability.shared.markUnavailable(apiKey)
+        setupTimeout?.cancel(false)
+        setupTimeout = null
+        // Fresh handshake state for the new socket; the old one is detached first so its
+        // late callbacks are ignored.
+        setupCompleteReceived = false
+        setupMessageSent = false
+        websocketOpened = false
+        serverMessageCount = 0
+        lastServerMessageKeys = "none"
+        onStatus("$SEARCH_UNAVAILABLE_STATUS\n(refusal: $source)")
+        onState(LiveState.CONNECTING)
+        val rejected = socket
+        socket = null
+        runCatching { rejected?.close(1000, "retry without grounding") }
+        if (running.get()) connect()
+    }
+
+    /** Ends the session and stops audio. Returns false when it was already finished. */
+    private fun closeRunning(): Boolean {
+        if (!running.getAndSet(false)) return false
+        stopAudio()
+        return true
     }
 
     private fun fail(message: String) {
@@ -246,6 +666,7 @@ class GeminiLiveVoice(
             terminalErrorReported.set(true)
             try { socket?.close(1002, "Session setup failed") } catch (_: Exception) {}
             stopAudio()
+            onState(LiveState.FAILED)
             onError(detailedMessage)
         }
     }
@@ -289,7 +710,7 @@ class GeminiLiveVoice(
                         val message = JSONObject().put(
                             "realtimeInput",
                             JSONObject().put("audio", JSONObject()
-                                .put("mimeType", "audio/pcm;rate=16000")
+                                .put("mimeType", "audio/pcm;rate=$INPUT_RATE")
                                 .put("data", payload))
                         )
                         val activeSocket = socket
@@ -362,14 +783,21 @@ class GeminiLiveVoice(
     fun stop() {
         if (!running.getAndSet(false)) return
         try {
+            timeSyncTask?.cancel(false)
+            timeSyncTask = null
             socket?.send(JSONObject().put("realtimeInput", JSONObject().put("audioStreamEnd", true)).toString())
             socket?.close(1000, "User stopped session")
         } catch (_: Exception) {}
         stopAudio()
-        onStatus("Live voice বন্ধ")
+        onStatus("Live voice \u09ac\u09a8\u09cd\u09a7")
+        onState(LiveState.ENDED)
     }
 
     private fun stopAudio() {
+        // Every terminal path (user stop, close frame, failure) goes through here, so outstanding
+        // searches are cancelled and their late results can never reach a dead socket.
+        searchRunner?.shutdown()
+        searchRunner = null
         setupTimeout?.cancel(false)
         setupTimeout = null
         setupTimer.shutdownNow()

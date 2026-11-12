@@ -3,7 +3,7 @@ name: Android Build
 
 on:
   push:
-    branches: [ "main", "fix/gemini-live-session-lifecycle" ]
+    branches: [ "main", "fix/gemini-live-session-lifecycle", "jarves-wip-backup" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:

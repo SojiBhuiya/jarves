@@ -12,8 +12,8 @@ android {
         applicationId = "com.sojibhuiya.jarves"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.2.0"
+        versionCode = 6
+        versionName = "0.2.2"
     }
 
     signingConfigs {
@@ -59,6 +59,9 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // Design 4 uses runInterruptible() and withTimeoutOrNull() directly, so the coroutines
+    // runtime must not be left to a transitive version.
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     testImplementation("junit:junit:4.13.2")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

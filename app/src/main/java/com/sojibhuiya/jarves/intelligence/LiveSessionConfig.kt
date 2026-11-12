@@ -1,0 +1,212 @@
+package com.sojibhuiya.jarves.intelligence
+
+import com.sojibhuiya.jarves.apiproviders.MiniJson
+
+/**
+ * Which search tool (if any) the Live session declares.
+ *
+ * Design 4: the Live session no longer asks Google to run the search itself. It declares a
+ * **function** (`search_web`) that the app answers from its own REST grounding call. The built-in
+ * `googleSearch` tool is deliberately NOT sent, because a project without Live grounding
+ * entitlement has the whole session refused when that tool is present.
+ */
+enum class LiveSearchTool {
+    /** No tools at all: voice only, no search. */
+    NONE,
+
+    /**
+     * `search_web` declared with `behavior: NON_BLOCKING`, so the model keeps talking while the
+     * app searches, and the result is announced when it arrives.
+     */
+    FUNCTION_NON_BLOCKING,
+
+    /**
+     * `search_web` declared without `behavior` (server default = blocking). Used only when the
+     * server rejects NON_BLOCKING for this model; the model then waits for the result before
+     * speaking. Degraded, but still working search.
+     */
+    FUNCTION_BLOCKING;
+
+    val declaresFunction: Boolean get() = this != NONE
+}
+
+/**
+ * Builds the Gemini Live session payload and its instruction text.
+ *
+ * **Tool architecture (Design 4).** The session declares exactly one tool: a function
+ * `search_web`. Retrieval happens in [GroundedSearchClient] over REST with
+ * `tools:[{"google_search":{}}]` on `gemini-2.5-flash`, and the result is handed back to the live
+ * session as a `toolResponse`. Consequences:
+ *  * the Live setup never contains `googleSearch`, so the quota refusal that kills the whole
+ *    session cannot happen;
+ *  * the user keeps talking while the search runs (`behavior: NON_BLOCKING`);
+ *  * the app decides when a search happens, so it is controllable and cheap.
+ */
+object LiveSessionConfig {
+
+    /** Name used in the function declaration and in every `toolResponse`. */
+    const val FUNCTION_SEARCH_WEB = "search_web"
+
+    /** Kept for the legacy-compatibility test only: this string must never appear in a setup frame. */
+    const val TOOL_GOOGLE_SEARCH = "googleSearch"
+
+    const val BEHAVIOR_NON_BLOCKING = "NON_BLOCKING"
+
+    /** Marker that tells the instruction builder (and the tests) a search tool is available. */
+    private const val MARK_SEARCH = "You can search the live web"
+
+    fun searchEnabled(systemInstruction: String): Boolean = systemInstruction.contains(MARK_SEARCH)
+
+    /**
+     * The complete system instruction: identity, freshness rules, source rules, honesty rules and
+     * the current date/time block.
+     */
+    fun systemInstruction(
+        assistantName: String,
+        time: TimeContext.Snapshot,
+        searchTool: LiveSearchTool
+    ): String = buildString {
+        appendLine(
+            "You are $assistantName, a warm and capable personal voice assistant. " +
+                "Speak naturally and conversationally. Understand and respond in Bengali, English, " +
+                "Banglish, or the language the user uses. Prefer natural Bangla when the user speaks " +
+                "Bangla. Keep responses clear, useful and concise. This is a live voice conversation. " +
+                "Do not say you are reading a transcript."
+        )
+        appendLine()
+        appendLine("CURRENT INFORMATION RULES:")
+        if (searchTool.declaresFunction) {
+            appendLine(
+                "$MARK_SEARCH by calling the `$FUNCTION_SEARCH_WEB` function. Whenever the user asks " +
+                    "about anything that changes over time — who currently holds an office (Prime " +
+                    "Minister, President, Chief Adviser, ministers, CEOs), today's date or time, news, " +
+                    "prices, exchange rates, weather, sports results, events, laws or anything 'latest' " +
+                    "or 'current' — call `$FUNCTION_SEARCH_WEB` first and answer from the results it " +
+                    "returns. Never answer such a question from memory alone."
+            )
+            appendLine(
+                "While the search is running, say one short sentence in the user's language that you " +
+                    "are checking — for example: \"একটু দেখে নিচ্ছি, এক মুহূর্ত…\". Do not guess an " +
+                    "answer before the result arrives, and do not stay silent for long."
+            )
+            appendLine(
+                "When the result comes back, announce it briefly in the user's language and name the " +
+                    "source you used. If the result says the search failed, say so plainly and do not " +
+                    "invent facts or links."
+            )
+        } else {
+            appendLine(
+                "Web search is NOT available in this session. For any question about current affairs, " +
+                    "current office holders, today's date, news, prices, weather or anything 'latest', " +
+                    "say plainly that you cannot verify live information right now, and do not present " +
+                    "remembered facts as confirmed current information."
+            )
+        }
+        appendLine(
+            "Prefer the most recent sources. When a fact is disputed, compare the sources, report the " +
+                "disagreement instead of choosing one side silently, and separate what is confirmed from " +
+                "what is uncertain. Name the sources you used, briefly, in the spoken answer."
+        )
+        appendLine(
+            "Stable knowledge (history, definitions, fixed past events, mathematics) does not need a " +
+                "search; answer it directly and accurately."
+        )
+        appendLine(
+            "Never state a date, time or 'current' fact that you have not been given or verified in " +
+                "this session. If you are unsure, say so."
+        )
+        appendLine()
+        append(TimeContext.instructionBlock(time))
+    }
+
+    /**
+     * One `search_web` declaration. [nonBlocking] adds `behavior: NON_BLOCKING`, which makes the
+     * model continue the conversation instead of waiting for the result.
+     */
+    fun searchFunctionDeclaration(nonBlocking: Boolean): Map<String, Any?> = linkedMapOf<String, Any?>(
+        "name" to FUNCTION_SEARCH_WEB,
+        "description" to (
+            "Search the live web. Use for any current or time-sensitive question. " +
+                "Returns current facts with source URLs."
+            ),
+        "parameters" to linkedMapOf<String, Any?>(
+            "type" to "OBJECT",
+            "properties" to linkedMapOf<String, Any?>(
+                "query" to linkedMapOf<String, Any?>(
+                    "type" to "STRING",
+                    "description" to "The search query, in the language of the user's question."
+                )
+            ),
+            "required" to listOf("query")
+        )
+    ).also { declaration ->
+        if (nonBlocking) declaration["behavior"] = BEHAVIOR_NON_BLOCKING
+    }
+
+    /** The `tools` array for a given mode; empty for [LiveSearchTool.NONE]. */
+    fun toolsJson(searchTool: LiveSearchTool): List<Map<String, Any?>> = when (searchTool) {
+        LiveSearchTool.NONE -> emptyList()
+        LiveSearchTool.FUNCTION_NON_BLOCKING -> listOf(
+            linkedMapOf<String, Any?>(
+                "functionDeclarations" to listOf(searchFunctionDeclaration(nonBlocking = true))
+            )
+        )
+        LiveSearchTool.FUNCTION_BLOCKING -> listOf(
+            linkedMapOf<String, Any?>(
+                "functionDeclarations" to listOf(searchFunctionDeclaration(nonBlocking = false))
+            )
+        )
+    }
+
+    /**
+     * The setup message, serialized with the app's dependency-free JSON writer so the exact
+     * payload is unit-tested.
+     */
+    fun setupJson(
+        model: String,
+        voiceName: String,
+        systemInstruction: String,
+        searchTool: LiveSearchTool,
+        inputTranscription: Boolean = true,
+        outputTranscription: Boolean = true
+    ): String {
+        val generationConfig = linkedMapOf<String, Any?>(
+            "responseModalities" to listOf("AUDIO"),
+            "speechConfig" to linkedMapOf<String, Any?>(
+                "voiceConfig" to linkedMapOf<String, Any?>(
+                    "prebuiltVoiceConfig" to linkedMapOf<String, Any?>("voiceName" to voiceName)
+                )
+            )
+        )
+        val setup = linkedMapOf<String, Any?>(
+            "model" to "models/$model",
+            "generationConfig" to generationConfig,
+            "systemInstruction" to linkedMapOf<String, Any?>(
+                "parts" to listOf(linkedMapOf<String, Any?>("text" to systemInstruction))
+            )
+        )
+        // Exactly one function tool, and never `googleSearch` (Design 4).
+        val tools = toolsJson(searchTool)
+        if (tools.isNotEmpty()) setup["tools"] = tools
+        if (inputTranscription) setup["inputAudioTranscription"] = emptyMap<String, Any?>()
+        if (outputTranscription) setup["outputAudioTranscription"] = emptyMap<String, Any?>()
+
+        return MiniJson.encode(linkedMapOf<String, Any?>("setup" to setup))
+    }
+
+    /** clientContent message carrying free text into the running session. */
+    fun clientContentJson(text: String, turnComplete: Boolean = false): String =
+        MiniJson.encode(
+            linkedMapOf<String, Any?>(
+                "clientContent" to linkedMapOf<String, Any?>(
+                    "turns" to listOf(
+                        linkedMapOf<String, Any?>(
+                            "role" to "user",
+                            "parts" to listOf(linkedMapOf<String, Any?>("text" to text))
+                        )
+                    ),
+                    "turnComplete" to turnComplete
+                )
+            )
+        )
+}
