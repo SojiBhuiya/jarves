@@ -20,6 +20,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -298,12 +299,15 @@ private fun MessageBubble(message: ChatMessage) {
                 fontWeight = FontWeight.Medium
             )
             Spacer(Modifier.height(4.dp))
-            Text(
-                text = message.text,
-                color = if (fromUser) JarvesColors.TextSecondary else JarvesColors.TextPrimary,
-                fontSize = 13.5.sp,
-                lineHeight = 19.sp
-            )
+            // Selectable: a search-failure report lands here and has to be copyable.
+            SelectionContainer {
+                Text(
+                    text = message.text,
+                    color = if (fromUser) JarvesColors.TextSecondary else JarvesColors.TextPrimary,
+                    fontSize = 13.5.sp,
+                    lineHeight = 19.sp
+                )
+            }
             if (!fromUser && message.sources.isNotEmpty()) {
                 Spacer(Modifier.height(8.dp))
                 Text(

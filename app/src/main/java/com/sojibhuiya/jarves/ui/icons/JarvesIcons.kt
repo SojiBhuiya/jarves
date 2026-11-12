@@ -244,6 +244,29 @@ object JarvesIcons {
         }
     }
 
+    /** copy — duplicated sheets, used by the "copy diagnostics" action */
+    val Copy: ImageVector = strokeIcon("Jarves.Copy") {
+        strokePath {
+            // Front sheet.
+            moveTo(8.5f, 8.5f); horizontalLineTo(18f)
+            arcTo(1.5f, 1.5f, 0f, false, true, 19.5f, 10f)
+            verticalLineTo(19.5f)
+            arcTo(1.5f, 1.5f, 0f, false, true, 18f, 21f)
+            horizontalLineTo(8.5f)
+            arcTo(1.5f, 1.5f, 0f, false, true, 7f, 19.5f)
+            verticalLineTo(10f)
+            arcTo(1.5f, 1.5f, 0f, false, true, 8.5f, 8.5f)
+            close()
+        }
+        strokePath {
+            // Back sheet, partially visible behind it.
+            moveTo(5f, 15.5f)
+            verticalLineTo(5.5f)
+            arcTo(1.5f, 1.5f, 0f, false, true, 6.5f, 4f)
+            horizontalLineTo(16f)
+        }
+    }
+
     /** arrow-left */
     val ArrowLeft: ImageVector = strokeIcon("Jarves.ArrowLeft") {
         strokePath {

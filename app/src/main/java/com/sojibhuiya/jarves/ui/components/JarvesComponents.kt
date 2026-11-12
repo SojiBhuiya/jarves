@@ -1,6 +1,7 @@
 package com.sojibhuiya.jarves.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -400,9 +401,20 @@ fun JarvesTextField(
     }
 }
 
-/** Inline status/error line. */
+/**
+ * Inline status/error line.
+ *
+ * The text is selectable on purpose: the line is where the on-device diagnostic block appears, and
+ * a user has to be able to copy it (long-press / drag) and send it on. When [onCopy] is supplied a
+ * small copy action is shown as well, so one tap takes the whole line.
+ */
 @Composable
-fun JarvesStatusLine(text: String, isError: Boolean, modifier: Modifier = Modifier) {
+fun JarvesStatusLine(
+    text: String,
+    isError: Boolean,
+    modifier: Modifier = Modifier,
+    onCopy: (() -> Unit)? = null
+) {
     if (text.isBlank()) return
     Row(modifier = modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Box(
@@ -412,11 +424,22 @@ fun JarvesStatusLine(text: String, isError: Boolean, modifier: Modifier = Modifi
                 .background(if (isError) JarvesColors.Danger else JarvesColors.Success)
         )
         Spacer(Modifier.width(8.dp))
-        Text(
-            text = text,
-            color = if (isError) JarvesColors.Danger else JarvesColors.TextSecondary,
-            fontSize = 11.5.sp
-        )
+        SelectionContainer(Modifier.weight(1f)) {
+            Text(
+                text = text,
+                color = if (isError) JarvesColors.Danger else JarvesColors.TextSecondary,
+                fontSize = 11.5.sp
+            )
+        }
+        if (onCopy != null) {
+            Spacer(Modifier.width(8.dp))
+            JarvesIconTextAction(
+                icon = JarvesIcons.Copy,
+                label = "Copy",
+                onClick = onCopy,
+                tint = JarvesColors.Accent
+            )
+        }
     }
 }
 

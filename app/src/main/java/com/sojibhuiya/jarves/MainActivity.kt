@@ -187,6 +187,23 @@ private fun AgiApp() {
     }
 
     /**
+     * Design 4 (0.2.4): writes the search failure report into the active conversation as its own
+     * message, so the real HTTP status and Google's own error text are visible and selectable in
+     * the chat instead of only being spoken by the model. Any speech still buffered for this turn
+     * is flushed first, so the report never lands in the middle of a sentence.
+     */
+    private fun appendSearchReport(report: String) {
+        if (report.isBlank()) return
+        flushTranscript(fromUser = true)
+        flushTranscript(fromUser = false)
+        val conversationId = activeConversationId ?: return
+        scope.launch {
+            conversationRepository.appendMessage(conversationId, report, fromUser = false)
+                ?.let { conversations = it }
+        }
+    }
+
+    /**
      * New Chat: a brand new conversation with its own id, plus a stopped voice session so the next
      * Gemini Live connection starts without the previous conversation's context.
      */
@@ -308,6 +325,7 @@ private fun AgiApp() {
                 onGrounding = { sources ->
                     pendingSources = sources.map { ChatSource(title = it.title, url = it.url) }
                 },
+                onSearchReport = { report -> scope.launch { appendSearchReport(report) } },
                 onError = { message ->
                     scope.launch {
                         status = message
@@ -538,6 +556,8 @@ private fun SettingsScreen(
 ) {
     var editingName by remember(assistantName) { mutableStateOf(assistantName.isBlank()) }
     var draftName by remember(assistantName) { mutableStateOf(assistantName) }
+    // Needed by the copy action on the diagnostic line below.
+    val context = LocalContext.current
 
     Column(
         Modifier
@@ -634,7 +654,12 @@ private fun SettingsScreen(
 
         if (status.isNotBlank()) {
             Spacer(Modifier.height(12.dp))
-            JarvesStatusLine(text = status, isError = false)
+            // 0.2.4: the diagnostic block appears on this line; make it copyable in one tap.
+            JarvesStatusLine(
+                text = status,
+                isError = false,
+                onCopy = { copyToClipboard(context, "Jarves diagnostics", status) }
+            )
         }
 
         Spacer(Modifier.height(18.dp))
@@ -702,5 +727,18 @@ private fun ApiProvidersRow(
             tint = JarvesColors.TextMuted,
             modifier = Modifier.size(16.dp)
         )
+    }
+}
+
+/**
+ * Puts [text] on the system clipboard. Used by the diagnostic line so the user can send the exact
+ * on-device numbers without retyping them. The API key never reaches this text: everything that
+ * arrives here has already been scrubbed by the search client.
+ */
+private fun copyToClipboard(context: android.content.Context, label: String, text: String) {
+    runCatching {
+        val manager = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+            as? android.content.ClipboardManager ?: return
+        manager.setPrimaryClip(android.content.ClipData.newPlainText(label, text))
     }
 }

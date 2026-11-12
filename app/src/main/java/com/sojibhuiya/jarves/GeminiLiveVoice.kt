@@ -60,7 +60,13 @@ class GeminiLiveVoice(
      * Design 4 search backend. `null` means voice-only: no function tool is declared and the app
      * never makes a REST search call.
      */
-    private val searchClient: GroundedSearchClient? = null
+    private val searchClient: GroundedSearchClient? = null,
+    /**
+     * Design 4 (0.2.4): the technical failure text that must also appear *in the chat*, so the user
+     * can read and copy the real HTTP status and Google's own error message. Called only when a
+     * search fails; already scrubbed of anything key-shaped.
+     */
+    private val onSearchReport: (String) -> Unit = {}
 ) {
     companion object {
         /**
@@ -95,7 +101,7 @@ class GeminiLiveVoice(
             "\u09b8\u0982\u09af\u09c1\u0995\u09cd\u09a4\u0964 \u098f\u0996\u09a8 \u0995\u09a5\u09be \u09ac\u09b2\u09c1\u09a8 (\u09b2\u09be\u0987\u09ad \u09b8\u09be\u09b0\u09cd\u099a \u099b\u09be\u09a1\u09bc\u09be \u2014 \u09b2\u09be\u0987\u09ad \u09a4\u09a5\u09cd\u09af \u09af\u09be\u099a\u09be\u0987 \u0995\u09b0\u09be \u09af\u09be\u09ac\u09c7 \u09a8\u09be)"
 
         /** Identifies this build in the on-device diagnostic block. */
-        const val FIX_TAG = "design4-1"
+        const val FIX_TAG = "design4-2"
 
         /** Connected status when live search verification is available. */
         const val CONNECTED_WITH_SEARCH_STATUS =
@@ -581,7 +587,9 @@ class GeminiLiveVoice(
                 } else {
                     "${answer.failure}" +
                         (if (answer.statusCode > 0) " HTTP ${answer.statusCode}" else "") +
-                        (if (answer.detail.isNotBlank()) " [${answer.detail}]" else "")
+                        (if (answer.serverMessage.isNotBlank()) " google=[${answer.serverMessage}]" else "") +
+                        (if (answer.detail.isNotBlank()) " [${answer.detail}]" else "") +
+                        (if (answer.model.isNotBlank()) " model=${answer.model}" else "")
                 }
                 if (answer.isSuccess) {
                     if (answer.sources.isNotEmpty()) runCatching { onGrounding(answer.sources) }
@@ -590,6 +598,8 @@ class GeminiLiveVoice(
                     // The technical reason is shown too: without it a user cannot tell a genuine
                     // connection problem from an app fault, which is exactly what went wrong in 0.2.2.
                     runCatching { onStatus("সার্চ করা যায়নি — $lastSearchOutcome") }
+                    // 0.2.4: the same facts, in a place the user can actually select and copy.
+                    runCatching { onSearchReport(answer.failureReport()) }
                 }
             },
             onEvent = { line -> runCatching { onStatus(line) } }
