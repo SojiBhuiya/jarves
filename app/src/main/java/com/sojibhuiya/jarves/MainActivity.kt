@@ -192,7 +192,7 @@ private fun AgiApp() {
      * the chat instead of only being spoken by the model. Any speech still buffered for this turn
      * is flushed first, so the report never lands in the middle of a sentence.
      */
-    private fun appendSearchReport(report: String) {
+    fun appendSearchReport(report: String) {
         if (report.isBlank()) return
         flushTranscript(fromUser = true)
         flushTranscript(fromUser = false)
