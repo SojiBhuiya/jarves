@@ -37,7 +37,15 @@ enum class GroundedSearchFailure {
     EMPTY,
 
     /** Too many searches were already running; this one was refused on purpose. */
-    BUSY
+    BUSY,
+
+    /**
+     * The search failed inside the app (a bug or an unreadable response), NOT on the network.
+     * Kept separate from [NETWORK] so an app fault never gets reported to the user as "you have
+     * no internet". This is the value that would have exposed the gzip/EOFException bug instead
+     * of hiding it behind a network message.
+     */
+    INTERNAL
 }
 
 /**
@@ -50,7 +58,9 @@ data class GroundedAnswer(
     val sources: List<GroundedSource> = emptyList(),
     val failure: GroundedSearchFailure? = null,
     val statusCode: Int = 0,
-    val elapsedMillis: Long = 0L
+    val elapsedMillis: Long = 0L,
+    /** Short, secret-free technical detail (exception class or parse note) for diagnostics only. */
+    val detail: String = ""
 ) {
     val isSuccess: Boolean get() = failure == null && text.isNotBlank()
 
@@ -92,6 +102,9 @@ data class GroundedAnswer(
         GroundedSearchFailure.EMPTY ->
             "The web search returned nothing usable. Tell the user in their language that you could " +
                 "not find live results, and do not invent facts or links."
+        GroundedSearchFailure.INTERNAL ->
+            "The web search failed inside the app before it could reach the network. Tell the user " +
+                "in their language that the search could not run, and do not invent facts or links."
         GroundedSearchFailure.BUSY ->
             "Two searches were already running, so this one was not started. Tell the user in their " +
                 "language, in one short sentence, that you are still looking at the earlier question " +
@@ -126,18 +139,22 @@ class OkHttpRestTransport(
         .readTimeout(20, TimeUnit.SECONDS)
         .callTimeout(25, TimeUnit.SECONDS)
         .build(),
-    private val maxBodyBytes: Long = 1L shl 20
+    private val maxBodyChars: Int = 1 shl 20
 ) : RestTransport {
 
     override fun post(request: RestRequest): RestResponse {
         val builder = Request.Builder().url(request.url).post(request.body.toRequestBody(JSON))
         request.headers.forEach { (name, value) -> builder.header(name, value) }
         return client.newCall(builder.build()).execute().use { response ->
-            val body = response.body?.let { source ->
-                val available = if (source.contentLength() >= 0) source.contentLength() else maxBodyBytes
-                String(source.source().readByteArray(minOf(maxBodyBytes, available)), Charsets.UTF_8)
-            }.orEmpty()
-            RestResponse(response.code, body)
+            // `string()` reads the body through OkHttp's decompressing source until EOF.
+            //
+            // Do NOT "optimise" this into readByteArray(contentLength()): when the length is
+            // unknown (-1, as for chunked or gzip responses — and Google gzips its responses) the
+            // fallback demanded 1 MiB from a few-hundred-byte body, and okio's readByteArray(count)
+            // requires exactly that many bytes, so it threw EOFException. That is the bug that made
+            // every search in 0.2.2 fail and get reported to the user as "no internet connection".
+            val body = response.body?.string().orEmpty()
+            RestResponse(response.code, if (body.length > maxBodyChars) body.take(maxBodyChars) else body)
         }
     }
 
@@ -183,8 +200,9 @@ class GroundedSearchClient(
             return@withContext GroundedAnswer(
                 query = trimmed,
                 text = "",
-                failure = GroundedSearchFailure.NETWORK,
-                elapsedMillis = clock() - started
+                failure = classifyException(e),
+                elapsedMillis = clock() - started,
+                detail = e.javaClass.simpleName + (e.message?.let { ": ${it.take(120)}" } ?: "")
             )
         }
         parseResponse(trimmed, response.code, response.body)
@@ -277,6 +295,33 @@ class GroundedSearchClient(
                 failure = if (text.isBlank()) GroundedSearchFailure.EMPTY else null,
                 statusCode = statusCode
             )
+        }
+
+        /**
+         * Maps a thrown exception to the honest failure.
+         *
+         * Only genuine connectivity problems may become [GroundedSearchFailure.NETWORK];
+         * `EOFException` is checked first and becomes [GroundedSearchFailure.INTERNAL], because
+         * okio/OkHttp signal "the body ended before the count I asked for" that way — an app-side
+         * read error that must never read as "you have no internet".
+         */
+        fun classifyException(e: Exception): GroundedSearchFailure = when (e) {
+            is java.io.EOFException -> GroundedSearchFailure.INTERNAL
+
+            is java.net.SocketTimeoutException,
+            is java.io.InterruptedIOException -> GroundedSearchFailure.TIMEOUT
+
+            is java.net.UnknownHostException,
+            is java.net.ConnectException,
+            is java.net.NoRouteToHostException,
+            is java.net.PortUnreachableException,
+            is javax.net.ssl.SSLException,
+            is java.net.SocketException -> GroundedSearchFailure.NETWORK
+
+            // Remaining I/O failures are ordinary transport problems.
+            is java.io.IOException -> GroundedSearchFailure.NETWORK
+
+            else -> GroundedSearchFailure.INTERNAL
         }
 
         /** Maps a status/reason to the failure the model is told about. */

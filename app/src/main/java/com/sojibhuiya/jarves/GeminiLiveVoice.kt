@@ -95,7 +95,7 @@ class GeminiLiveVoice(
             "\u09b8\u0982\u09af\u09c1\u0995\u09cd\u09a4\u0964 \u098f\u0996\u09a8 \u0995\u09a5\u09be \u09ac\u09b2\u09c1\u09a8 (\u09b2\u09be\u0987\u09ad \u09b8\u09be\u09b0\u09cd\u099a \u099b\u09be\u09a1\u09bc\u09be \u2014 \u09b2\u09be\u0987\u09ad \u09a4\u09a5\u09cd\u09af \u09af\u09be\u099a\u09be\u0987 \u0995\u09b0\u09be \u09af\u09be\u09ac\u09c7 \u09a8\u09be)"
 
         /** Identifies this build in the on-device diagnostic block. */
-        const val FIX_TAG = "refusal-2"
+        const val FIX_TAG = "design4-1"
 
         /** Connected status when live search verification is available. */
         const val CONNECTED_WITH_SEARCH_STATUS =
@@ -112,6 +112,12 @@ class GeminiLiveVoice(
     @Volatile private var setupMessageSent = false
     @Volatile private var serverMessageCount = 0
     @Volatile private var lastServerMessageKeys = "none"
+    /** Design 4 telemetry: answers "did the model ever ask us to search?" on the device. */
+    @Volatile private var toolCallCount = 0
+    @Volatile private var lastToolQuery = "none"
+    @Volatile private var lastSearchOutcome = "none"
+    /** What the setup frame declared, so the diagnostic block can prove tools were sent. */
+    @Volatile private var setupDeclaredTool = "none"
     @Volatile private var microphoneInitialized = false
     @Volatile private var microphoneStarted = false
     @Volatile private var microphoneStateDetail = "not created"
@@ -282,7 +288,15 @@ class GeminiLiveVoice(
                     return
                 }
                 setupMessageSent = true
-                onStatus("Setup message পাঠানো হয়েছে; Gemini response-এর অপেক্ষায়…")
+                setupDeclaredTool = when (searchToolMode) {
+                    LiveSearchTool.NONE -> "none"
+                    LiveSearchTool.FUNCTION_NON_BLOCKING -> "search_web/NON_BLOCKING"
+                    LiveSearchTool.FUNCTION_BLOCKING -> "search_web/blocking"
+                }
+                lastSearchOutcome = "no toolCall yet"
+                toolCallCount = 0
+                lastToolQuery = "none"
+                onStatus("Setup message পাঠানো হয়েছে (tools: $setupDeclaredTool); response-এর অপেক্ষায়…")
                 setupTimeout?.cancel(false)
                 setupTimeout = setupTimer.schedule({
                     if (running.get() && !setupDone.get()) {
@@ -348,7 +362,11 @@ class GeminiLiveVoice(
                             onStatus("সার্চ বাতিল হয়েছে — আপনি কথা বলেছেন")
                         }
                         val calls = LiveToolProtocol.parseSearchCalls(text)
-                        if (calls.isNotEmpty()) handleSearchCalls(calls)
+                        if (calls.isNotEmpty()) {
+                            toolCallCount += calls.size
+                            lastToolQuery = calls.first().query.take(60)
+                            handleSearchCalls(calls)
+                        }
                     }
 
                     if (GroundingParser.mightContainGrounding(text)) {
@@ -524,7 +542,9 @@ class GeminiLiveVoice(
             "Mic started: $microphoneStarted | Mic state: $micState ($microphoneStateDetail) | " +
             "Audio chunks: $chunks | Bytes: $bytes | Callback: $closeCallback | " +
             "Echo: $closeEchoed | Search: ${if (groundingAvailable) "on" else "off"} " +
-            "(tool=$searchToolMode, legacyFallback=$groundingFallbackUsed) | build: $FIX_TAG"
+            "(tool=$searchToolMode, legacyFallback=$groundingFallbackUsed) | " +
+            "Setup tools: $setupDeclaredTool | toolCalls: $toolCallCount | " +
+            "Last query: $lastToolQuery | Last search: $lastSearchOutcome | build: $FIX_TAG"
     }
 
     // -------------------------------------------------------------------------------------
@@ -556,11 +576,20 @@ class GeminiLiveVoice(
                 sendToolResponse(
                     LiveToolProtocol.toolResponseJson(call.callId, answer.asToolResult(), scheduling)
                 )
+                lastSearchOutcome = if (answer.isSuccess) {
+                    "ok (${answer.sources.size} sources, ${answer.elapsedMillis}ms)"
+                } else {
+                    "${answer.failure}" +
+                        (if (answer.statusCode > 0) " HTTP ${answer.statusCode}" else "") +
+                        (if (answer.detail.isNotBlank()) " [${answer.detail}]" else "")
+                }
                 if (answer.isSuccess) {
                     if (answer.sources.isNotEmpty()) runCatching { onGrounding(answer.sources) }
                     runCatching { onStatus("সার্চ শেষ — ফল জানানো হচ্ছে") }
                 } else {
-                    runCatching { onStatus("সার্চ করা যায়নি") }
+                    // The technical reason is shown too: without it a user cannot tell a genuine
+                    // connection problem from an app fault, which is exactly what went wrong in 0.2.2.
+                    runCatching { onStatus("সার্চ করা যায়নি — $lastSearchOutcome") }
                 }
             },
             onEvent = { line -> runCatching { onStatus(line) } }

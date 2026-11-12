@@ -12,8 +12,8 @@ android {
         applicationId = "com.sojibhuiya.jarves"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.2.2"
+        versionCode = 7
+        versionName = "0.2.3"
     }
 
     signingConfigs {
@@ -63,5 +63,8 @@ dependencies {
     // runtime must not be left to a transitive version.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     testImplementation("junit:junit:4.13.2")
+    // Exercises the REAL OkHttp transport (incl. gzip/chunked decoding) instead of a fake —
+    // the gap that let the 0.2.2 "no internet connection" bug through.
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

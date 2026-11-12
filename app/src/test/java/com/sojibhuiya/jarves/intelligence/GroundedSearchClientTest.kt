@@ -224,6 +224,53 @@ class GroundedSearchClientTest {
         assertEquals(GroundedSearchFailure.EMPTY, answer.failure)
     }
 
+    // ---- honest failure classification --------------------------------------------------
+
+    @Test
+    fun onlyRealConnectivityProblemsAreReportedAsNetworkTrouble() {
+        // The lesson from 0.2.2: an app-side parsing fault (EOFException) must NOT be shown to the
+        // user as "no internet connection".
+        assertEquals(
+            GroundedSearchFailure.NETWORK,
+            GroundedSearchClient.classifyException(java.net.UnknownHostException("no dns"))
+        )
+        assertEquals(
+            GroundedSearchFailure.NETWORK,
+            GroundedSearchClient.classifyException(java.net.ConnectException("refused"))
+        )
+        assertEquals(
+            GroundedSearchFailure.TIMEOUT,
+            GroundedSearchClient.classifyException(java.net.SocketTimeoutException("slow"))
+        )
+        assertEquals(
+            "an EOF while reading a body is our bug, not the user's network",
+            GroundedSearchFailure.INTERNAL,
+            GroundedSearchClient.classifyException(java.io.EOFException())
+        )
+        assertEquals(
+            GroundedSearchFailure.INTERNAL,
+            GroundedSearchClient.classifyException(IllegalStateException("boom"))
+        )
+    }
+
+    @Test
+    fun anInternalFailureNeverSaysNoInternet() {
+        val wording = GroundedAnswer("q", "", failure = GroundedSearchFailure.INTERNAL).asToolResult()
+        assertFalse("must not blame the network", wording.contains("network connection", ignoreCase = true))
+        assertTrue(wording.contains("inside the app", ignoreCase = true))
+        assertTrue(wording.contains("do not invent", ignoreCase = true))
+    }
+
+    @Test
+    fun theTransportFailureKeepsATechnicalDetailForDiagnostics() {
+        val c = client { throw java.io.EOFException() }
+        val answer = kotlinx.coroutines.runBlocking { c.search("q") }
+        assertEquals(GroundedSearchFailure.INTERNAL, answer.failure)
+        assertTrue("detail must name the exception class", answer.detail.contains("EOFException"))
+        // …and the detail must never leak into what the model is told.
+        assertFalse(answer.asToolResult().contains("EOFException"))
+    }
+
     @Test
     fun duplicateSourceUrlsAreCollapsed() {
         val body = """
