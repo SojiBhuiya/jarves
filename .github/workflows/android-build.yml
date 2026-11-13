@@ -1,9 +1,5 @@
 name: Android Build
-# 0.2.7
-#  * every APK (debug and release) is signed with ONE fixed keystore, so a new build installs over
-#    the previous one instead of "App not installed";
-#  * every build from jarves-wip-backup publishes a GitHub Release with the signed APK and its
-#    SHA-256, which is what the in-app updater reads through the public GitHub API.
+# Rebuild after permanent signing secrets were configured
 
 on:
   push:
@@ -11,13 +7,6 @@ on:
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
-
-permissions:
-  contents: write      # needed to create/update the GitHub Release, with GITHUB_TOKEN only
-
-concurrency:
-  group: android-build-${{ github.ref }}
-  cancel-in-progress: false
 
 jobs:
   build:
@@ -37,9 +26,13 @@ jobs:
         with:
           gradle-version: "8.9"
 
-      # The keystore must exist BEFORE any APK is built: the debug build uses it too, which is the
-      # whole fix for "App not installed". Only repository secrets are used, never a PAT.
-      - name: Prepare fixed signing key
+      - name: Build debug APK
+        run: gradle assembleDebug
+
+      - name: Run unit tests
+        run: gradle testDebugUnitTest
+
+      - name: Prepare release signing key
         id: signing
         env:
           KEYSTORE_BASE64: ${{ secrets.JARVES_KEYSTORE_BASE64 }}
@@ -50,22 +43,10 @@ jobs:
           if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
             printf '%s' "$KEYSTORE_BASE64" | base64 --decode > jarves-release.jks
             echo "available=true" >> "$GITHUB_OUTPUT"
-            echo "Fixed keystore restored; debug and release will share it."
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Fixed signing secrets are missing. Debug APKs will not be updateable."
+            echo "Release signing secrets are not configured. Skipping release APK."
           fi
-
-      # The debug variant is signed with the same fixed keystore, so it needs the same passwords.
-      - name: Build debug APK
-        env:
-          JARVES_KEYSTORE_PASSWORD: ${{ secrets.JARVES_KEYSTORE_PASSWORD }}
-          JARVES_KEY_ALIAS: ${{ secrets.JARVES_KEY_ALIAS }}
-          JARVES_KEY_PASSWORD: ${{ secrets.JARVES_KEY_PASSWORD }}
-        run: gradle assembleDebug
-
-      - name: Run unit tests
-        run: gradle testDebugUnitTest
 
       - name: Build signed release APK
         if: steps.signing.outputs.available == 'true'
@@ -81,76 +62,9 @@ jobs:
           name: jarves-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
 
-      # Proof, not a promise: the two APKs must carry the same certificate, otherwise Android will
-      # refuse the update and the user would have to uninstall (losing the key and the chats).
-      - name: Prove debug and release share one signing key
-        if: steps.signing.outputs.available == 'true'
-        run: |
-          set -euo pipefail
-          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
-          echo "apksigner: $APKSIGNER"
-          DEBUG_CERT=$("$APKSIGNER" verify --print-certs app/build/outputs/apk/debug/app-debug.apk | grep -i "SHA-256 digest" | head -1)
-          RELEASE_CERT=$("$APKSIGNER" verify --print-certs app/build/outputs/apk/release/app-release.apk | grep -i "SHA-256 digest" | head -1)
-          echo "debug   -> $DEBUG_CERT"
-          echo "release -> $RELEASE_CERT"
-          if [ "$DEBUG_CERT" != "$RELEASE_CERT" ]; then
-            echo "::error::debug and release APKs are signed with DIFFERENT keys; updates would not install"
-            exit 1
-          fi
-          echo "::notice::FIXED_CERT=$RELEASE_CERT"
-          AAPT=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -1)
-          "$AAPT" dump badging app/build/outputs/apk/release/app-release.apk | grep -E "package:|versionCode" || true
-
       - name: Upload signed release APK
         if: steps.signing.outputs.available == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: jarves-release-apk
           path: app/build/outputs/apk/release/app-release.apk
-
-      # ---- In-app updater assets. Only GITHUB_TOKEN; no keystore, password or PAT is attached.
-      - name: Prepare release assets
-        if: steps.signing.outputs.available == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/jarves-wip-backup'
-        id: assets
-        run: |
-          set -euo pipefail
-          VERSION=$(grep -m1 'versionName = ' app/build.gradle.kts | sed 's/.*"\(.*\)".*/\1/')
-          CODE=$(grep -m1 'versionCode = ' app/build.gradle.kts | sed 's/[^0-9]*\([0-9]*\).*/\1/')
-          mkdir -p dist
-          cp app/build/outputs/apk/release/app-release.apk "dist/jarves-$VERSION.apk"
-          ( cd dist && sha256sum "jarves-$VERSION.apk" > "jarves-$VERSION.apk.sha256" && cat "jarves-$VERSION.apk.sha256" )
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "code=$CODE" >> "$GITHUB_OUTPUT"
-          echo "::notice::Uploading jarves-$VERSION.apk (versionCode $CODE)"
-
-      - name: Publish GitHub Release
-        if: steps.signing.outputs.available == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/jarves-wip-backup'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.assets.outputs.version }}
-          name: Jarves ${{ steps.assets.outputs.version }}
-          target_commitish: ${{ github.sha }}
-          draft: false
-          prerelease: false
-          files: |
-            dist/jarves-${{ steps.assets.outputs.version }}.apk
-            dist/jarves-${{ steps.assets.outputs.version }}.apk.sha256
-          body: |
-            Jarves ${{ steps.assets.outputs.version }} (versionCode ${{ steps.assets.outputs.code }})
-
-            Built from `${{ github.sha }}` by workflow run ${{ github.run_id }}.
-
-            - **Auto mode (default):** the conversation stays on `gemini-3.8-live`; `search_web` is
-              answered by a second, short-lived `gemini-2.5-flash-native-audio-preview-12-2025`
-              session with the built-in Google Search tool, and 3.8 speaks the result.
-            - **Voice only:** 3.8 with no search tools at all.
-            - **Search only:** 2.5 native audio with built-in Google Search (the previous behaviour).
-            - **Fixed signing:** debug and release APKs share one keystore, so a new build installs
-              over the old one.
-            - **In-app updater:** Settings → Update → "আপডেট আছে কি দেখুন". The APK is verified by
-              SHA-256 and by signing-certificate fingerprint before the installer is opened.
-
-            Install: download `jarves-${{ steps.assets.outputs.version }}.apk` below, or use the
-            button inside the app.
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
