@@ -101,7 +101,7 @@ class GeminiLiveVoice(
             "\u09b8\u0982\u09af\u09c1\u0995\u09cd\u09a4\u0964 \u098f\u0996\u09a8 \u0995\u09a5\u09be \u09ac\u09b2\u09c1\u09a8 (\u09b2\u09be\u0987\u09ad \u09b8\u09be\u09b0\u09cd\u099a \u099b\u09be\u09a1\u09bc\u09be \u2014 \u09b2\u09be\u0987\u09ad \u09a4\u09a5\u09cd\u09af \u09af\u09be\u099a\u09be\u0987 \u0995\u09b0\u09be \u09af\u09be\u09ac\u09c7 \u09a8\u09be)"
 
         /** Identifies this build in the on-device diagnostic block. */
-        const val FIX_TAG = "design4-2"
+        const val FIX_TAG = "design4-3"
 
         /** Connected status when live search verification is available. */
         const val CONNECTED_WITH_SEARCH_STATUS =
@@ -122,6 +122,8 @@ class GeminiLiveVoice(
     @Volatile private var toolCallCount = 0
     @Volatile private var lastToolQuery = "none"
     @Volatile private var lastSearchOutcome = "none"
+    /** Which search model produced (or last tried for) the most recent search. */
+    @Volatile private var lastSearchModel = "none"
     /** What the setup frame declared, so the diagnostic block can prove tools were sent. */
     @Volatile private var setupDeclaredTool = "none"
     @Volatile private var microphoneInitialized = false
@@ -550,7 +552,9 @@ class GeminiLiveVoice(
             "Echo: $closeEchoed | Search: ${if (groundingAvailable) "on" else "off"} " +
             "(tool=$searchToolMode, legacyFallback=$groundingFallbackUsed) | " +
             "Setup tools: $setupDeclaredTool | toolCalls: $toolCallCount | " +
-            "Last query: $lastToolQuery | Last search: $lastSearchOutcome | build: $FIX_TAG"
+            "Last query: $lastToolQuery | Last search: $lastSearchOutcome | " +
+            "Last search model: $lastSearchModel | ${searchClient?.diagnosticsLine() ?: "Search models: none"} | " +
+            "build: $FIX_TAG"
     }
 
     // -------------------------------------------------------------------------------------
@@ -582,6 +586,9 @@ class GeminiLiveVoice(
                 sendToolResponse(
                     LiveToolProtocol.toolResponseJson(call.callId, answer.asToolResult(), scheduling)
                 )
+                lastSearchModel = answer.model.ifBlank { "unknown" } +
+                    (if (answer.attempted.size > 1) " (tried ${answer.attempted.joinToString(">")})" else "") +
+                    (if (answer.skipped.isNotEmpty()) " (skipped ${answer.skipped.joinToString(", ")})" else "")
                 lastSearchOutcome = if (answer.isSuccess) {
                     "ok (${answer.sources.size} sources, ${answer.elapsedMillis}ms)"
                 } else {

@@ -30,6 +30,15 @@ enum class GroundedSearchFailure {
     /** The model or the `google_search` tool is not available for this key. */
     UNSUPPORTED,
 
+    /**
+     * Google refused the model *name* itself: HTTP 404, or a message such as
+     * "models/gemini-2.5-flash-lite is no longer available to new users".
+     * Separate from [UNSUPPORTED] because it is the one failure worth retrying on the next model in
+     * [SearchModels.ORDER], and the one the chat bubble must describe as "this model is
+     * deprecated / no longer available" rather than "search is broken".
+     */
+    MODEL_UNAVAILABLE,
+
     /** Any other non-2xx response. */
     HTTP,
 
@@ -64,7 +73,11 @@ data class GroundedAnswer(
     /** Google's own error text, verbatim but scrubbed of anything key-shaped. Empty when unknown. */
     val serverMessage: String = "",
     /** Which model produced this answer (or the last one tried). */
-    val model: String = ""
+    val model: String = "",
+    /** Every model this search tried, in order (diagnostics). */
+    val attempted: List<String> = emptyList(),
+    /** Models skipped without a request, with the reason (diagnostics). */
+    val skipped: List<String> = emptyList()
 ) {
     /**
      * The report shown in the chat bubble when a search fails: what failed, the real HTTP status
@@ -74,11 +87,19 @@ data class GroundedAnswer(
         append("সার্চ ব্যর্থ — type=").append(failure?.name ?: "UNKNOWN")
         append(" | HTTP=").append(if (statusCode > 0) statusCode.toString() else "none")
         append(" | model=").append(model.ifBlank { "unknown" })
+        if (attempted.size > 1) append(" | tried=").append(attempted.joinToString(">"))
+        if (skipped.isNotEmpty()) append(" | skipped=").append(skipped.joinToString(", "))
         if (serverMessage.isNotBlank()) {
             append('\n').append("Google: ").append(serverMessage)
         }
         if (detail.isNotBlank() && detail != serverMessage) {
             append('\n').append("Detail: ").append(detail)
+        }
+        if (failure == GroundedSearchFailure.MODEL_UNAVAILABLE) {
+            append('\n').append(
+                "এই মডেলটি Google বন্ধ করে দিয়েছে (deprecated / no longer available) — " +
+                    "সার্চের মডেল বদলানো দরকার।"
+            )
         }
         if (serverMessage.isBlank() && detail.isBlank()) {
             append('\n').append("Google: (no error text returned)")
@@ -122,6 +143,11 @@ data class GroundedAnswer(
         GroundedSearchFailure.HTTP ->
             "The web search failed with a server error. Tell the user in their language that you " +
                 "could not search right now, and do not invent facts or links."
+        GroundedSearchFailure.MODEL_UNAVAILABLE ->
+            "The web search model Google was asked for has been retired, so the search could not " +
+                "run. Tell the user in their language, plainly, that the search model is no longer " +
+                "available and that the app is switching to another one — and do not invent facts " +
+                "or links."
         GroundedSearchFailure.EMPTY ->
             "The web search returned nothing usable. Tell the user in their language that you could " +
                 "not find live results, and do not invent facts or links."
@@ -201,14 +227,22 @@ class GroundedSearchClient(
     private val clock: () -> Long = { System.currentTimeMillis() },
     private val baseUrl: String = DEFAULT_BASE_URL,
     /**
-     * Models tried in order. Both entries are the only models whose Google Search grounding is
-     * free on the Gemini free tier (500 RPD, one shared pool) per the official pricing table, so
-     * the fallback never silently moves the user onto a paid-only path.
+     * Models tried in order. There is exactly one such list in the app — [SearchModels.ORDER] —
+     * and this parameter only exists so tests can inject a shorter one.
      */
-    private val models: List<String> = listOf(MODEL, FALLBACK_MODEL)
+    private val models: List<String> = SearchModels.ORDER,
+    /** Remembers the model that worked and the ones that ran out of quota today. */
+    private val health: SearchModelHealth = SearchModelHealth()
 ) {
     /** The first (preferred) model. */
     val model: String get() = models.first()
+
+    /**
+     * One secret-free line for the on-device diagnostic block: the model list, the cached model and
+     * its expiry, and every model currently skipped for quota.
+     */
+    fun diagnosticsLine(): String =
+        "Search models: " + models.joinToString(">") + " | " + health.describe()
 
     /** Runs on [ioDispatcher] so the WebSocket thread and the audio threads stay free. */
     suspend fun search(query: String): GroundedAnswer = withContext(ioDispatcher) {
@@ -217,17 +251,59 @@ class GroundedSearchClient(
         if (trimmed.isEmpty()) {
             return@withContext GroundedAnswer("", "", failure = GroundedSearchFailure.EMPTY)
         }
+        // Start from the model that last worked (cache), otherwise from the top of the list.
+        val cached = health.cachedModel()
+        val ordered = if (cached != null && cached in models) {
+            models.dropWhile { it != cached } + models.takeWhile { it != cached }
+        } else {
+            models
+        }
+
         var last: GroundedAnswer? = null
-        models.forEachIndexed { index, candidate ->
-            val attempt = attempt(trimmed, candidate, started)
-            if (attempt.isSuccess) return@withContext attempt
+        val attempted = mutableListOf<String>()
+        val skipped = mutableListOf<String>()
+
+        for (candidate in ordered) {
+            // A model that already returned 429 today is not asked again: the daily quota is gone
+            // until local midnight, and asking would only waste another request.
+            if (health.isExhaustedToday(candidate)) {
+                skipped += "$candidate (quota exhausted today)"
+                continue
+            }
+            attempted += candidate
+            val attempt = attempt(trimmed, candidate, started).copy(
+                attempted = attempted.toList(),
+                skipped = skipped.toList()
+            )
+            if (attempt.isSuccess) {
+                health.onSuccess(candidate)
+                return@withContext attempt.copy(attempted = attempted.toList(), skipped = skipped.toList())
+            }
             last = attempt
-            // Only a model-side problem is worth another model; a key/quota/timeout problem is not.
-            if (index == models.lastIndex || !isWorthAnotherModel(attempt.failure)) {
-                return@withContext attempt
+            when (attempt.failure) {
+                // Model name retired: remember it and move on to the next model.
+                GroundedSearchFailure.MODEL_UNAVAILABLE -> {
+                    health.onModelUnavailable(candidate)
+                    skipped += "$candidate (model unavailable)"
+                }
+                // Daily/per-minute quota: skip this model for the rest of the day, try the next.
+                GroundedSearchFailure.QUOTA -> {
+                    health.onDailyQuotaExhausted(candidate)
+                    skipped += "$candidate (quota exhausted today)"
+                }
+                // AUTH / INTERNAL / NETWORK / TIMEOUT / BUSY / HTTP / EMPTY / UNSUPPORTED:
+                // the next model shares the same key, the same network and the same project, so
+                // cycling would only burn another request. Stop and report the real reason.
+                else -> return@withContext attempt
             }
         }
-        last ?: GroundedAnswer(trimmed, "", failure = GroundedSearchFailure.EMPTY)
+        last ?: GroundedAnswer(
+            trimmed,
+            "",
+            failure = GroundedSearchFailure.QUOTA,
+            detail = "every model is out of quota today",
+            skipped = skipped.toList()
+        )
     }
 
     /** One model, one attempt. Never throws: every path becomes an answer. */
@@ -256,14 +332,17 @@ class GroundedSearchClient(
     }
 
     /**
-     * A model-side refusal is worth retrying on the next model; a credential, quota, timeout or
-     * network problem is not (the fallback shares the same key and, on the free tier, the same
-     * grounding pool).
+     * Whether the next model in the list may be tried.
+     *
+     * 0.2.5 deliberately narrows this to the two failures where another model can actually help:
+     * a retired model name ([GroundedSearchFailure.MODEL_UNAVAILABLE]) and quota
+     * ([GroundedSearchFailure.QUOTA], which also marks the model out for the rest of the day).
+     * Everything else — including a plain 5xx and an empty answer — reports the real reason
+     * immediately, because on a 20 RPD free tier a speculative second request is expensive.
      */
     fun isWorthAnotherModel(failure: GroundedSearchFailure?): Boolean = when (failure) {
-        GroundedSearchFailure.UNSUPPORTED,
-        GroundedSearchFailure.HTTP,
-        GroundedSearchFailure.EMPTY -> true
+        GroundedSearchFailure.MODEL_UNAVAILABLE,
+        GroundedSearchFailure.QUOTA -> true
         else -> false
     }
 
@@ -295,9 +374,22 @@ class GroundedSearchClient(
                 )
             ),
             "tools" to listOf(linkedMapOf<String, Any?>("google_search" to emptyMap<String, Any?>())),
+            // Field names checked against the generateContent reference
+            // (https://ai.google.dev/api/generate-content): Tool.googleSearch accepts `{}`,
+            // GenerationConfig.maxOutputTokens and GenerationConfig.thinkingConfig.thinkingLevel.
+            //
+            // maxOutputTokens is 1024 (not 512): a grounded answer plus its source list was being
+            // cut off mid-sentence at 512. `temperature` is gone on purpose — the same reference
+            // says it "is no longer supported and is silently ignored on Gemini 3.6 Flash and
+            // newer models", so sending it would only pretend to have an effect.
             "generationConfig" to linkedMapOf<String, Any?>(
-                "temperature" to 0.2,
-                "maxOutputTokens" to 512
+                "maxOutputTokens" to MAX_OUTPUT_TOKENS,
+                "thinkingConfig" to linkedMapOf<String, Any?>(
+                    // MINIMAL is a supported level for both models in the list and keeps a
+                    // voice-latency-bound search cheap; default is already minimal for
+                    // 3.5-flash-lite, but saying so keeps the request explicit.
+                    "thinkingLevel" to "MINIMAL"
+                )
             )
         )
     )
@@ -308,15 +400,9 @@ class GroundedSearchClient(
 
     companion object {
         const val DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-        const val MODEL = "gemini-2.5-flash"
 
-        /**
-         * Fallback. Per the official pricing table, gemini-2.5-flash and gemini-2.5-flash-lite are
-         * the ONLY models whose Grounding with Google Search is available on the Free Tier
-         * (500 requests/day, one shared pool); every Gemini 3.x entry reads "Not available" there.
-         * So the fallback stays inside the free allowance instead of silently moving to a paid path.
-         */
-        const val FALLBACK_MODEL = "gemini-2.5-flash-lite"
+        /** Output budget: enough for a grounded answer plus its source list (was 512). */
+        const val MAX_OUTPUT_TOKENS = 1024
 
         /** Removes anything key-shaped from text that came back from the network. */
         fun scrubSecret(text: String): String =
@@ -440,19 +526,36 @@ class GroundedSearchClient(
             else -> GroundedSearchFailure.INTERNAL
         }
 
-        /** Maps a status/reason to the failure the model is told about. */
+        /**
+         * Maps a status/reason to the failure the model is told about.
+         *
+         * Order matters. The 0.2.4 device log was
+         * `HTTP 404 … "models/gemini-2.5-flash-lite is no longer available to new users"`, and the
+         * old code turned that into a generic [GroundedSearchFailure.HTTP] — which is why the app
+         * kept asking the same dead model and the user only ever saw "some problem on the server".
+         * A 404, or wording about a model being retired/unavailable, is now
+         * [GroundedSearchFailure.MODEL_UNAVAILABLE], the one failure that triggers the next model.
+         */
         fun classifyHttp(statusCode: Int, bodyOrMessage: String): GroundedSearchFailure {
             val text = bodyOrMessage.lowercase()
             val quota = listOf("quota", "exhausted", "billing", "payment required", "insufficient")
             val auth = listOf("api key not valid", "api_key_invalid", "permission denied", "unauthorized",
-                "unauthenticated", "forbidden")
-            val unsupported = listOf("not found", "not supported", "unsupported", "does not support",
-                "invalid tool", "unknown name")
+                "unauthenticated", "forbidden", "api key expired")
+            val retired = listOf(
+                "no longer available", "is no longer", "not available to new users",
+                "has been deprecated", "is deprecated", "model_not_found", "not found for api version",
+                "is not supported for", "decommissioned", "retired", "shut down"
+            )
+            val unsupported = listOf("not supported", "unsupported", "does not support",
+                "invalid tool", "unknown name", "google_search")
             return when {
                 statusCode == 402 -> GroundedSearchFailure.QUOTA
                 statusCode == 429 -> GroundedSearchFailure.QUOTA
                 statusCode == 401 || statusCode == 403 ->
                     if (quota.any { it in text }) GroundedSearchFailure.QUOTA else GroundedSearchFailure.AUTH
+                // A 404 on generateContent is a statement about the model name, not the network.
+                statusCode == 404 -> GroundedSearchFailure.MODEL_UNAVAILABLE
+                retired.any { it in text } -> GroundedSearchFailure.MODEL_UNAVAILABLE
                 auth.any { it in text } -> GroundedSearchFailure.AUTH
                 quota.any { it in text } -> GroundedSearchFailure.QUOTA
                 unsupported.any { it in text } -> GroundedSearchFailure.UNSUPPORTED

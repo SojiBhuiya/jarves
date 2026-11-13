@@ -77,6 +77,7 @@ import com.sojibhuiya.jarves.chat.Conversation
 import com.sojibhuiya.jarves.storage.ApiProvidersModule
 import com.sojibhuiya.jarves.storage.ConversationModule
 import com.sojibhuiya.jarves.ui.chats.ChatsScreen
+import com.sojibhuiya.jarves.storage.AndroidModelStateStore
 import com.sojibhuiya.jarves.storage.PrefKeys
 import com.sojibhuiya.jarves.storage.jarvesDataStore
 import com.sojibhuiya.jarves.ui.apiproviders.ApiProvidersScreen
@@ -302,7 +303,13 @@ private fun AgiApp() {
                 assistantName = assistantName,
                 // Design 4: the app performs the search over REST with the same key, so the live
                 // session never has to declare the Live grounding tool.
-                searchClient = GroundedSearchClient(apiKey = credentialKey),
+                searchClient = GroundedSearchClient(
+                    apiKey = credentialKey,
+                    // The model that worked is remembered across app restarts (SharedPreferences),
+                    // so a normal search never probes the list again. Separate prefs file: no
+                    // existing key or schema is touched.
+                    health = SearchModelHealth(AndroidModelStateStore(context.applicationContext))
+                ),
                 // Status text is for the user to read only. State is never inferred from it.
                 onStatus = { value -> scope.launch { status = value } },
                 // Explicit state: the single source of truth for these booleans and for releasing

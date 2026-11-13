@@ -66,7 +66,7 @@ class GroundedSearchClientTest {
         val c = client { RestResponse(200, successBody()) }
         val request = c.buildRequest("আজকের সোনার দাম")
         assertEquals(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+            "https://generativelanguage.googleapis.com/v1beta/models/${SearchModels.PREFERRED}:generateContent",
             request.url
         )
         assertTrue(request.body.contains("আজকের সোনার দাম"))
@@ -89,7 +89,7 @@ class GroundedSearchClientTest {
         val described = client { RestResponse(200, successBody()) }.describe()
         assertFalse(described.contains("UNIT-TEST-key-placeholder"))
         assertTrue(described.contains("AIza****"))
-        assertTrue(described.contains("gemini-2.5-flash"))
+        assertTrue(described.contains(SearchModels.PREFERRED))
     }
 
     // ---- the answer --------------------------------------------------------------------
@@ -137,7 +137,9 @@ class GroundedSearchClientTest {
             Triple(403, """{"error":{"code":403,"message":"Permission denied."}}""", GroundedSearchFailure.AUTH),
             Triple(429, """{"error":{"code":429,"message":"Resource has been exhausted."}}""", GroundedSearchFailure.QUOTA),
             Triple(400, """{"error":{"code":400,"message":"Unknown name \\"google_search\\""}}""", GroundedSearchFailure.UNSUPPORTED),
-            Triple(404, """{"error":{"code":404,"message":"models/x is not found for API version v1beta"}}""", GroundedSearchFailure.UNSUPPORTED),
+            // 0.2.5: a 404 is a statement about the model name, and it is the failure that makes
+            // the client try the next model. Previously it was folded into UNSUPPORTED/HTTP.
+            Triple(404, """{"error":{"code":404,"message":"models/x is not found for API version v1beta"}}""", GroundedSearchFailure.MODEL_UNAVAILABLE),
             Triple(500, "boom", GroundedSearchFailure.HTTP)
         )
         cases.forEach { (code, body, expected) ->
