@@ -25,9 +25,23 @@ enum class LiveSearchTool {
      * server rejects NON_BLOCKING for this model; the model then waits for the result before
      * speaking. Degraded, but still working search.
      */
-    FUNCTION_BLOCKING;
+    FUNCTION_BLOCKING,
 
-    val declaresFunction: Boolean get() = this != NONE
+    /**
+     * Mode A (0.2.6): Google's own search, run **inside** the Live session.
+     * `tools:[{"googleSearch":{}}]` and nothing else — no `functionDeclarations`, so the app never
+     * runs a REST search in this mode.
+     *
+     * Docs: `Tool.googleSearch` — https://ai.google.dev/api/generate-content#Resource:Tool —
+     * and the Live tool table, where Search is "Supported" for Gemini 2.5 Flash Live Preview:
+     * https://ai.google.dev/gemini-api/docs/live-tools#tools-overview
+     */
+    GOOGLE_SEARCH_BUILT_IN;
+
+    val declaresFunction: Boolean get() = this == FUNCTION_NON_BLOCKING || this == FUNCTION_BLOCKING
+
+    /** True when the session asks Google to search for us. */
+    val usesBuiltInSearch: Boolean get() = this == GOOGLE_SEARCH_BUILT_IN
 }
 
 /**
@@ -75,7 +89,23 @@ object LiveSessionConfig {
         )
         appendLine()
         appendLine("CURRENT INFORMATION RULES:")
-        if (searchTool.declaresFunction) {
+        if (searchTool.usesBuiltInSearch) {
+            // Mode A. Google Search is built into the session: the model searches by itself, so
+            // there is no `search_web` function and no "let me check" protocol to run.
+            appendLine(
+                "You have Google Search available inside this session. Use it for every current or " +
+                    "time-sensitive fact: today's date and time, news, weather, prices, exchange " +
+                    "rates, sports results, holders of an office (Prime Minister, President, Chief " +
+                    "Adviser, ministers, CEOs), laws, events, or anything the user calls 'latest' or " +
+                    "'now'. Search first and answer from what the search returns. Never answer such " +
+                    "a question from memory alone."
+            )
+            appendLine(
+                "Answer in one go, in the user's language, and name the source you used when the " +
+                    "search returned one. If the search returns nothing usable, say plainly that " +
+                    "you could not verify it and do not invent facts or links."
+            )
+        } else if (searchTool.declaresFunction) {
             appendLine(
                 "$MARK_SEARCH by calling the `$FUNCTION_SEARCH_WEB` function. Whenever the user asks " +
                     "about anything that changes over time — who currently holds an office (Prime " +
@@ -146,6 +176,11 @@ object LiveSessionConfig {
     /** The `tools` array for a given mode; empty for [LiveSearchTool.NONE]. */
     fun toolsJson(searchTool: LiveSearchTool): List<Map<String, Any?>> = when (searchTool) {
         LiveSearchTool.NONE -> emptyList()
+        // Mode A: the built-in tool and NOTHING else. The Live API reference types this field as
+        // Tool.googleSearch, serialized camelCase in the JSON setup frame.
+        LiveSearchTool.GOOGLE_SEARCH_BUILT_IN -> listOf(
+            linkedMapOf<String, Any?>("googleSearch" to emptyMap<String, Any?>())
+        )
         LiveSearchTool.FUNCTION_NON_BLOCKING -> listOf(
             linkedMapOf<String, Any?>(
                 "functionDeclarations" to listOf(searchFunctionDeclaration(nonBlocking = true))

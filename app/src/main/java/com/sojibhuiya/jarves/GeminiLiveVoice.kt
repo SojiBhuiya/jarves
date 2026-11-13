@@ -24,6 +24,9 @@ import com.sojibhuiya.jarves.intelligence.GroundedSource
 import com.sojibhuiya.jarves.intelligence.GroundedSearchClient
 import com.sojibhuiya.jarves.intelligence.GroundingParser
 import com.sojibhuiya.jarves.intelligence.LiveSearchTool
+import com.sojibhuiya.jarves.intelligence.LiveModels
+import com.sojibhuiya.jarves.intelligence.SessionEndReport
+import com.sojibhuiya.jarves.intelligence.VoiceSearchMode
 import com.sojibhuiya.jarves.intelligence.LiveToolProtocol
 import com.sojibhuiya.jarves.intelligence.SearchFunctionCall
 import com.sojibhuiya.jarves.intelligence.SearchToolRunner
@@ -66,7 +69,17 @@ class GeminiLiveVoice(
      * can read and copy the real HTTP status and Google's own error message. Called only when a
      * search fails; already scrubbed of anything key-shaped.
      */
-    private val onSearchReport: (String) -> Unit = {}
+    private val onSearchReport: (String) -> Unit = {},
+    /**
+     * 0.2.6: which voice/search mode this session uses. The model ID and the setup tools both come
+     * from the mode, so nothing at a call site can pick a model on its own.
+     */
+    private val mode: VoiceSearchMode = VoiceSearchMode.VOICE_ONLY,
+    /**
+     * 0.2.6: called when a session ends with a code the user can act on (1007 / 1008 / 1011 …).
+     * The report carries the exact code and reason and says whether Mode B is the way out.
+     */
+    private val onSessionEnd: (SessionEndReport) -> Unit = {}
 ) {
     companion object {
         /**
@@ -76,7 +89,9 @@ class GeminiLiveVoice(
          */
         const val WEBSOCKET_ENDPOINT =
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-        const val MODEL = "gemini-3.8-live"
+        /** The Mode B model. Kept as a constant only for compatibility; the source of truth is
+         * [LiveModels], which owns every Live model ID in the app. */
+        const val MODEL = LiveModels.VOICE_ONLY
         const val INPUT_RATE = 16000
         const val OUTPUT_RATE = 24000
         const val CHUNK_BYTES = 640
@@ -101,7 +116,32 @@ class GeminiLiveVoice(
             "\u09b8\u0982\u09af\u09c1\u0995\u09cd\u09a4\u0964 \u098f\u0996\u09a8 \u0995\u09a5\u09be \u09ac\u09b2\u09c1\u09a8 (\u09b2\u09be\u0987\u09ad \u09b8\u09be\u09b0\u09cd\u099a \u099b\u09be\u09a1\u09bc\u09be \u2014 \u09b2\u09be\u0987\u09ad \u09a4\u09a5\u09cd\u09af \u09af\u09be\u099a\u09be\u0987 \u0995\u09b0\u09be \u09af\u09be\u09ac\u09c7 \u09a8\u09be)"
 
         /** Identifies this build in the on-device diagnostic block. */
-        const val FIX_TAG = "design4-3"
+        const val FIX_TAG = "design4-4"
+
+        /**
+         * The mode/model/tool/close line of the diagnostic block. Pure and public so it is
+         * unit-tested directly and cannot drift from what the block prints.
+         */
+        fun diagnosticsFor(
+            mode: VoiceSearchMode,
+            setupTool: LiveSearchTool,
+            closeCode: Int,
+            closeReason: String
+        ): String {
+            val tool = when (setupTool) {
+                LiveSearchTool.NONE -> "none"
+                LiveSearchTool.GOOGLE_SEARCH_BUILT_IN -> "googleSearch(built-in)"
+                LiveSearchTool.FUNCTION_NON_BLOCKING -> "search_web/NON_BLOCKING"
+                LiveSearchTool.FUNCTION_BLOCKING -> "search_web/blocking"
+            }
+            val close = if (closeCode == 0) "none" else "$closeCode / ${closeReason.ifBlank { "none" }}"
+            return "Mode: ${mode.name} (${mode.label}) | Live model: ${LiveModels.modelFor(mode)} | " +
+                "Tools: $tool | Close: $close"
+        }
+
+        /** Connected status for Mode A: Google Search runs inside the session. */
+        const val CONNECTED_WITH_BUILTIN_SEARCH_STATUS =
+            "\u09b8\u0982\u09af\u09c1\u0995\u09cd\u09a4\u0964 \u098f\u0996\u09a8 \u0995\u09a5\u09be \u09ac\u09b2\u09c1\u09a8 (Google Search \u099a\u09be\u09b2\u09c1)"
 
         /** Connected status when live search verification is available. */
         const val CONNECTED_WITH_SEARCH_STATUS =
@@ -124,6 +164,10 @@ class GeminiLiveVoice(
     @Volatile private var lastSearchOutcome = "none"
     /** Which search model produced (or last tried for) the most recent search. */
     @Volatile private var lastSearchModel = "none"
+    /** 0.2.6: the mode in force, and the last close code/reason seen on this session. */
+    @Volatile private var activeMode: VoiceSearchMode = VoiceSearchMode.VOICE_ONLY
+    @Volatile private var lastCloseCode = 0
+    @Volatile private var lastCloseReason = "none"
     /** What the setup frame declared, so the diagnostic block can prove tools were sent. */
     @Volatile private var setupDeclaredTool = "none"
     @Volatile private var microphoneInitialized = false
@@ -180,6 +224,21 @@ class GeminiLiveVoice(
         },
         retryWithoutSearch = { source -> retryWithoutSearch(source) },
         reportFailure = { code, reason ->
+            // 0.2.6: keep the exact code/reason for the diagnostic block and tell the user what it
+            // means — never a paraphrase.
+            lastCloseCode = code
+            lastCloseReason = reason.ifBlank { "none" }
+            runCatching {
+                onSessionEnd(
+                    SessionEndReport(
+                        code = code,
+                        reason = reason,
+                        mode = activeMode,
+                        model = LiveModels.modelFor(activeMode),
+                        setupTools = setupDeclaredTool
+                    )
+                )
+            }
             if (!setupCompleteReceived) {
                 fail(
                     "Gemini setupComplete \u0986\u09b8\u09be\u09b0 \u0986\u0997\u09c7\u0987 server session \u09ac\u09a8\u09cd\u09a7 \u0995\u09b0\u09c7\u099b\u09c7 " +
@@ -235,15 +294,21 @@ class GeminiLiveVoice(
         // memo guards a path that no longer exists, and honouring it would block working REST
         // search for six hours after an unrelated refusal. The memo is left intact for the legacy
         // fallback in retryWithoutSearch().
-        val hasSearchBackend = searchClient != null
+        activeMode = mode
+        lastCloseCode = 0
+        lastCloseReason = "none"
+        // Mode A: Google searches inside the Live session, so there is no REST backend and no
+        // function tool at all. Mode B: exactly the previous behaviour.
+        val hasSearchBackend = !mode.usesBuiltInSearch && searchClient != null
         groundingFallbackUsed = false
         searchToolMode = when {
+            mode.usesBuiltInSearch -> LiveSearchTool.GOOGLE_SEARCH_BUILT_IN
             !hasSearchBackend -> LiveSearchTool.NONE
             nonBlockingAccepted -> LiveSearchTool.FUNCTION_NON_BLOCKING
             else -> LiveSearchTool.FUNCTION_BLOCKING
         }
-        groundingRequested = hasSearchBackend
-        groundingAvailable = hasSearchBackend
+        groundingRequested = searchToolMode != LiveSearchTool.NONE
+        groundingAvailable = groundingRequested
         retryInFlight.set(false)
         closeFlow.reset()
         closeCallback = "none"
@@ -286,7 +351,7 @@ class GeminiLiveVoice(
                     searchTool = searchToolMode
                 )
                 val setup = LiveSessionConfig.setupJson(
-                    model = MODEL,
+                    model = LiveModels.modelFor(activeMode),
                     voiceName = VOICE_NAME,
                     systemInstruction = instruction,
                     searchTool = searchToolMode
@@ -298,6 +363,7 @@ class GeminiLiveVoice(
                 setupMessageSent = true
                 setupDeclaredTool = when (searchToolMode) {
                     LiveSearchTool.NONE -> "none"
+                    LiveSearchTool.GOOGLE_SEARCH_BUILT_IN -> "googleSearch(built-in)"
                     LiveSearchTool.FUNCTION_NON_BLOCKING -> "search_web/NON_BLOCKING"
                     LiveSearchTool.FUNCTION_BLOCKING -> "search_web/blocking"
                 }
@@ -353,8 +419,12 @@ class GeminiLiveVoice(
                         startAudioPlayback()
                         startAudioCapture()
                         onStatus(
-                            if (groundingAvailable) CONNECTED_WITH_SEARCH_STATUS
-                            else CONNECTED_WITHOUT_SEARCH_STATUS
+                            when {
+                                searchToolMode == LiveSearchTool.GOOGLE_SEARCH_BUILT_IN ->
+                                    CONNECTED_WITH_BUILTIN_SEARCH_STATUS
+                                groundingAvailable -> CONNECTED_WITH_SEARCH_STATUS
+                                else -> CONNECTED_WITHOUT_SEARCH_STATUS
+                            }
                         )
                         onState(
                             if (groundingAvailable) LiveState.CONNECTED_GROUNDED
@@ -552,6 +622,7 @@ class GeminiLiveVoice(
             "Echo: $closeEchoed | Search: ${if (groundingAvailable) "on" else "off"} " +
             "(tool=$searchToolMode, legacyFallback=$groundingFallbackUsed) | " +
             "Setup tools: $setupDeclaredTool | toolCalls: $toolCallCount | " +
+            diagnosticsFor(activeMode, searchToolMode, lastCloseCode, lastCloseReason) + " | " +
             "Last query: $lastToolQuery | Last search: $lastSearchOutcome | " +
             "Last search model: $lastSearchModel | ${searchClient?.diagnosticsLine() ?: "Search models: none"} | " +
             "build: $FIX_TAG"
@@ -577,6 +648,8 @@ class GeminiLiveVoice(
     private fun startSearchRunner() {
         searchRunner?.shutdown()
         searchRunner = null
+        // Mode A: Google searches inside the Live session; the app must not run a REST search.
+        if (activeMode.usesBuiltInSearch) return
         val backend = searchClient ?: return
         searchRunner = SearchToolRunner(
             client = backend,

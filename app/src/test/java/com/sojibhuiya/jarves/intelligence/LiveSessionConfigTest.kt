@@ -77,15 +77,30 @@ class LiveSessionConfigTest {
     }
 
     @Test
-    fun everySetupPayloadOmitsGoogleSearchInAllThreeModes() {
+    fun onlyTheBuiltInModeDeclaresGoogleSearchAndTheFunctionModesNeverDo() {
+        // 0.2.6 adds a fourth tool value, and the rule it must obey is exact:
+        //  * GOOGLE_SEARCH_BUILT_IN sends `googleSearch` and no function,
+        //  * the two function modes send `search_web` and no `googleSearch` (Design 4), because a
+        //    session that declares the Live grounding tool is refused wholesale when the project
+        //    has no Live grounding entitlement,
+        //  * NONE sends no tools at all.
         LiveSearchTool.entries.forEach { mode ->
             val setup = setup(mode)["setup"] as Map<*, *>
             val encoded = MiniJson.encode(setup)
-            assertFalse("$mode must not contain googleSearch", encoded.contains("googleSearch"))
-            if (mode == LiveSearchTool.NONE) {
-                assertNull("$mode must send no tools at all", setup["tools"])
-            } else {
-                assertNotNull("$mode must declare a function", setup["tools"])
+            when (mode) {
+                LiveSearchTool.NONE -> {
+                    assertNull("$mode must send no tools at all", setup["tools"])
+                    assertFalse(encoded.contains("googleSearch"))
+                }
+                LiveSearchTool.GOOGLE_SEARCH_BUILT_IN -> {
+                    assertTrue("$mode must declare googleSearch", encoded.contains("googleSearch"))
+                    assertFalse("$mode must not declare a function", encoded.contains("functionDeclarations"))
+                }
+                LiveSearchTool.FUNCTION_NON_BLOCKING,
+                LiveSearchTool.FUNCTION_BLOCKING -> {
+                    assertNotNull("$mode must declare a function", setup["tools"])
+                    assertFalse("$mode must not contain googleSearch", encoded.contains("googleSearch"))
+                }
             }
         }
     }

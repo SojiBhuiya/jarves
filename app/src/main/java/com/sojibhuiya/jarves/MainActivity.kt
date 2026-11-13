@@ -74,11 +74,14 @@ import com.sojibhuiya.jarves.intelligence.GroundingAvailability
 import com.sojibhuiya.jarves.intelligence.LiveState
 import com.sojibhuiya.jarves.intelligence.LiveStateRouting
 import com.sojibhuiya.jarves.intelligence.SearchModelHealth
+import com.sojibhuiya.jarves.intelligence.VoiceSearchModeSettings
+import com.sojibhuiya.jarves.intelligence.VoiceSearchMode
 import com.sojibhuiya.jarves.chat.Conversation
 import com.sojibhuiya.jarves.storage.ApiProvidersModule
 import com.sojibhuiya.jarves.storage.ConversationModule
 import com.sojibhuiya.jarves.ui.chats.ChatsScreen
 import com.sojibhuiya.jarves.storage.AndroidModelStateStore
+import com.sojibhuiya.jarves.storage.AndroidVoiceModeStore
 import com.sojibhuiya.jarves.storage.PrefKeys
 import com.sojibhuiya.jarves.storage.jarvesDataStore
 import com.sojibhuiya.jarves.ui.apiproviders.ApiProvidersScreen
@@ -111,6 +114,10 @@ private fun AgiApp() {
     val scope = rememberCoroutineScope()
     val repository = remember { ApiProvidersModule.repository(context) }
     val prefs by context.jarvesDataStore.data.collectAsState(initial = null)
+    // 0.2.6: the voice/search mode is read once from its own prefs file and kept in state, so the
+    // Settings selector and the session start can never disagree.
+    val modeSettings = remember { VoiceSearchModeSettings(AndroidVoiceModeStore(context.applicationContext)) }
+    var voiceMode by remember { mutableStateOf(modeSettings.current()) }
     var screen by remember { mutableStateOf(JarvesNavigation.HOME) }
     var assistantNameInput by remember(prefs) { mutableStateOf(prefs?.get(PrefKeys.ASSISTANT_NAME).orEmpty()) }
     var status by remember { mutableStateOf("মাঝের বাটনে চাপ দিয়ে Live Voice চালু করুন") }
@@ -304,13 +311,23 @@ private fun AgiApp() {
                 assistantName = assistantName,
                 // Design 4: the app performs the search over REST with the same key, so the live
                 // session never has to declare the Live grounding tool.
-                searchClient = GroundedSearchClient(
-                    apiKey = credentialKey,
-                    // The model that worked is remembered across app restarts (SharedPreferences),
-                    // so a normal search never probes the list again. Separate prefs file: no
-                    // existing key or schema is touched.
-                    health = SearchModelHealth(AndroidModelStateStore(context.applicationContext))
-                ),
+                // Mode A: Google runs the search inside the Live session, so the app passes no
+                // REST backend at all — that guarantees no REST search in this mode.
+                searchClient = if (voiceMode.usesBuiltInSearch) {
+                    null
+                } else {
+                    GroundedSearchClient(
+                        apiKey = credentialKey,
+                        health = SearchModelHealth(AndroidModelStateStore(context.applicationContext))
+                    )
+                },
+                mode = voiceMode,
+                onSessionEnd = { report ->
+                    scope.launch {
+                        status = report.message()
+                        appendSearchReport(report.message())
+                    }
+                },
                 // Status text is for the user to read only. State is never inferred from it.
                 onStatus = { value -> scope.launch { status = value } },
                 // Explicit state: the single source of truth for these booleans and for releasing
@@ -415,6 +432,12 @@ private fun AgiApp() {
                             enabledProviderCount = providers.count { it.enabled },
                             onBack = { screen = JarvesNavigation.HOME },
                             onOpenApiProviders = { screen = JarvesNavigation.API_PROVIDERS },
+                            voiceMode = voiceMode,
+                            onSelectMode = { chosen ->
+                                voiceMode = chosen
+                                modeSettings.save(chosen)
+                                status = "Voice and search mode: ${chosen.label} — পরের সেশন থেকে কার্যকর"
+                            },
                             onSaveName = { newName ->
                                 scope.launch {
                                     context.jarvesDataStore.edit { it[PrefKeys.ASSISTANT_NAME] = newName }
@@ -560,7 +583,9 @@ private fun SettingsScreen(
     enabledProviderCount: Int,
     onBack: () -> Unit,
     onOpenApiProviders: () -> Unit,
-    onSaveName: (String) -> Unit
+    onSaveName: (String) -> Unit,
+    voiceMode: VoiceSearchMode = VoiceSearchMode.DEFAULT,
+    onSelectMode: (VoiceSearchMode) -> Unit = {}
 ) {
     var editingName by remember(assistantName) { mutableStateOf(assistantName.isBlank()) }
     var draftName by remember(assistantName) { mutableStateOf(assistantName) }
@@ -660,6 +685,19 @@ private fun SettingsScreen(
             )
         }
 
+        Spacer(Modifier.height(JarvesDimens.SectionGap))
+        SectionLabel("Voice and search mode")
+        Spacer(Modifier.height(8.dp))
+        JarvesCard {
+            VoiceSearchMode.entries.forEach { entry ->
+                VoiceModeRow(
+                    mode = entry,
+                    selected = entry == voiceMode,
+                    onSelect = { onSelectMode(entry) }
+                )
+            }
+        }
+
         if (status.isNotBlank()) {
             Spacer(Modifier.height(12.dp))
             // 0.2.4: the diagnostic block appears on this line; make it copyable in one tap.
@@ -748,5 +786,52 @@ private fun copyToClipboard(context: android.content.Context, label: String, tex
         val manager = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
             as? android.content.ClipboardManager ?: return
         manager.setPrimaryClip(android.content.ClipData.newPlainText(label, text))
+    }
+}
+
+/**
+ * One selectable voice/search mode. Radio-style: the dot shows which mode the next session uses,
+ * and the model ID is printed underneath so the choice is auditable from the screen.
+ */
+@Composable
+private fun VoiceModeRow(
+    mode: VoiceSearchMode,
+    selected: Boolean,
+    onSelect: () -> Unit
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = JarvesDimens.TouchTarget)
+            .clickable(onClickLabel = "Select ${mode.label} mode", onClick = onSelect)
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            Modifier
+                .size(16.dp)
+                .clip(androidx.compose.foundation.shape.CircleShape)
+                .border(
+                    1.5.dp,
+                    if (selected) JarvesColors.Accent else JarvesColors.Border,
+                    androidx.compose.foundation.shape.CircleShape
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            if (selected) {
+                Box(
+                    Modifier
+                        .size(8.dp)
+                        .clip(androidx.compose.foundation.shape.CircleShape)
+                        .background(JarvesColors.Accent)
+                )
+            }
+        }
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Text(mode.label, color = JarvesColors.TextPrimary, fontSize = 13.5.sp)
+            Text(mode.detail, color = JarvesColors.TextMuted, fontSize = 10.5.sp, lineHeight = 14.sp)
+            Text(mode.model, color = JarvesColors.TextMuted, fontSize = 10.sp)
+        }
     }
 }

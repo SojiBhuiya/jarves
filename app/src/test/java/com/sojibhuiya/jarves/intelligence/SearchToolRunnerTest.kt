@@ -119,8 +119,14 @@ class SearchToolRunnerTest {
 
     @Test
     fun aDuplicateCallIdIsAnsweredOnceOnly() {
+        // The duplicate guard covers the window in which a callId is actually reserved, so the
+        // three frames have to arrive while the first search is still running. Gating the
+        // transport on a latch makes that deterministic: with an already-open gate the first
+        // search can finish (and release its id) before the duplicates arrive, which made this
+        // test flaky without testing anything the runner promises.
         val transport = GatedTransport()
-        transport.release = CountDownLatch(0)
+        val release = CountDownLatch(1)
+        transport.release = release
         val results = Collections.synchronizedList(mutableListOf<String>())
         val runner = SearchToolRunner(
             client = client(transport),
@@ -130,13 +136,15 @@ class SearchToolRunnerTest {
 
         val call = SearchFunctionCall("same-id", "q")
         runner.handle(call)
+        assertTrue("the first search must actually be in flight", awaitTrue { transport.requests.size == 1 })
         runner.handle(call)
         runner.handle(call)
 
+        release.countDown()
         assertTrue(awaitTrue { results.size >= 1 })
         Thread.sleep(150)
         assertEquals("one callId must produce exactly one toolResponse", 1, results.size)
-        assertEquals(1, transport.requests.size)
+        assertEquals("only one search may reach the network", 1, transport.requests.size)
         runner.shutdown()
     }
 
