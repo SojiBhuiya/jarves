@@ -73,6 +73,7 @@ import com.sojibhuiya.jarves.intelligence.GroundedSearchClient
 import com.sojibhuiya.jarves.intelligence.GroundingAvailability
 import com.sojibhuiya.jarves.intelligence.LiveState
 import com.sojibhuiya.jarves.intelligence.LiveStateRouting
+import com.sojibhuiya.jarves.intelligence.SearchModelHealth
 import com.sojibhuiya.jarves.chat.Conversation
 import com.sojibhuiya.jarves.storage.ApiProvidersModule
 import com.sojibhuiya.jarves.storage.ConversationModule
