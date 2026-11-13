@@ -106,23 +106,18 @@ object LiveSessionConfig {
                     "you could not verify it and do not invent facts or links."
             )
         } else if (searchTool.declaresFunction) {
+            // Short on purpose (0.2.7): a long instruction was making the model chatty.
             appendLine(
-                "$MARK_SEARCH by calling the `$FUNCTION_SEARCH_WEB` function. Whenever the user asks " +
-                    "about anything that changes over time — who currently holds an office (Prime " +
-                    "Minister, President, Chief Adviser, ministers, CEOs), today's date or time, news, " +
-                    "prices, exchange rates, weather, sports results, events, laws or anything 'latest' " +
-                    "or 'current' — call `$FUNCTION_SEARCH_WEB` first and answer from the results it " +
-                    "returns. Never answer such a question from memory alone."
+                "You can search the live web by calling `$FUNCTION_SEARCH_WEB` only for current or " +
+                    "time-sensitive facts: weather, news, prices, exchange rates, sports scores, " +
+                    "today's date, or \"who is the current …\". Never call it for small talk, " +
+                    "arithmetic or definitions."
             )
             appendLine(
-                "While the search is running, say one short sentence in the user's language that you " +
-                    "are checking — for example: \"একটু দেখে নিচ্ছি, এক মুহূর্ত…\". Do not guess an " +
-                    "answer before the result arrives, and do not stay silent for long."
-            )
-            appendLine(
-                "When the result comes back, announce it briefly in the user's language and name the " +
-                    "source you used. If the result says the search failed, say so plainly and do not " +
-                    "invent facts or links."
+                "Before calling it, say one short line in the user's language: \"দেখে নিচ্ছি\". Do not " +
+                    "guess before the result arrives. Then give the answer in a few plain Bengali " +
+                    "sentences and name the source you used. If the result says the search failed, say " +
+                    "so plainly. Never invent facts or links."
             )
         } else {
             appendLine(
@@ -226,6 +221,47 @@ object LiveSessionConfig {
         if (inputTranscription) setup["inputAudioTranscription"] = emptyMap<String, Any?>()
         if (outputTranscription) setup["outputAudioTranscription"] = emptyMap<String, Any?>()
 
+        return MiniJson.encode(linkedMapOf<String, Any?>("setup" to setup))
+    }
+
+    /**
+     * Setup frame for the **second, short-lived search session** (Auto mode).
+     *
+     * It is deliberately separate from [setupJson]: no voice instruction, no function tools, and
+     * `outputAudioTranscription` is mandatory because a native-audio model answers in audio and the
+     * transcription is the only text the app can get.
+     *
+     * Docs: https://ai.google.dev/gemini-api/docs/live-guide — native audio models "only support
+     * AUDIO response modality", and the output audio transcription is how the text is obtained.
+     */
+    fun searchSessionSetupJson(model: String, voiceName: String): String {
+        val setup = linkedMapOf<String, Any?>(
+            "model" to "models/$model",
+            "generationConfig" to linkedMapOf<String, Any?>(
+                "responseModalities" to listOf("AUDIO"),
+                "speechConfig" to linkedMapOf<String, Any?>(
+                    "voiceConfig" to linkedMapOf<String, Any?>(
+                        "prebuiltVoiceConfig" to linkedMapOf<String, Any?>("voiceName" to voiceName)
+                    )
+                )
+            ),
+            "systemInstruction" to linkedMapOf<String, Any?>(
+                "parts" to listOf(
+                    linkedMapOf<String, Any?>(
+                        "text" to (
+                            "You are a web search engine for a voice assistant. Use Google Search for " +
+                                "the question you are given. Answer in at most three short sentences, in " +
+                                "the language of the question, and state the source name. If you cannot " +
+                                "verify it, say so in one sentence. Never invent facts or links."
+                            )
+                    )
+                )
+            ),
+            // The built-in tool and nothing else: no functionDeclarations in this session.
+            "tools" to listOf(linkedMapOf<String, Any?>("googleSearch" to emptyMap<String, Any?>())),
+            // Mandatory: this is how the app reads the answer.
+            "outputAudioTranscription" to emptyMap<String, Any?>()
+        )
         return MiniJson.encode(linkedMapOf<String, Any?>("setup" to setup))
     }
 

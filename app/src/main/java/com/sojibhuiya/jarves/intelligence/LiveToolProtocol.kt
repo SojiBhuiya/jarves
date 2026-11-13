@@ -102,6 +102,19 @@ object LiveToolProtocol {
      * `INTERRUPT` for a short result the user is waiting for; `WHEN_IDLE` for a long one, so a
      * multi-paragraph answer does not interrupt a sentence mid-sentence.
      */
+    /**
+     * Which `FunctionResponse.scheduling` to use for a search result.
+     *
+     * Docs (https://ai.google.dev/gemini-api/docs/live-tools → "Asynchronous function calling",
+     * "supported on `gemini-3.8-live`"):
+     *  * `INTERRUPT` — "Interrupt what it's doing and tell you about the response it got right away";
+     *  * `WHEN_IDLE` — "Wait until it's finished with what it's currently doing";
+     *  * `SILENT` — "do nothing and use that knowledge later on in the discussion".
+     *
+     * A short search answer is what the user is waiting for and the model has already said
+     * "দেখে নিচ্ছি", so it is announced immediately (INTERRUPT). A long result must not cut off what
+     * the model is currently saying, so it waits (WHEN_IDLE).
+     */
     fun schedulingFor(result: String, longThresholdChars: Int = LONG_RESULT_CHARS): String =
         if (result.length > longThresholdChars) SCHEDULING_WHEN_IDLE else SCHEDULING_INTERRUPT
 

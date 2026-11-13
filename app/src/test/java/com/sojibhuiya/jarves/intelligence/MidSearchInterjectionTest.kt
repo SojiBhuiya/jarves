@@ -35,7 +35,7 @@ class MidSearchInterjectionTest {
         val sentFrames: MutableList<String> = Collections.synchronizedList(mutableListOf())
 
         val runner = SearchToolRunner(
-            client = client,
+            backend = client,
             scope = scope,
             onResult = { call, answer, scheduling ->
                 send(LiveToolProtocol.toolResponseJson(call.callId, answer.asToolResult(), scheduling))

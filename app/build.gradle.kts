@@ -12,22 +12,42 @@ android {
         applicationId = "com.sojibhuiya.jarves"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "0.2.6"
+        versionCode = 9
+        versionName = "0.2.7"
     }
 
+    // ---- 0.2.7: ONE fixed signing key for every installed APK.
+    // Before this, `debug` had no signingConfig at all, so Gradle generated a fresh debug keystore
+    // on every CI run: the certificate changed from build to build and Android refused the update
+    // with "App not installed". Debug and release now share the same fixed keystore
+    // (jarves-release.jks, restored from the JARVES_* secrets), so their certificates are equal
+    // across runs and an APK can install over the previous one.
     signingConfigs {
-        create("release") {
+        create("fixed") {
             storeFile = rootProject.file("jarves-release.jks")
             storePassword = System.getenv("JARVES_KEYSTORE_PASSWORD")
             keyAlias = System.getenv("JARVES_KEY_ALIAS")
             keyPassword = System.getenv("JARVES_KEY_PASSWORD")
+            // minSdk 26: v2/v3 are what the app is signed with; v1 is not needed.
+            enableV1Signing = false
+            enableV2Signing = true
+            enableV3Signing = true
         }
     }
 
+    // True only when the keystore file exists and its password is present, i.e. in CI.
+    val hasFixedKey = rootProject.file("jarves-release.jks").exists() &&
+        !System.getenv("JARVES_KEYSTORE_PASSWORD").isNullOrBlank()
+
     buildTypes {
+        getByName("debug") {
+            if (hasFixedKey) {
+                signingConfig = signingConfigs.getByName("fixed")
+            }
+            isMinifyEnabled = false
+        }
         getByName("release") {
-            signingConfig = signingConfigs.getByName("release")
+            signingConfig = signingConfigs.getByName("fixed")
             isMinifyEnabled = false
         }
     }

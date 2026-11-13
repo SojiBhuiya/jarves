@@ -61,7 +61,7 @@ class SearchToolRunnerTest {
         transport.release = release
         val results = Collections.synchronizedList(mutableListOf<GroundedAnswer>())
         val runner = SearchToolRunner(
-            client = client(transport),
+            backend = client(transport),
             scope = scope(),
             onResult = { _, answer, _ -> results += answer }
         )
@@ -90,7 +90,7 @@ class SearchToolRunnerTest {
         transport.release = transportRelease
         val results = Collections.synchronizedList(mutableListOf<Pair<String, GroundedAnswer>>())
         val runner = SearchToolRunner(
-            client = client(transport),
+            backend = client(transport),
             scope = scope(),
             onResult = { call, answer, _ -> results += call.callId to answer }
         )
@@ -129,7 +129,7 @@ class SearchToolRunnerTest {
         transport.release = release
         val results = Collections.synchronizedList(mutableListOf<String>())
         val runner = SearchToolRunner(
-            client = client(transport),
+            backend = client(transport),
             scope = scope(),
             onResult = { _, _, _ -> results += "answer" }
         )
@@ -157,7 +157,7 @@ class SearchToolRunnerTest {
         transport.release = CountDownLatch(1)
         val results = Collections.synchronizedList(mutableListOf<GroundedAnswer>())
         val runner = SearchToolRunner(
-            client = client(transport),
+            backend = client(transport),
             scope = scope(),
             timeoutMillis = 250L,
             onResult = { _, answer, _ -> results += answer }
@@ -185,7 +185,7 @@ class SearchToolRunnerTest {
         transport.release = CountDownLatch(0)
         val schedulings = Collections.synchronizedList(mutableListOf<String>())
         val runner = SearchToolRunner(
-            client = client(transport),
+            backend = client(transport),
             scope = scope(),
             onResult = { _, _, scheduling -> schedulings += scheduling }
         )
@@ -203,7 +203,7 @@ class SearchToolRunnerTest {
         transport.release = CountDownLatch(1)
         val results = Collections.synchronizedList(mutableListOf<String>())
         val runner = SearchToolRunner(
-            client = client(transport),
+            backend = client(transport),
             scope = scope(),
             onResult = { call, _, _ -> results += call.callId }
         )
@@ -223,7 +223,7 @@ class SearchToolRunnerTest {
         val transport = GatedTransport()
         transport.release = CountDownLatch(0)
         val runner = SearchToolRunner(
-            client = client(transport),
+            backend = client(transport),
             scope = scope(),
             onResult = { _, _, _ -> }
         )
@@ -239,7 +239,7 @@ class SearchToolRunnerTest {
         transport.release = release
         val results = Collections.synchronizedList(mutableListOf<String>())
         val runner = SearchToolRunner(
-            client = client(transport),
+            backend = client(transport),
             scope = scope(),
             onResult = { call, _, _ -> results += call.callId }
         )
@@ -265,7 +265,7 @@ class SearchToolRunnerTest {
         transport.release = CountDownLatch(0)
         val results = Collections.synchronizedList(mutableListOf<String>())
         val runner = SearchToolRunner(
-            client = client(transport),
+            backend = client(transport),
             scope = scope(),
             onResult = { call, answer, scheduling ->
                 results += LiveToolProtocol.toolResponseJson(call.callId, answer.asToolResult(), scheduling)

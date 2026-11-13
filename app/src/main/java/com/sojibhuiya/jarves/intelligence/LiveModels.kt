@@ -1,91 +1,115 @@
 package com.sojibhuiya.jarves.intelligence
 
 /**
- * The two ways Jarves can talk to Gemini Live. The user picks one in Settings; the choice is
- * persisted and is the *only* thing that decides which model and which tools are used.
- */
-enum class VoiceSearchMode(
-    /** What the Settings row says. */
-    val label: String,
-    /** What the Settings row explains underneath the label. */
-    val detail: String,
-    /** The Live model ID from [LiveModels]; never a literal at a call site. */
-    val model: String,
-    /** `true` = Mode A: Google runs the search inside the Live session (built-in `googleSearch`). */
-    val usesBuiltInSearch: Boolean
-) {
-    /**
-     * Mode A — "Search". The Live session declares `tools:[{"googleSearch":{}}]` and nothing else;
-     * Google decides when to search and answers with current data. No REST call, no function tool.
-     *
-     * Docs: Grounding with Google Search is listed as **Supported** for Gemini 2.5 Flash Live
-     * Preview (https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash-native-audio-preview-12-2025)
-     * and Search is "Supported" for that model in the Live tool table
-     * (https://ai.google.dev/gemini-api/docs/live-tools#tools-overview).
-     */
-    SEARCH(
-        label = "Search",
-        detail = "Google Search inside the Live session (gemini-2.5 native audio). Current facts, no extra REST call.",
-        model = LiveModels.SEARCH_NATIVE_AUDIO,
-        usesBuiltInSearch = true
-    ),
-
-    /**
-     * Mode B — "Voice only". The previous behaviour: `gemini-3.8-live` with no `tools` at all.
-     * Voice works; nothing is searched.
-     */
-    VOICE_ONLY(
-        label = "Voice only",
-        detail = "Voice conversation only (gemini-3.8-live, no search tools).",
-        model = LiveModels.VOICE_ONLY,
-        usesBuiltInSearch = false
-    );
-
-    companion object {
-        /** Mode A is the default from 0.2.6 on. */
-        val DEFAULT: VoiceSearchMode = SEARCH
-
-        /** Lenient parse of a stored value; anything unknown falls back to [DEFAULT]. */
-        fun fromStored(raw: String?): VoiceSearchMode =
-            entries.firstOrNull { it.name.equals(raw?.trim(), ignoreCase = true) } ?: DEFAULT
-    }
-}
-
-/**
- * Every Live model ID the app can use, in ONE place.
+ * Every Live model ID the app can use, in ONE place. Nothing else may contain a Live model string.
  *
- * Nothing else in the codebase may contain a Live model string: the diagnostics, the setup frame
- * and the tests all read it from here, so a model can be changed (or a preview retired) in exactly
- * one line.
- *
- * Verified in the official docs:
- *  * `gemini-3.8-live` — "Default Live API model for most low-latency voice agent experiences",
- *    https://ai.google.dev/gemini-api/docs/models (Gemini 3.8 Live) and the model comparison table
- *    in https://ai.google.dev/gemini-api/docs/live-guide#model-comparison.
- *  * `gemini-2.5-flash-native-audio-preview-12-2025` — official model page
+ * Verified in the official docs (2026-11):
+ *  * `gemini-3.8-live` — the default Live model in
+ *    https://ai.google.dev/gemini-api/docs/live-tools (model comparison table) and
+ *    https://ai.google.dev/gemini-api/docs/models
+ *  * `gemini-2.5-flash-native-audio-preview-12-2025` — model page
  *    https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash-native-audio-preview-12-2025
- *    (versions list: "Preview: gemini-2.5-flash-native-audio-preview-12-2025"; no deprecation notice
- *    on that page). Audio + text input, audio output, Grounding with Google Search = Supported.
+ *    (Grounding with Google Search = Supported; inputs include **text**, so a text turn is valid)
  */
 object LiveModels {
 
-    /** Mode B: voice only. */
-    const val VOICE_ONLY = "gemini-3.8-live"
+    /** The voice model. Always used for the conversation in Auto and Voice-only modes. */
+    const val VOICE = "gemini-3.8-live"
 
-    /** Mode A: 2.5 native-audio preview with the built-in Google Search tool. */
+    /** The search model: 2.5 native audio with the built-in Google Search tool. */
     const val SEARCH_NATIVE_AUDIO = "gemini-2.5-flash-native-audio-preview-12-2025"
 
     /** Every model this app may open a Live session with. */
-    val ALL: List<String> = listOf(SEARCH_NATIVE_AUDIO, VOICE_ONLY)
+    val ALL: List<String> = listOf(VOICE, SEARCH_NATIVE_AUDIO)
 
-    /** The model for a mode. */
-    fun modelFor(mode: VoiceSearchMode): String = mode.model
-
-    /** True only for a model in [ALL]; anything else is a bug, not a fallback. */
     fun isKnown(model: String): Boolean = model in ALL
 
-    /** The voice used by both modes: a prebuilt TTS voice name. */
+    /** The model that runs the conversation for [mode]. The single entry point for call sites. */
+    fun modelFor(mode: VoiceSearchMode): String = mode.voiceModel
+
+    /** The prebuilt voice used by both sessions (speechConfig.voiceConfig.prebuiltVoiceConfig). */
     const val VOICE_NAME = "Aoede"
+
+    /** Compat aliases so older call sites keep one source of truth. */
+    const val VOICE_ONLY: String = VOICE
+    const val SEARCH_NATIVE_AUDIO_MODEL: String = SEARCH_NATIVE_AUDIO
+}
+
+/**
+ * The three ways voice and search can be combined. The user picks one in Settings; it is persisted
+ * and is the only thing that decides models and tools.
+ */
+enum class VoiceSearchMode(
+    val label: String,
+    val detail: String,
+    /** The model that runs the *conversation*. */
+    val voiceModel: String,
+    /** Conversation declares the `search_web` function (Design 4). */
+    val usesFunctionSearch: Boolean,
+    /** The conversation session declares Google's built-in `googleSearch` tool. */
+    val usesBuiltInSearch: Boolean,
+    /** Search runs in a second, short-lived 2.5 session and is returned as the tool response. */
+    val usesSecondSearchSession: Boolean
+) {
+    /**
+     * Auto (0.2.7, default): the conversation stays on `gemini-3.8-live` — the voice the user
+     * wants — and the model calls `search_web` when a fact must be current. The app answers that
+     * call from a second, short-lived Live session on the 2.5 native-audio model, which has
+     * free-tier Google Search grounding.
+     */
+    AUTO(
+        label = "Auto",
+        detail = "3.8 voice + Google Search in a second short session. Best voice, real search.",
+        voiceModel = LiveModels.VOICE,
+        usesFunctionSearch = true,
+        usesBuiltInSearch = false,
+        usesSecondSearchSession = true
+    ),
+
+    /** Voice only: the 3.8 model, no tools at all. */
+    VOICE_ONLY(
+        label = "Voice only",
+        detail = "3.8 voice, no search tools at all.",
+        voiceModel = LiveModels.VOICE,
+        usesFunctionSearch = false,
+        usesBuiltInSearch = false,
+        usesSecondSearchSession = false
+    ),
+
+    /** Search only: the previous Mode A — the 2.5 model with built-in Google Search. */
+    SEARCH_ONLY(
+        label = "Search only",
+        detail = "2.5 native-audio with built-in Google Search (slower voice, simplest path).",
+        voiceModel = LiveModels.SEARCH_NATIVE_AUDIO,
+        usesFunctionSearch = false,
+        usesBuiltInSearch = true,
+        usesSecondSearchSession = false
+    );
+
+    /** Compat alias: the model this mode runs on. */
+    val model: String get() = voiceModel
+
+    /** The session's search tool. */
+    val searchTool: LiveSearchTool
+        get() = when {
+            usesBuiltInSearch -> LiveSearchTool.GOOGLE_SEARCH_BUILT_IN
+            usesFunctionSearch -> LiveSearchTool.FUNCTION_NON_BLOCKING
+            else -> LiveSearchTool.NONE
+        }
+
+    companion object {
+        val DEFAULT: VoiceSearchMode = AUTO
+
+        /**
+         * Lenient parse. `SEARCH` was the 0.2.6 name of the built-in-search mode and is mapped to
+         * [SEARCH_ONLY] so an existing choice survives the upgrade.
+         */
+        fun fromStored(raw: String?): VoiceSearchMode {
+            val value = raw?.trim().orEmpty()
+            return entries.firstOrNull { it.name.equals(value, ignoreCase = true) }
+                ?: if (value.equals("SEARCH", ignoreCase = true)) SEARCH_ONLY else DEFAULT
+        }
+    }
 }
 
 /** Persistence seam for the chosen [VoiceSearchMode]. SharedPreferences on device. */
@@ -119,7 +143,7 @@ class VoiceSearchModeSettings(private val store: VoiceModeStore = InMemoryVoiceM
  *
  * Close codes 1007 (invalid payload — e.g. the setup was rejected), 1008 (policy violation — e.g.
  * quota/entitlement) and 1011 (server internal error) are the ones that can follow a search-tool
- * setup, so for those the report says plainly what the server said and points at Mode B.
+ * setup, so the report says plainly what the server said and points at a mode that needs no search.
  */
 data class SessionEndReport(
     val code: Int,
@@ -128,9 +152,8 @@ data class SessionEndReport(
     val model: String,
     val setupTools: String
 ) {
-    /** Whether the user is better off on Mode B right now. */
     val suggestVoiceOnly: Boolean
-        get() = mode.usesBuiltInSearch && code in ACTIONABLE_CODES
+        get() = mode != VoiceSearchMode.VOICE_ONLY && code in ACTIONABLE_CODES
 
     /** One message for the chat bubble / diagnostic line. Never contains the key. */
     fun message(): String = buildString {
@@ -141,15 +164,13 @@ data class SessionEndReport(
             .append(" | tools=").append(setupTools)
         if (suggestVoiceOnly) {
             append('\n').append(
-                "এই মোডে সার্চ টুল নিয়ে সেশন শুরু হচ্ছিলা না। Settings → Voice and search mode → " +
-                    "\"Voice only\" বেছে নিলে ভয়েস আবার চালু হবে (সার্চ ছাড়া)।"
+                "Settings → Voice and search mode → \"Voice only\" বেছে নিলে ভয়েস আবার চালু হবে (সার্চ ছাড়া)।"
             )
         }
         append('\n').append("key=AIza****")
     }
 
     companion object {
-        /** Close codes that mean "this setup was refused", i.e. switching mode can help. */
         val ACTIONABLE_CODES: Set<Int> = setOf(1007, 1008, 1011, 4400, 4401, 4403)
     }
 }

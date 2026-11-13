@@ -77,7 +77,15 @@ data class GroundedAnswer(
     /** Every model this search tried, in order (diagnostics). */
     val attempted: List<String> = emptyList(),
     /** Models skipped without a request, with the reason (diagnostics). */
-    val skipped: List<String> = emptyList()
+    val skipped: List<String> = emptyList(),
+    /** Live search session: WebSocket close code, 0 when the socket was never closed. */
+    val closeCode: Int = 0,
+    /** Live search session: milliseconds from start to an open/setup-complete socket. */
+    val connectMillis: Long = 0L,
+    /** Live search session: milliseconds from start to the first transcription chunk. */
+    val firstTranscriptMillis: Long = 0L,
+    /** Live search session: characters of transcription text received. */
+    val textLength: Int = 0
 ) {
     /**
      * The report shown in the chat bubble when a search fails: what failed, the real HTTP status
@@ -100,6 +108,12 @@ data class GroundedAnswer(
                 "এই মডেলটি Google বন্ধ করে দিয়েছে (deprecated / no longer available) — " +
                     "সার্চের মডেল বদলানো দরকার।"
             )
+        }
+        if (closeCode != 0 || connectMillis > 0 || firstTranscriptMillis > 0) {
+            append('\n').append("Search session: connect=").append(connectMillis)
+                .append("ms | first transcript=").append(firstTranscriptMillis)
+                .append("ms | total=").append(elapsedMillis).append("ms | chars=").append(textLength)
+            if (closeCode != 0) append(" | close=").append(closeCode)
         }
         if (serverMessage.isBlank() && detail.isBlank()) {
             append('\n').append("Google: (no error text returned)")
@@ -233,7 +247,7 @@ class GroundedSearchClient(
     private val models: List<String> = SearchModels.ORDER,
     /** Remembers the model that worked and the ones that ran out of quota today. */
     private val health: SearchModelHealth = SearchModelHealth()
-) {
+) : SearchBackend {
     /** The first (preferred) model. */
     val model: String get() = models.first()
 
@@ -244,8 +258,11 @@ class GroundedSearchClient(
     fun diagnosticsLine(): String =
         "Search models: " + models.joinToString(">") + " | " + health.describe()
 
+    /** [SearchBackend] diagnostics: this is the REST path, which 0.2.7 does not use by default. */
+    override fun describe(): String = "REST search (off the default path): " + describeRequest()
+
     /** Runs on [ioDispatcher] so the WebSocket thread and the audio threads stay free. */
-    suspend fun search(query: String): GroundedAnswer = withContext(ioDispatcher) {
+    override suspend fun search(query: String): GroundedAnswer = withContext(ioDispatcher) {
         val started = clock()
         val trimmed = query.trim().take(LiveToolProtocol.MAX_QUERY_CHARS)
         if (trimmed.isEmpty()) {
@@ -394,8 +411,8 @@ class GroundedSearchClient(
         )
     )
 
-    /** Secret-free description for diagnostics and tests. */
-    fun describe(): String =
+    /** Secret-free description of the request this client would make (diagnostics and tests). */
+    fun describeRequest(): String =
         "POST $baseUrl/models/$model:generateContent (fallback: ${models.drop(1).joinToString(",")}) key=AIza****"
 
     companion object {

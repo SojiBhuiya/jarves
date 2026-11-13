@@ -21,7 +21,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import com.sojibhuiya.jarves.intelligence.FreshnessClassifier
 import com.sojibhuiya.jarves.intelligence.GroundedSource
-import com.sojibhuiya.jarves.intelligence.GroundedSearchClient
 import com.sojibhuiya.jarves.intelligence.GroundingParser
 import com.sojibhuiya.jarves.intelligence.LiveSearchTool
 import com.sojibhuiya.jarves.intelligence.LiveModels
@@ -29,6 +28,8 @@ import com.sojibhuiya.jarves.intelligence.SessionEndReport
 import com.sojibhuiya.jarves.intelligence.VoiceSearchMode
 import com.sojibhuiya.jarves.intelligence.LiveToolProtocol
 import com.sojibhuiya.jarves.intelligence.SearchFunctionCall
+import com.sojibhuiya.jarves.intelligence.SearchBackend
+import com.sojibhuiya.jarves.intelligence.SearchBudget
 import com.sojibhuiya.jarves.intelligence.SearchToolRunner
 import com.sojibhuiya.jarves.intelligence.GroundingAvailability
 import com.sojibhuiya.jarves.intelligence.GroundingPolicy
@@ -63,7 +64,7 @@ class GeminiLiveVoice(
      * Design 4 search backend. `null` means voice-only: no function tool is declared and the app
      * never makes a REST search call.
      */
-    private val searchClient: GroundedSearchClient? = null,
+    private val searchBackend: SearchBackend? = null,
     /**
      * Design 4 (0.2.4): the technical failure text that must also appear *in the chat*, so the user
      * can read and copy the real HTTP status and Google's own error message. Called only when a
@@ -87,6 +88,9 @@ class GeminiLiveVoice(
          * They are constants so the provider adapter and the unit tests reference the exact
          * same values instead of duplicating (and drifting from) them.
          */
+        /** Auto mode: one search per user question, as the 0.2.7 spec requires. */
+        const val MAX_SEARCHES_PER_QUESTION = 1
+
         const val WEBSOCKET_ENDPOINT =
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         /** The Mode B model. Kept as a constant only for compatibility; the source of truth is
@@ -188,6 +192,9 @@ class GeminiLiveVoice(
     @Volatile private var searchToolMode: LiveSearchTool = LiveSearchTool.NONE
     /** Cleared once the server rejects `NON_BLOCKING`, so later sessions declare a blocking function. */
     @Volatile private var nonBlockingAccepted = true
+
+    /** Auto mode: one search per user question; reset after every model turn. */
+    private val searchBudget = SearchBudget(MAX_SEARCHES_PER_QUESTION)
     /** Runs `search_web` calls off the WebSocket thread; one per live session. */
     @Volatile private var searchRunner: SearchToolRunner? = null
     /** Set once a tool-refusal retry starts, so the retry can never repeat. */
@@ -299,7 +306,7 @@ class GeminiLiveVoice(
         lastCloseReason = "none"
         // Mode A: Google searches inside the Live session, so there is no REST backend and no
         // function tool at all. Mode B: exactly the previous behaviour.
-        val hasSearchBackend = !mode.usesBuiltInSearch && searchClient != null
+        val hasSearchBackend = !mode.usesBuiltInSearch && searchBackend != null
         groundingFallbackUsed = false
         searchToolMode = when {
             mode.usesBuiltInSearch -> LiveSearchTool.GOOGLE_SEARCH_BUILT_IN
@@ -317,6 +324,7 @@ class GeminiLiveVoice(
         groundingForTurn = false
         noticeSentForTurn = false
         turnUserSpeech.setLength(0)
+        searchBudget.reset()
         lastTimeSyncMillis = 0L
         lastTimeSyncDateKey = ""
         startSearchRunner()
@@ -568,6 +576,7 @@ class GeminiLiveVoice(
     private fun finishTurn(webSocket: WebSocket) {
         val spoken = turnUserSpeech.toString().trim()
         turnUserSpeech.setLength(0)
+        searchBudget.reset()
         val needsLiveSources = FreshnessClassifier.needsLiveSources(spoken)
         if (needsLiveSources && !groundingForTurn && !noticeSentForTurn) {
             noticeSentForTurn = true
@@ -624,7 +633,7 @@ class GeminiLiveVoice(
             "Setup tools: $setupDeclaredTool | toolCalls: $toolCallCount | " +
             diagnosticsFor(activeMode, searchToolMode, lastCloseCode, lastCloseReason) + " | " +
             "Last query: $lastToolQuery | Last search: $lastSearchOutcome | " +
-            "Last search model: $lastSearchModel | ${searchClient?.diagnosticsLine() ?: "Search models: none"} | " +
+            "Last search model: $lastSearchModel | ${searchBackend?.describe() ?: "Search models: none"} | " +
             "build: $FIX_TAG"
     }
 
@@ -650,9 +659,9 @@ class GeminiLiveVoice(
         searchRunner = null
         // Mode A: Google searches inside the Live session; the app must not run a REST search.
         if (activeMode.usesBuiltInSearch) return
-        val backend = searchClient ?: return
+        val backend = searchBackend ?: return
         searchRunner = SearchToolRunner(
-            client = backend,
+            backend = backend,
             onResult = { call, answer, scheduling ->
                 // The result is always sent, success or failure: a silent call would leave the
                 // model waiting and the user without an answer.
@@ -706,7 +715,22 @@ class GeminiLiveVoice(
             return
         }
         onStatus("ওয়েব সার্চ শুরু হচ্ছে…")
-        calls.forEach { runner.handle(it) }
+        calls.forEach { call ->
+            if (searchBudget.tryStart()) {
+                runner.handle(call)
+            } else {
+                // One search per question: tell the model to answer with what it already has
+                // instead of spending a second session on the same question.
+                onStatus("এই প্রশ্নে ইতিমধ্যে একবার সার্চ হয়েছে")
+                sendToolResponse(
+                    LiveToolProtocol.toolResponseJson(
+                        callId = call.callId,
+                        result = "A search has already been run for this question. Answer with " +
+                            "what you have now and do not request another search."
+                    )
+                )
+            }
+        }
     }
 
     /**

@@ -23,7 +23,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  *  * a callId is answered at most once.
  */
 class SearchToolRunner(
-    private val client: GroundedSearchClient,
+    private val backend: SearchBackend,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     private val maxConcurrent: Int = 2,
     private val timeoutMillis: Long = 25_000L,
@@ -56,7 +56,7 @@ class SearchToolRunner(
             try {
                 onEvent("সার্চ চলছে: ${call.query}")
                 val answer = withTimeoutOrNull(timeoutMillis) {
-                    client.search(call.query)
+                    backend.search(call.query)
                 } ?: GroundedAnswer(
                     query = call.query,
                     text = "",

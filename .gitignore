@@ -9,3 +9,5 @@ local.properties
 # IDE
 .idea/
 *.iml
+# CI release assets
+dist/

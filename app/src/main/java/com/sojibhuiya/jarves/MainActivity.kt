@@ -69,18 +69,27 @@ import com.sojibhuiya.jarves.apiproviders.CredentialResult
 import com.sojibhuiya.jarves.apiproviders.GeminiLiveAdapter
 import com.sojibhuiya.jarves.apiproviders.MigrationResult
 import com.sojibhuiya.jarves.chat.ChatSource
-import com.sojibhuiya.jarves.intelligence.GroundedSearchClient
+import com.sojibhuiya.jarves.intelligence.CachedSearchBackend
+import com.sojibhuiya.jarves.intelligence.LiveSearchSession
+import com.sojibhuiya.jarves.intelligence.OkHttpLiveSearchTransport
+import com.sojibhuiya.jarves.update.AndroidInstalledAppReader
+import com.sojibhuiya.jarves.update.InstallOutcome
+import com.sojibhuiya.jarves.update.InstallResultBus
+import com.sojibhuiya.jarves.update.UpdateCheck
+import com.sojibhuiya.jarves.update.UpdateDownload
+import com.sojibhuiya.jarves.update.UpdateInstaller
+import com.sojibhuiya.jarves.update.UpdateManager
+import com.sojibhuiya.jarves.update.UpdateUiState
+import com.sojibhuiya.jarves.update.statusText
 import com.sojibhuiya.jarves.intelligence.GroundingAvailability
 import com.sojibhuiya.jarves.intelligence.LiveState
 import com.sojibhuiya.jarves.intelligence.LiveStateRouting
-import com.sojibhuiya.jarves.intelligence.SearchModelHealth
 import com.sojibhuiya.jarves.intelligence.VoiceSearchModeSettings
 import com.sojibhuiya.jarves.intelligence.VoiceSearchMode
 import com.sojibhuiya.jarves.chat.Conversation
 import com.sojibhuiya.jarves.storage.ApiProvidersModule
 import com.sojibhuiya.jarves.storage.ConversationModule
 import com.sojibhuiya.jarves.ui.chats.ChatsScreen
-import com.sojibhuiya.jarves.storage.AndroidModelStateStore
 import com.sojibhuiya.jarves.storage.AndroidVoiceModeStore
 import com.sojibhuiya.jarves.storage.PrefKeys
 import com.sojibhuiya.jarves.storage.jarvesDataStore
@@ -119,6 +128,43 @@ private fun AgiApp() {
     val modeSettings = remember { VoiceSearchModeSettings(AndroidVoiceModeStore(context.applicationContext)) }
     var voiceMode by remember { mutableStateOf(modeSettings.current()) }
     var screen by remember { mutableStateOf(JarvesNavigation.HOME) }
+
+    // ---- 0.2.7 in-app updater. The install itself is done by the system installer; this app only
+    // checks GitHub Releases, downloads, verifies (SHA-256 + certificate) and hands the file over.
+    val appReader = remember { AndroidInstalledAppReader(context.applicationContext) }
+    val updateManager = remember {
+        UpdateManager(reader = appReader, cacheDir = context.applicationContext.cacheDir)
+    }
+    val installer = remember { UpdateInstaller(context.applicationContext) }
+    val appVersionName = remember { appReader.installedVersion().name }
+    var updateState by remember { mutableStateOf<UpdateUiState>(UpdateUiState.Idle) }
+    // The system's verdict arrives here; success is never assumed before it does.
+    val installOutcome by InstallResultBus.outcome.collectAsState()
+    LaunchedEffect(installOutcome) {
+        when (val outcome = installOutcome) {
+            null -> Unit
+            InstallOutcome.Success -> {
+                updateState = UpdateUiState.Message("ইনস্টল সফল হয়েছে — নতুন ভার্সন চালু হচ্ছে।")
+                InstallResultBus.clear()
+            }
+            InstallOutcome.Cancelled -> {
+                updateState = UpdateUiState.Message("ইনস্টল বাতিল হয়েছে। অ্যাপ আগের মতোই আছে।")
+                InstallResultBus.clear()
+            }
+            is InstallOutcome.Failed -> {
+                updateState = UpdateUiState.Message("ইনস্টল হয়নি — ${outcome.message}")
+                InstallResultBus.clear()
+            }
+            InstallOutcome.NeedsPermission -> {
+                updateState = UpdateUiState.Message(
+                    "অ্যাপ ইনস্টল করার অনুমতি নেই। সেটিংসে \"Install unknown apps\" চালু করুন।"
+                )
+                InstallResultBus.clear()
+            }
+            InstallOutcome.Started -> InstallResultBus.clear()
+        }
+    }
+    LaunchedEffect(Unit) { UpdateManager.pruneCache(context.applicationContext.cacheDir) }
     var assistantNameInput by remember(prefs) { mutableStateOf(prefs?.get(PrefKeys.ASSISTANT_NAME).orEmpty()) }
     var status by remember { mutableStateOf("মাঝের বাটনে চাপ দিয়ে Live Voice চালু করুন") }
     var connected by remember { mutableStateOf(false) }
@@ -311,15 +357,16 @@ private fun AgiApp() {
                 assistantName = assistantName,
                 // Design 4: the app performs the search over REST with the same key, so the live
                 // session never has to declare the Live grounding tool.
-                // Mode A: Google runs the search inside the Live session, so the app passes no
-                // REST backend at all — that guarantees no REST search in this mode.
-                searchClient = if (voiceMode.usesBuiltInSearch) {
-                    null
+                // 0.2.7 backend per mode:
+                //  * AUTO        -> the second, short-lived 2.5 Live session (+ short cache);
+                //  * VOICE_ONLY  -> none (no tools at all);
+                //  * SEARCH_ONLY -> none (Google searches inside the 2.5 conversation session).
+                // The REST GroundedSearchClient is deliberately NOT wired here; it stays in the
+                // code base as a fallback but is off the default path.
+                searchBackend = if (voiceMode.usesSecondSearchSession) {
+                    CachedSearchBackend(LiveSearchSession(OkHttpLiveSearchTransport(credentialKey)))
                 } else {
-                    GroundedSearchClient(
-                        apiKey = credentialKey,
-                        health = SearchModelHealth(AndroidModelStateStore(context.applicationContext))
-                    )
+                    null
                 },
                 mode = voiceMode,
                 onSessionEnd = { report ->
@@ -426,6 +473,68 @@ private fun AgiApp() {
                         )
                         screen == JarvesNavigation.SETTINGS -> SettingsScreen(
                             assistantName = assistantNameInput.ifBlank { assistantName },
+                            appVersionName = appVersionName,
+                            updateState = updateState,
+                            onCheckUpdate = {
+                                if (!updateState.isBusy) {
+                                    scope.launch {
+                                        updateState = UpdateUiState.Checking
+                                        updateState = when (val result = updateManager.check()) {
+                                            is UpdateCheck.UpToDate -> UpdateUiState.UpToDate(
+                                                result.current,
+                                                result.latestName
+                                            )
+                                            is UpdateCheck.Available -> UpdateUiState.Available(
+                                                result.current,
+                                                result.release
+                                            )
+                                            is UpdateCheck.Failed -> UpdateUiState.Failed(
+                                                result.failure,
+                                                result.detail
+                                            )
+                                        }
+                                    }
+                                }
+                            },
+                            onDownloadUpdate = {
+                                val available = updateState as? UpdateUiState.Available
+                                if (available != null) {
+                                    scope.launch {
+                                        val release = available.release
+                                        updateState = UpdateUiState.Downloading(release, 0f)
+                                        updateState = when (
+                                            val downloaded = updateManager.downloadAndVerify(release) { progress ->
+                                                updateState = UpdateUiState.Downloading(release, progress)
+                                            }
+                                        ) {
+                                            is UpdateDownload.Ready -> UpdateUiState.ReadyToInstall(
+                                                release,
+                                                downloaded.path
+                                            )
+                                            is UpdateDownload.Failed -> UpdateUiState.Failed(
+                                                downloaded.failure,
+                                                downloaded.detail
+                                            )
+                                        }
+                                    }
+                                }
+                            },
+                            onInstallUpdate = {
+                                val ready = updateState as? UpdateUiState.ReadyToInstall
+                                if (ready != null) {
+                                    when (val outcome = installer.install(java.io.File(ready.path))) {
+                                        InstallOutcome.NeedsPermission -> {
+                                            installer.openInstallPermissionSettings()
+                                            updateState = UpdateUiState.Message(
+                                                "অ্যাপ ইনস্টল করার অনুমতি দিন, তারপর আবার \"ইনস্টল করুন\" চাপুন।"
+                                            )
+                                        }
+                                        is InstallOutcome.Failed -> updateState =
+                                            UpdateUiState.Message("ইনস্টল হয়নি — ${outcome.message}")
+                                        else -> Unit // Started: InstallResultBus reports the truth.
+                                    }
+                                }
+                            },
                             status = status,
                             providersLoaded = providersLoaded,
                             providerCount = providers.size,
@@ -577,6 +686,11 @@ private fun SelectableText(value: String, color: Color) {
 @Composable
 private fun SettingsScreen(
     assistantName: String,
+    appVersionName: String = "",
+    updateState: UpdateUiState = UpdateUiState.Idle,
+    onCheckUpdate: () -> Unit = {},
+    onDownloadUpdate: () -> Unit = {},
+    onInstallUpdate: () -> Unit = {},
     status: String,
     providersLoaded: Boolean,
     providerCount: Int,
@@ -695,6 +809,68 @@ private fun SettingsScreen(
                     selected = entry == voiceMode,
                     onSelect = { onSelectMode(entry) }
                 )
+            }
+        }
+
+        Spacer(Modifier.height(JarvesDimens.SectionGap))
+        SectionLabel("Update")
+        Spacer(Modifier.height(8.dp))
+        JarvesCard {
+            Column(Modifier.padding(JarvesDimens.CardPadding)) {
+                Text(
+                    text = "বর্তমান ভার্সন: $appVersionName",
+                    color = JarvesColors.TextSecondary,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium
+                )
+                Spacer(Modifier.height(6.dp))
+                Row(
+                    Modifier.fillMaxWidth().heightIn(min = JarvesDimens.TouchTarget),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = updateState.statusText(appVersionName),
+                        color = if (updateState is UpdateUiState.Failed) JarvesColors.TextPrimary
+                        else JarvesColors.TextSecondary,
+                        fontSize = 13.sp,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (updateState is UpdateUiState.Checking || updateState is UpdateUiState.Downloading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp,
+                            color = JarvesColors.TextSecondary
+                        )
+                    }
+                }
+                if (updateState is UpdateUiState.Available) {
+                    val release = (updateState as UpdateUiState.Available).release
+                    if (release.notes.isNotBlank()) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = release.notes.take(1200),
+                            color = JarvesColors.TextMuted,
+                            fontSize = 12.sp
+                        )
+                    }
+                    JarvesTextAction(
+                        text = "ডাউনলোড ও ইনস্টল",
+                        onClick = onDownloadUpdate,
+                        enabled = !updateState.isBusy
+                    )
+                }
+                if (updateState is UpdateUiState.ReadyToInstall) {
+                    JarvesTextAction(text = "ইনস্টল করুন", onClick = onInstallUpdate)
+                }
+                if (updateState !is UpdateUiState.Available &&
+                    updateState !is UpdateUiState.ReadyToInstall
+                ) {
+                    JarvesTextAction(
+                        text = "আপডেট আছে কি দেখুন",
+                        onClick = onCheckUpdate,
+                        enabled = !updateState.isBusy
+                    )
+                }
             }
         }
 

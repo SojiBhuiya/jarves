@@ -134,13 +134,15 @@ class LiveSessionConfigTest {
     fun searchInstructionRequiresCheckingFirstAndSayingSo() {
         val text = LiveSessionConfig.systemInstruction("Jarves", snapshot, LiveSearchTool.FUNCTION_NON_BLOCKING)
         assertTrue(LiveSessionConfig.searchEnabled(text))
-        assertTrue(text.contains("search_web` first", ignoreCase = true) ||
-            text.contains("search first", ignoreCase = true))
+        // 0.2.7: the function is named once, and only for current/time-sensitive facts.
+        assertTrue(text.contains("`search_web` only for current or time-sensitive facts", ignoreCase = true))
         // The user must hear that a check is happening, not silence and not a guess.
-        assertTrue(text.contains("একটু দেখে নিচ্ছি"))
-        assertTrue(text.contains("Do not guess an answer before the result arrives", ignoreCase = true))
+        assertTrue(text.contains("দেখে নিচ্ছি"))
+        assertTrue(text.contains("Do not guess before the result arrives", ignoreCase = true))
         assertTrue(text.contains("most recent sources", ignoreCase = true))
         assertTrue(text.contains("name the source you used", ignoreCase = true))
+        // ...and small talk / arithmetic / definitions must be excluded in so many words.
+        assertTrue(text.contains("Never call it for small talk, arithmetic or definitions", ignoreCase = true))
     }
 
     @Test
