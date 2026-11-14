@@ -27,6 +27,7 @@ import com.sojibhuiya.jarves.intelligence.LiveModels
 import com.sojibhuiya.jarves.intelligence.SessionEndReport
 import com.sojibhuiya.jarves.intelligence.VoiceSearchMode
 import com.sojibhuiya.jarves.intelligence.LiveToolProtocol
+import com.sojibhuiya.jarves.intelligence.MicSensitivity
 import com.sojibhuiya.jarves.intelligence.SearchFunctionCall
 import com.sojibhuiya.jarves.intelligence.SearchBackend
 import com.sojibhuiya.jarves.intelligence.SearchBudget
@@ -80,7 +81,12 @@ class GeminiLiveVoice(
      * 0.2.6: called when a session ends with a code the user can act on (1007 / 1008 / 1011 …).
      * The report carries the exact code and reason and says whether Mode B is the way out.
      */
-    private val onSessionEnd: (SessionEndReport) -> Unit = {}
+    private val onSessionEnd: (SessionEndReport) -> Unit = {},
+    /**
+     * 0.2.8: how eagerly microphone input is treated as speech. Settings → Advanced → Mic
+     * sensitivity; a conservative value keeps nearby voices and faint noise from starting a turn.
+     */
+    private val micSensitivity: MicSensitivity = MicSensitivity.DEFAULT
 ) {
     companion object {
         /**
@@ -192,6 +198,14 @@ class GeminiLiveVoice(
     @Volatile private var searchToolMode: LiveSearchTool = LiveSearchTool.NONE
     /** Cleared once the server rejects `NON_BLOCKING`, so later sessions declare a blocking function. */
     @Volatile private var nonBlockingAccepted = true
+
+    /**
+     * 0.2.8: the last Auto search, step by step, for the Diagnostic block. Written from the search
+     * worker thread and the WebSocket thread, read by the UI — volatile + a short immutable String.
+     */
+    @Volatile private var lastAutoTrace: String = "none"
+    @Volatile private var lastToolCallSeen: String = "none"
+    @Volatile private var lastToolResponseDelivery: String = "none"
 
     /** Auto mode: one search per user question; reset after every model turn. */
     private val searchBudget = SearchBudget(MAX_SEARCHES_PER_QUESTION)
@@ -325,6 +339,9 @@ class GeminiLiveVoice(
         noticeSentForTurn = false
         turnUserSpeech.setLength(0)
         searchBudget.reset()
+        lastAutoTrace = "none"
+        lastToolCallSeen = "none"
+        lastToolResponseDelivery = "none"
         lastTimeSyncMillis = 0L
         lastTimeSyncDateKey = ""
         startSearchRunner()
@@ -362,7 +379,8 @@ class GeminiLiveVoice(
                     model = LiveModels.modelFor(activeMode),
                     voiceName = VOICE_NAME,
                     systemInstruction = instruction,
-                    searchTool = searchToolMode
+                    searchTool = searchToolMode,
+                    micSensitivity = micSensitivity
                 )
                 if (!webSocket.send(setup)) {
                     fail("Gemini setup পাঠানো যায়নি: WebSocket send queue বন্ধ")
@@ -451,6 +469,10 @@ class GeminiLiveVoice(
                         if (calls.isNotEmpty()) {
                             toolCallCount += calls.size
                             lastToolQuery = calls.first().query.take(60)
+                            lastToolCallSeen = "toolCall received (id=${calls.first().callId.take(24)}, " +
+                                "q=${calls.first().query.take(40)}, model=${LiveModels.modelFor(activeMode)})"
+                            lastAutoTrace = "Auto steps: $lastToolCallSeen"
+                            onStatus("৩.৮ মডেল সার্চ চাইছে — দ্বিতীয় সেশন খোলা হচ্ছে…")
                             handleSearchCalls(calls)
                         }
                     }
@@ -634,12 +656,32 @@ class GeminiLiveVoice(
             diagnosticsFor(activeMode, searchToolMode, lastCloseCode, lastCloseReason) + " | " +
             "Last query: $lastToolQuery | Last search: $lastSearchOutcome | " +
             "Last search model: $lastSearchModel | ${searchBackend?.describe() ?: "Search models: none"} | " +
-            "build: $FIX_TAG"
+            "Mic sensitivity: ${micSensitivity.label} | Audio effects: ${audioEffectsSummary()} | " +
+            "build: $FIX_TAG" + "\n" + lastAutoTrace
     }
 
     // -------------------------------------------------------------------------------------
     // Design 4: the model calls `search_web` -> app searches over REST -> toolResponse
     // -------------------------------------------------------------------------------------
+
+    /** The last Auto search's step trace, for Settings → Advanced → Diagnostics. */
+    fun lastAutoSearchTrace(): String = lastAutoTrace
+
+    /**
+     * What the OS gives this app for echo/noise handling. The recorder uses
+     * `MediaRecorder.AudioSource.VOICE_COMMUNICATION`
+     * (https://developer.android.com/reference/android/media/MediaRecorder.AudioSource#VOICE_COMMUNICATION),
+     * which the platform routes through echo cancellation and noise suppression where the device
+     * provides them; this line reports whether the effect APIs exist at all, so a device that
+     * lacks them is visible instead of guessed at.
+     */
+    private fun audioEffectsSummary(): String = try {
+        val aec = android.media.audiofx.AcousticEchoCanceler.isAvailable()
+        val ns = android.media.audiofx.NoiseSuppressor.isAvailable()
+        "source=VOICE_COMMUNICATION, AEC available=$aec, NS available=$ns"
+    } catch (e: Throwable) {
+        "source=VOICE_COMMUNICATION, effects unknown (${e.javaClass.simpleName})"
+    }
 
     /**
      * Sends one `toolResponse` frame. This is the single send path used by the search runner; it
@@ -665,9 +707,28 @@ class GeminiLiveVoice(
             onResult = { call, answer, scheduling ->
                 // The result is always sent, success or failure: a silent call would leave the
                 // model waiting and the user without an answer.
-                sendToolResponse(
+                // Never claim the result reached the model: the send is checked and reported.
+                val delivered = sendToolResponse(
                     LiveToolProtocol.toolResponseJson(call.callId, answer.asToolResult(), scheduling)
                 )
+                lastToolResponseDelivery = if (delivered) {
+                    "toolResponse sent (id=${call.callId.take(24)}, scheduling=$scheduling, " +
+                        "3.8 session open=true)"
+                } else {
+                    "toolResponse NOT sent — the 3.8 session was already closed " +
+                        "(close=$lastCloseCode ${lastCloseReason.take(40)})"
+                }
+                lastAutoTrace = (answer.trace.ifBlank { "Auto steps: none" }) +
+                    " -> " + lastToolResponseDelivery
+                if (!delivered) {
+                    runCatching {
+                        onSearchReport(
+                            "সার্চের ফল ৩.৮ সেশনে পাঠানো যায়নি — সেশন বন্ধ ছিল " +
+                                "(step=${answer.step.ifBlank { "toolResponse" }} | close=$lastCloseCode, " +
+                                "${lastCloseReason.take(60)}).\n${answer.failureReport()}"
+                        )
+                    }
+                }
                 lastSearchModel = answer.model.ifBlank { "unknown" } +
                     (if (answer.attempted.size > 1) " (tried ${answer.attempted.joinToString(">")})" else "") +
                     (if (answer.skipped.isNotEmpty()) " (skipped ${answer.skipped.joinToString(", ")})" else "")

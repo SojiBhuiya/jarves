@@ -85,7 +85,11 @@ data class GroundedAnswer(
     /** Live search session: milliseconds from start to the first transcription chunk. */
     val firstTranscriptMillis: Long = 0L,
     /** Live search session: characters of transcription text received. */
-    val textLength: Int = 0
+    val textLength: Int = 0,
+    /** 0.2.8: which step of the Auto search failed (empty when it succeeded). */
+    val step: String = "",
+    /** 0.2.8: the step-by-step trace with timings, shown in the Diagnostic block. */
+    val trace: String = ""
 ) {
     /**
      * The report shown in the chat bubble when a search fails: what failed, the real HTTP status
@@ -109,6 +113,8 @@ data class GroundedAnswer(
                     "সার্চের মডেল বদলানো দরকার।"
             )
         }
+        if (step.isNotBlank()) append('\n').append("Step that failed: ").append(step)
+        if (trace.isNotBlank()) append('\n').append(trace)
         if (closeCode != 0 || connectMillis > 0 || firstTranscriptMillis > 0) {
             append('\n').append("Search session: connect=").append(connectMillis)
                 .append("ms | first transcript=").append(firstTranscriptMillis)

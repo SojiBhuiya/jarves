@@ -71,6 +71,28 @@ object LiveSessionConfig {
 
     fun searchEnabled(systemInstruction: String): Boolean = systemInstruction.contains(MARK_SEARCH)
 
+    /** Marker the tests use to prove the rule is present in every mode's instruction. */
+    const val MARK_LANGUAGE_RULE = "LANGUAGE RULE (strict)"
+
+    /**
+     * The strict language rule, identical for all three modes.
+     *
+     * Docs: https://ai.google.dev/gemini-api/docs/live-guide#supported-languages — native audio
+     * models switch language on their own unless the system instruction restricts them
+     * (Bengali = `bn` is in the supported list). No `languageCode` field is sent: the docs attach
+     * language control to the instruction, and the Live `generationConfig` field list does not
+     * include a language for audio output.
+     */
+    fun languageRule(): String = buildString {
+        append(MARK_LANGUAGE_RULE).append(": ")
+        append("Speak ONLY Bengali when the user speaks Bengali, and English only when the user ")
+        append("speaks English. Quote foreign words only when they are part of a Bengali sentence. ")
+        append("NEVER switch language because of background noise, a TV, music, a nearby voice, or ")
+        append("any speech that is not clearly addressed to you — if the sound is unclear or is not ")
+        append("a request for you, stay silent. If you cannot understand the user's words, do not ")
+        append("guess in another language: stay silent or ask once, in Bengali, \"একটু আবার বলবেন?\"")
+    }
+
     /**
      * The complete system instruction: identity, freshness rules, source rules, honesty rules and
      * the current date/time block.
@@ -82,12 +104,18 @@ object LiveSessionConfig {
     ): String = buildString {
         appendLine(
             "You are $assistantName, a warm and capable personal voice assistant. " +
-                "Speak naturally and conversationally. Understand and respond in Bengali, English, " +
-                "Banglish, or the language the user uses. Prefer natural Bangla when the user speaks " +
-                "Bangla. Keep responses clear, useful and concise. This is a live voice conversation. " +
+                "Speak naturally and conversationally. Understand Bengali, English and Banglish, " +
+                "but the strict LANGUAGE RULE below decides which language you speak in. " +
+                "Keep responses clear, useful and concise. This is a live voice conversation. " +
                 "Do not say you are reading a transcript."
         )
         appendLine()
+        // 0.2.8: the phone report showed random Spanish/Indonesian answers triggered by background
+        // noise. The Live docs say native-audio models "can switch between languages naturally
+        // during conversation. You can also restrict the languages it speaks in by specifying it in
+        // the system instructions." (https://ai.google.dev/gemini-api/docs/live-guide#supported-languages)
+        // There is no languageCode field for this, so the rule lives here — once, for every mode.
+        appendLine(languageRule())
         appendLine("CURRENT INFORMATION RULES:")
         if (searchTool.usesBuiltInSearch) {
             // Mode A. Google Search is built into the session: the model searches by itself, so
@@ -198,7 +226,8 @@ object LiveSessionConfig {
         systemInstruction: String,
         searchTool: LiveSearchTool,
         inputTranscription: Boolean = true,
-        outputTranscription: Boolean = true
+        outputTranscription: Boolean = true,
+        micSensitivity: MicSensitivity = MicSensitivity.DEFAULT
     ): String {
         val generationConfig = linkedMapOf<String, Any?>(
             "responseModalities" to listOf("AUDIO"),
@@ -220,6 +249,11 @@ object LiveSessionConfig {
         if (tools.isNotEmpty()) setup["tools"] = tools
         if (inputTranscription) setup["inputAudioTranscription"] = emptyMap<String, Any?>()
         if (outputTranscription) setup["outputAudioTranscription"] = emptyMap<String, Any?>()
+        // 0.2.8: conservative automatic VAD so nearby voices do not start a turn. Only sent for
+        // models the docs list as supporting it, and never for NORMAL (server defaults).
+        if (MicVadSupport.shouldSend(model, micSensitivity)) {
+            micSensitivity.realtimeInputConfigJson()?.let { setup["realtimeInputConfig"] = it }
+        }
 
         return MiniJson.encode(linkedMapOf<String, Any?>("setup" to setup))
     }

@@ -80,16 +80,19 @@ import com.sojibhuiya.jarves.update.UpdateDownload
 import com.sojibhuiya.jarves.update.UpdateInstaller
 import com.sojibhuiya.jarves.update.UpdateManager
 import com.sojibhuiya.jarves.update.UpdateUiState
-import com.sojibhuiya.jarves.update.statusText
+import com.sojibhuiya.jarves.update.resultLine
 import com.sojibhuiya.jarves.intelligence.GroundingAvailability
 import com.sojibhuiya.jarves.intelligence.LiveState
 import com.sojibhuiya.jarves.intelligence.LiveStateRouting
 import com.sojibhuiya.jarves.intelligence.VoiceSearchModeSettings
+import com.sojibhuiya.jarves.intelligence.MicSensitivity
+import com.sojibhuiya.jarves.intelligence.MicSensitivitySettings
 import com.sojibhuiya.jarves.intelligence.VoiceSearchMode
 import com.sojibhuiya.jarves.chat.Conversation
 import com.sojibhuiya.jarves.storage.ApiProvidersModule
 import com.sojibhuiya.jarves.storage.ConversationModule
 import com.sojibhuiya.jarves.ui.chats.ChatsScreen
+import com.sojibhuiya.jarves.storage.AndroidMicSensitivityStore
 import com.sojibhuiya.jarves.storage.AndroidVoiceModeStore
 import com.sojibhuiya.jarves.storage.PrefKeys
 import com.sojibhuiya.jarves.storage.jarvesDataStore
@@ -100,7 +103,6 @@ import com.sojibhuiya.jarves.ui.components.JarvesIcon
 import com.sojibhuiya.jarves.ui.components.JarvesIconButton
 import com.sojibhuiya.jarves.ui.components.JarvesIconTextAction
 import com.sojibhuiya.jarves.ui.components.JarvesNavigation
-import com.sojibhuiya.jarves.ui.components.JarvesStatusLine
 import com.sojibhuiya.jarves.ui.components.JarvesTextAction
 import com.sojibhuiya.jarves.ui.components.JarvesTextField
 import com.sojibhuiya.jarves.ui.components.NavigationDrawer
@@ -127,6 +129,9 @@ private fun AgiApp() {
     // Settings selector and the session start can never disagree.
     val modeSettings = remember { VoiceSearchModeSettings(AndroidVoiceModeStore(context.applicationContext)) }
     var voiceMode by remember { mutableStateOf(modeSettings.current()) }
+    // 0.2.8: mic sensitivity is read once, like the mode, so Settings and the session agree.
+    val micSettings = remember { MicSensitivitySettings(AndroidMicSensitivityStore(context.applicationContext)) }
+    var micSensitivity by remember { mutableStateOf(micSettings.current()) }
     var screen by remember { mutableStateOf(JarvesNavigation.HOME) }
 
     // ---- 0.2.7 in-app updater. The install itself is done by the system installer; this app only
@@ -369,6 +374,7 @@ private fun AgiApp() {
                     null
                 },
                 mode = voiceMode,
+                micSensitivity = micSensitivity,
                 onSessionEnd = { report ->
                     scope.launch {
                         status = report.message()
@@ -542,6 +548,12 @@ private fun AgiApp() {
                             onBack = { screen = JarvesNavigation.HOME },
                             onOpenApiProviders = { screen = JarvesNavigation.API_PROVIDERS },
                             voiceMode = voiceMode,
+                            micSensitivity = micSensitivity,
+                            onSelectMicSensitivity = { chosen ->
+                                micSensitivity = chosen
+                                micSettings.save(chosen)
+                            },
+                            lastAutoTrace = engine?.lastAutoSearchTrace() ?: "none",
                             onSelectMode = { chosen ->
                                 voiceMode = chosen
                                 modeSettings.save(chosen)
@@ -699,12 +711,22 @@ private fun SettingsScreen(
     onOpenApiProviders: () -> Unit,
     onSaveName: (String) -> Unit,
     voiceMode: VoiceSearchMode = VoiceSearchMode.DEFAULT,
-    onSelectMode: (VoiceSearchMode) -> Unit = {}
+    onSelectMode: (VoiceSearchMode) -> Unit = {},
+    micSensitivity: MicSensitivity = MicSensitivity.DEFAULT,
+    onSelectMicSensitivity: (MicSensitivity) -> Unit = {},
+    lastAutoTrace: String = "none"
 ) {
     var editingName by remember(assistantName) { mutableStateOf(assistantName.isBlank()) }
     var draftName by remember(assistantName) { mutableStateOf(assistantName) }
-    // Needed by the copy action on the diagnostic line below.
+    // 0.2.8: everything technical lives in one collapsed section at the bottom.
+    var advancedOpen by remember { mutableStateOf(false) }
     val context = LocalContext.current
+    val diagnostics = buildString {
+        append("Jarves $appVersionName").append('\n')
+        append("mode=").append(voiceMode.label).append(" | mic=").append(micSensitivity.label).append('\n')
+        append(lastAutoTrace).append('\n')
+        if (status.isNotBlank()) append(status)
+    }
 
     Column(
         Modifier
@@ -725,12 +747,12 @@ private fun SettingsScreen(
             modifier = Modifier.padding(top = 2.dp, bottom = 18.dp)
         )
 
+        // ---------------- 1. Assistant ------------------------------------------------
         SectionLabel("Assistant")
         Spacer(Modifier.height(8.dp))
         JarvesCard {
             Column(Modifier.padding(JarvesDimens.CardPadding)) {
                 if (editingName) {
-                    // ---- Edit mode: input + Save / Cancel
                     JarvesTextField(
                         value = draftName,
                         onValueChange = { draftName = it },
@@ -762,7 +784,6 @@ private fun SettingsScreen(
                         )
                     }
                 } else {
-                    // ---- Display mode: saved name + pencil Edit action
                     Row(
                         Modifier.fillMaxWidth().heightIn(min = JarvesDimens.TouchTarget),
                         verticalAlignment = Alignment.CenterVertically
@@ -787,112 +808,214 @@ private fun SettingsScreen(
             }
         }
 
+        // ---------------- 2. API Providers --------------------------------------------
         Spacer(Modifier.height(JarvesDimens.SectionGap))
-        SectionLabel("Integrations")
+        SectionLabel("API Providers")
         Spacer(Modifier.height(8.dp))
         JarvesCard {
-            ApiProvidersRow(
-                providerCount = providerCount,
-                enabledCount = enabledProviderCount,
-                loaded = providersLoaded,
-                onClick = onOpenApiProviders
-            )
-        }
-
-        Spacer(Modifier.height(JarvesDimens.SectionGap))
-        SectionLabel("Voice and search mode")
-        Spacer(Modifier.height(8.dp))
-        JarvesCard {
-            VoiceSearchMode.entries.forEach { entry ->
-                VoiceModeRow(
-                    mode = entry,
-                    selected = entry == voiceMode,
-                    onSelect = { onSelectMode(entry) }
+            Column(Modifier.padding(JarvesDimens.CardPadding)) {
+                ApiProvidersRow(
+                    providerCount = providerCount,
+                    enabledCount = enabledProviderCount,
+                    loaded = providersLoaded,
+                    onClick = onOpenApiProviders
+                )
+                // The one-line security note, kept short and only here.
+                Text(
+                    text = "Keys are encrypted with Android Keystore (AES-GCM) and never shown in full.",
+                    color = JarvesColors.TextMuted,
+                    fontSize = 10.5.sp,
+                    lineHeight = 14.sp,
+                    modifier = Modifier.padding(top = 2.dp)
                 )
             }
         }
 
+        // ---------------- 3. Voice and search mode ------------------------------------
+        Spacer(Modifier.height(JarvesDimens.SectionGap))
+        SectionLabel("Voice and search mode")
+        Spacer(Modifier.height(8.dp))
+        JarvesCard {
+            Column(Modifier.padding(horizontal = JarvesDimens.CardPadding)) {
+                VoiceSearchMode.entries.forEach { entry ->
+                    VoiceModeRow(
+                        mode = entry,
+                        selected = entry == voiceMode,
+                        onSelect = { onSelectMode(entry) }
+                    )
+                }
+            }
+        }
+
+        // ---------------- 4. Update ---------------------------------------------------
         Spacer(Modifier.height(JarvesDimens.SectionGap))
         SectionLabel("Update")
         Spacer(Modifier.height(8.dp))
         JarvesCard {
             Column(Modifier.padding(JarvesDimens.CardPadding)) {
-                Text(
-                    text = "বর্তমান ভার্সন: $appVersionName",
-                    color = JarvesColors.TextSecondary,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium
-                )
-                Spacer(Modifier.height(6.dp))
+                // One small version label on the right, one button on the left — no duplicate line.
                 Row(
                     Modifier.fillMaxWidth().heightIn(min = JarvesDimens.TouchTarget),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = updateState.statusText(appVersionName),
-                        color = if (updateState is UpdateUiState.Failed) JarvesColors.TextPrimary
-                        else JarvesColors.TextSecondary,
-                        fontSize = 13.sp,
-                        modifier = Modifier.weight(1f)
-                    )
-                    if (updateState is UpdateUiState.Checking || updateState is UpdateUiState.Downloading) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(18.dp),
-                            strokeWidth = 2.dp,
-                            color = JarvesColors.TextSecondary
+                    if (updateState !is UpdateUiState.Available &&
+                        updateState !is UpdateUiState.ReadyToInstall
+                    ) {
+                        JarvesTextAction(
+                            text = "আপডেট আছে কি দেখুন",
+                            onClick = onCheckUpdate,
+                            enabled = !updateState.isBusy
                         )
+                    } else if (updateState is UpdateUiState.Available) {
+                        JarvesTextAction(
+                            text = "ডাউনলোড ও ইনস্টল",
+                            onClick = onDownloadUpdate,
+                            enabled = !updateState.isBusy
+                        )
+                    } else {
+                        JarvesTextAction(text = "ইনস্টল করুন", onClick = onInstallUpdate)
                     }
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        text = "v$appVersionName",
+                        color = JarvesColors.TextMuted,
+                        fontSize = 11.sp
+                    )
                 }
                 if (updateState is UpdateUiState.Available) {
                     val release = (updateState as UpdateUiState.Available).release
                     if (release.notes.isNotBlank()) {
-                        Spacer(Modifier.height(4.dp))
+                        Spacer(Modifier.height(2.dp))
                         Text(
-                            text = release.notes.take(1200),
+                            text = release.notes.take(600),
                             color = JarvesColors.TextMuted,
-                            fontSize = 12.sp
+                            fontSize = 11.sp,
+                            lineHeight = 15.sp
                         )
                     }
-                    JarvesTextAction(
-                        text = "ডাউনলোড ও ইনস্টল",
-                        onClick = onDownloadUpdate,
-                        enabled = !updateState.isBusy
-                    )
                 }
-                if (updateState is UpdateUiState.ReadyToInstall) {
-                    JarvesTextAction(text = "ইনস্টল করুন", onClick = onInstallUpdate)
-                }
-                if (updateState !is UpdateUiState.Available &&
-                    updateState !is UpdateUiState.ReadyToInstall
-                ) {
-                    JarvesTextAction(
-                        text = "আপডেট আছে কি দেখুন",
-                        onClick = onCheckUpdate,
-                        enabled = !updateState.isBusy
+                val line = updateState.resultLine()
+                if (line.isNotBlank()) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = line,
+                        color = if (updateState is UpdateUiState.Failed) JarvesColors.Danger
+                        else JarvesColors.TextSecondary,
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp
                     )
                 }
             }
         }
 
-        if (status.isNotBlank()) {
-            Spacer(Modifier.height(12.dp))
-            // 0.2.4: the diagnostic block appears on this line; make it copyable in one tap.
-            JarvesStatusLine(
-                text = status,
-                isError = false,
-                onCopy = { copyToClipboard(context, "Jarves diagnostics", status) }
-            )
+        // ---------------- 5. Advanced / Diagnostics (collapsed) -----------------------
+        Spacer(Modifier.height(JarvesDimens.SectionGap))
+        SectionLabel("Advanced")
+        Spacer(Modifier.height(8.dp))
+        JarvesCard {
+            Column(Modifier.padding(JarvesDimens.CardPadding)) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = JarvesDimens.TouchTarget)
+                        .clickable(onClickLabel = "Toggle diagnostics") { advancedOpen = !advancedOpen },
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Diagnostics",
+                        color = JarvesColors.TextPrimary,
+                        fontSize = 13.5.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        text = if (advancedOpen) "লুকান" else "দেখুন",
+                        color = JarvesColors.TextMuted,
+                        fontSize = 11.sp
+                    )
+                }
+                if (advancedOpen) {
+                    SectionLabel("Mic sensitivity")
+                    Spacer(Modifier.height(4.dp))
+                    MicSensitivity.entries.forEach { option ->
+                        MicSensitivityRow(
+                            option = option,
+                            selected = option == micSensitivity,
+                            onSelect = { onSelectMicSensitivity(option) }
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    JarvesTextAction(
+                        text = "Copy diagnostics",
+                        onClick = { copyToClipboard(context, "Jarves diagnostics", diagnostics) }
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    SelectionContainer {
+                        Text(
+                            text = diagnostics,
+                            color = JarvesColors.TextMuted,
+                            fontSize = 10.5.sp,
+                            lineHeight = 14.sp
+                        )
+                    }
+                }
+            }
         }
 
-        Spacer(Modifier.height(18.dp))
-        Text(
-            text = "API providers and their keys are managed in API Providers. Keys are encrypted " +
-                "with Android Keystore (AES-GCM) and never shown in full.",
-            color = JarvesColors.TextMuted,
-            fontSize = 10.5.sp,
-            lineHeight = 15.sp
-        )
         Spacer(Modifier.height(24.dp))
+    }
+}
+
+/** One mic-sensitivity option: a radio dot, the label and a short Bengali explanation. */
+@Composable
+private fun MicSensitivityRow(
+    option: MicSensitivity,
+    selected: Boolean,
+    onSelect: () -> Unit
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = JarvesDimens.TouchTarget)
+            .clickable(onClickLabel = "Select ${option.label}", onClick = onSelect)
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            Modifier
+                .size(16.dp)
+                .clip(CircleShape)
+                .border(
+                    1.5.dp,
+                    if (selected) JarvesColors.Accent else JarvesColors.Border,
+                    CircleShape
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            if (selected) {
+                Box(
+                    Modifier
+                        .size(8.dp)
+                        .clip(CircleShape)
+                        .background(JarvesColors.Accent)
+                )
+            }
+        }
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = option.label,
+                color = JarvesColors.TextPrimary,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium
+            )
+            Text(
+                text = option.detail,
+                color = JarvesColors.TextMuted,
+                fontSize = 10.5.sp,
+                lineHeight = 14.sp
+            )
+        }
     }
 }
 

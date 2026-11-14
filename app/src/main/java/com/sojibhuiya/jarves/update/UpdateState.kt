@@ -43,3 +43,18 @@ fun UpdateUiState.statusText(currentVersionName: String): String = when (this) {
     is UpdateUiState.Failed -> failure.message + if (detail.isBlank()) "" else "\n($detail)"
     is UpdateUiState.Message -> text
 }
+
+/**
+ * 0.2.8: the short result line under the update button. Deliberately *without* the version, because
+ * the version is shown once, on the card's right edge — the 0.2.7 screen printed it twice.
+ */
+fun UpdateUiState.resultLine(): String = when (this) {
+    is UpdateUiState.Idle -> ""
+    is UpdateUiState.Checking -> "খোঁজা হচ্ছে…"
+    is UpdateUiState.UpToDate -> "নতুন ভার্সন নেই — অ্যাপ আপডেট আছে।"
+    is UpdateUiState.Available -> "নতুন ভার্সন: ${release.versionName} (${formatSize(release.apkSize)})"
+    is UpdateUiState.Downloading -> "ডাউনলোড হচ্ছে — ${(progress * 100).toInt()}%"
+    is UpdateUiState.ReadyToInstall -> "যাচাই সম্পন্ন (SHA-256 + সার্টিফিকেট)। এখন ইনস্টল করুন।"
+    is UpdateUiState.Failed -> failure.message
+    is UpdateUiState.Message -> text
+}
