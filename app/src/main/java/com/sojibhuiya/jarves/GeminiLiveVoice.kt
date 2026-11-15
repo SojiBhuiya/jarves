@@ -27,7 +27,15 @@ import com.sojibhuiya.jarves.intelligence.LiveModels
 import com.sojibhuiya.jarves.intelligence.SessionEndReport
 import com.sojibhuiya.jarves.intelligence.VoiceSearchMode
 import com.sojibhuiya.jarves.intelligence.LiveToolProtocol
+import com.sojibhuiya.jarves.intelligence.CloseInitiator
 import com.sojibhuiya.jarves.intelligence.MicSensitivity
+import com.sojibhuiya.jarves.intelligence.ReconnectCause
+import com.sojibhuiya.jarves.intelligence.ReconnectDecision
+import com.sojibhuiya.jarves.intelligence.ReconnectPolicy
+import com.sojibhuiya.jarves.intelligence.SessionDiagnostics
+import com.sojibhuiya.jarves.intelligence.SessionEnvironment
+import com.sojibhuiya.jarves.intelligence.SessionEnvironmentProvider
+import com.sojibhuiya.jarves.intelligence.SessionResumptionState
 import com.sojibhuiya.jarves.intelligence.SearchFunctionCall
 import com.sojibhuiya.jarves.intelligence.SearchBackend
 import com.sojibhuiya.jarves.intelligence.SearchBudget
@@ -86,7 +94,13 @@ class GeminiLiveVoice(
      * 0.2.8: how eagerly microphone input is treated as speech. Settings → Advanced → Mic
      * sensitivity; a conservative value keeps nearby voices and faint noise from starting a turn.
      */
-    private val micSensitivity: MicSensitivity = MicSensitivity.DEFAULT
+    private val micSensitivity: MicSensitivity = MicSensitivity.DEFAULT,
+    /**
+     * 0.2.9: where the "what was the phone doing?" readings come from. Android passes a
+     * [SessionEnvironmentProvider]; tests pass a fake, and the default is "unknown" everywhere.
+     */
+    environmentProvider: SessionEnvironmentProvider =
+        SessionEnvironmentProvider { SessionEnvironment.UNKNOWN }
 ) {
     companion object {
         /**
@@ -96,6 +110,13 @@ class GeminiLiveVoice(
          */
         /** Auto mode: one search per user question, as the 0.2.7 spec requires. */
         const val MAX_SEARCHES_PER_QUESTION = 1
+
+        /**
+         * 0.2.9: a connection that stayed up this long resets the automatic-reconnect budget, so a
+         * long conversation survives the ~10-minute connection lifetime the docs describe
+         * (https://ai.google.dev/gemini-api/docs/live-session#session-lifetime) without giving up.
+         */
+        const val RECONNECT_BUDGET_RESET_MILLIS = 60_000L
 
         const val WEBSOCKET_ENDPOINT =
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
@@ -213,6 +234,37 @@ class GeminiLiveVoice(
     @Volatile private var searchRunner: SearchToolRunner? = null
     /** Set once a tool-refusal retry starts, so the retry can never repeat. */
     private val retryInFlight = AtomicBoolean(false)
+
+    // ---- 0.2.9: who closed the socket, what the phone was doing, and session resumption ----
+    /**
+     * The reason the *next* close of ours will carry. Written immediately before every
+     * `WebSocket.close(...)` in this class, so `onFailure("Socket closed")` can never be mistaken
+     * for a broken session again — OkHttp only says "Socket closed" when this process closed the
+     * socket itself.
+     */
+    @Volatile private var closeInitiator: CloseInitiator = CloseInitiator.NONE
+    /** Session resumption handle (https://ai.google.dev/gemini-api/docs/live-session). */
+    private val resumption = SessionResumptionState()
+    @Volatile private var sessionStartedAt: Long = 0L
+    @Volatile private var reconnectAttempts: Int = 0
+    @Volatile private var goAwaySeen: Boolean = false
+    @Volatile private var lastReconnectCause: ReconnectCause = ReconnectCause.NONE
+    @Volatile private var reconnectScheduled = false
+    @Volatile private var lastReconnectStartedAt: Long = 0L
+    @Volatile private var lastGoAwayMillis: Long = 0L
+    @Volatile private var lastReconnectNote: String = "none"
+    /**
+     * Injected on Android (see [SessionEnvironmentReader]); "unknown" until [init] runs, which is
+     * exactly the right answer for a plain-JVM test.
+     */
+    private var envProvider: SessionEnvironmentProvider =
+        SessionEnvironmentProvider { SessionEnvironment.UNKNOWN }
+
+    init {
+        // Constructor parameters are not properties here on purpose: the engine must stay
+        // constructible from a plain-JVM test with no Android context.
+        envProvider = environmentProvider
+    }
     /** True once this session actually produced grounding metadata. */
     @Volatile private var groundingSeen = false
     /** User speech accumulated for the current turn, used by the freshness classifier. */
@@ -241,14 +293,31 @@ class GeminiLiveVoice(
             // Completes the closing handshake so OkHttp releases the connection, and so the
             // decision below is never blocked waiting for onClosed.
             closeEchoed = true
+            if (closeInitiator == CloseInitiator.NONE) closeInitiator = CloseInitiator.SERVER_CLOSE_FRAME
             runCatching { socket?.close(1000, "close acknowledged") }
         },
         retryWithoutSearch = { source -> retryWithoutSearch(source) },
-        reportFailure = { code, reason ->
+        reportFailure = reportFailure@{ code, reason ->
             // 0.2.6: keep the exact code/reason for the diagnostic block and tell the user what it
             // means — never a paraphrase.
             lastCloseCode = code
             lastCloseReason = reason.ifBlank { "none" }
+            // 0.2.9: an unexpected end is retried first (session resumption); only the final
+            // failure — or an end the app itself asked for — is ever shown to the user.
+            if (tryAutomaticReconnect(ReconnectCause.SOCKET_FAILURE, code, reason)) {
+                // Reconnect scheduled: the mic stays up and the user gets one short, calm line.
+                return@reportFailure
+            }
+            if (closeInitiator.intentional) {
+                // Our own close (stop button, lifecycle, new chat, provider off, retry) came back as
+                // an IOException — OkHttp only says "Socket closed" for a socket WE closed. This is
+                // not a failure and must not reach the chat as one.
+                if (closeRunning()) {
+                    onStatus("Live session বন্ধ হয়েছে")
+                    onState(LiveState.ENDED)
+                }
+                return@reportFailure
+            }
             runCatching {
                 onSessionEnd(
                     SessionEndReport(
@@ -276,7 +345,12 @@ class GeminiLiveVoice(
             }
         },
         reportStopped = {
-            if (closeRunning()) {
+            // 0.2.9: a clean close frame that follows a `goAway` (or arrives mid-conversation with
+            // no request from us) is the server recycling the connection, not the end of the
+            // conversation — the resumption reconnect takes over instead of ending the session.
+            val handledByReconnect = !closeInitiator.intentional &&
+                tryAutomaticReconnect(ReconnectCause.SERVER_CLOSE, lastCloseCode, lastCloseReason)
+            if (!handledByReconnect && closeRunning()) {
                 onStatus("Live session \u09ac\u09a8\u09cd\u09a7 \u09b9\u09df\u09c7\u099b\u09c7\n${diagnosticSummary()}")
                 onState(LiveState.ENDED)
             }
@@ -342,6 +416,17 @@ class GeminiLiveVoice(
         lastAutoTrace = "none"
         lastToolCallSeen = "none"
         lastToolResponseDelivery = "none"
+        // 0.2.9 session-end forensics + resumption, one session at a time.
+        closeInitiator = CloseInitiator.NONE
+        resumption.clear()
+        sessionStartedAt = System.currentTimeMillis()
+        reconnectAttempts = 0
+        reconnectScheduled = false
+        lastReconnectStartedAt = 0L
+        goAwaySeen = false
+        lastGoAwayMillis = 0L
+        lastReconnectCause = ReconnectCause.NONE
+        lastReconnectNote = "none"
         lastTimeSyncMillis = 0L
         lastTimeSyncDateKey = ""
         startSearchRunner()
@@ -358,6 +443,10 @@ class GeminiLiveVoice(
         closeFlow.reset()
         closeCallback = "none"
         closeEchoed = false
+        // Nothing has closed *this* socket yet, and until its setupComplete arrives the capture
+        // thread holds the audio instead of sending it into a half-open session.
+        closeInitiator = CloseInitiator.NONE
+        setupDone.set(false)
         val request = Request.Builder()
             .url("$WEBSOCKET_ENDPOINT?key=$apiKey")
             .build()
@@ -380,7 +469,9 @@ class GeminiLiveVoice(
                     voiceName = VOICE_NAME,
                     systemInstruction = instruction,
                     searchTool = searchToolMode,
-                    micSensitivity = micSensitivity
+                    micSensitivity = micSensitivity,
+                    // 0.2.9: resume the same conversation across a connection reset.
+                    sessionResumptionHandle = resumption.handleForReconnect()
                 )
                 if (!webSocket.send(setup)) {
                     fail("Gemini setup পাঠানো যায়নি: WebSocket send queue বন্ধ")
@@ -435,6 +526,25 @@ class GeminiLiveVoice(
                         }
                         fail("Gemini API error ${if (code > 0) "($code) " else ""}$message")
                         return
+                    }
+
+                    // ---- 0.2.9: session resumption (https://ai.google.dev/gemini-api/docs/live-session)
+                    if (root.has("sessionResumptionUpdate")) {
+                        SessionResumptionState.parseUpdate(text)?.let { update ->
+                            resumption.onUpdate(update)
+                            lastReconnectNote = "resumption update: handle=" +
+                                (update.newHandle?.let { "present(${it.length})" } ?: "none") +
+                                ", resumable=${update.resumable}"
+                        }
+                    }
+
+                    // The server will disconnect soon: reconnect with the handle *before* it dies.
+                    if (root.has("goAway")) {
+                        goAwaySeen = true
+                        val notice = SessionResumptionState.parseGoAway(text)
+                        val timeLeft = notice?.timeLeftMillis ?: 0L
+                        lastReconnectNote = "goAway received (timeLeft=${timeLeft}ms)"
+                        scheduleGoAwayReconnect(timeLeft)
                     }
 
                     if (root.has("setupComplete")) {
@@ -657,7 +767,7 @@ class GeminiLiveVoice(
             "Last query: $lastToolQuery | Last search: $lastSearchOutcome | " +
             "Last search model: $lastSearchModel | ${searchBackend?.describe() ?: "Search models: none"} | " +
             "Mic sensitivity: ${micSensitivity.label} | Audio effects: ${audioEffectsSummary()} | " +
-            "build: $FIX_TAG" + "\n" + lastAutoTrace
+            "build: $FIX_TAG" + "\n" + lastAutoTrace + "\n" + endDiagnostics()
     }
 
     // -------------------------------------------------------------------------------------
@@ -666,6 +776,23 @@ class GeminiLiveVoice(
 
     /** The last Auto search's step trace, for Settings → Advanced → Diagnostics. */
     fun lastAutoSearchTrace(): String = lastAutoTrace
+
+    /**
+     * 0.2.9: who closed the socket, how long the session had been up, what the phone was doing, and
+     * where the resumption/reconnect machinery stands. Shown in Settings → Advanced → Diagnostics
+     * and appended to every error report.
+     */
+    fun endDiagnostics(): String = SessionDiagnostics.line(
+        initiator = closeInitiator,
+        environment = runCatching { envProvider.snapshot() }.getOrDefault(SessionEnvironment.UNKNOWN),
+        sessionDurationMillis = if (sessionStartedAt == 0L) 0L else System.currentTimeMillis() - sessionStartedAt,
+        closeCode = lastCloseCode,
+        closeReason = lastCloseReason,
+        reconnectsUsed = reconnectAttempts,
+        resumption = resumption,
+        goAwaySeen = goAwaySeen,
+        reconnectCause = lastReconnectCause
+    ) + "\nReconnect: " + lastReconnectNote
 
     /**
      * What the OS gives this app for echo/noise handling. The recorder uses
@@ -851,6 +978,7 @@ class GeminiLiveVoice(
         onState(LiveState.CONNECTING)
         val rejected = socket
         socket = null
+        closeInitiator = CloseInitiator.SEARCH_FALLBACK_RETRY
         runCatching { rejected?.close(1000, "retry without grounding") }
         if (running.get()) connect()
     }
@@ -868,6 +996,7 @@ class GeminiLiveVoice(
         if (running.getAndSet(false)) {
             val detailedMessage = "$message\n${diagnosticSummary()}"
             terminalErrorReported.set(true)
+            closeInitiator = CloseInitiator.SETUP_FAILURE
             try { socket?.close(1002, "Session setup failed") } catch (_: Exception) {}
             stopAudio()
             onState(LiveState.FAILED)
@@ -875,7 +1004,122 @@ class GeminiLiveVoice(
         }
     }
 
+    // -------------------------------------------------------------------------------------
+    // 0.2.9: automatic reconnect with the official session-resumption handle
+    // -------------------------------------------------------------------------------------
+
+    /**
+     * Decides and schedules at most [ReconnectPolicy.MAX_ATTEMPTS] automatic attempts.
+     *
+     * @return true when the end of the socket was handled here (reconnect scheduled or the final
+     *   "gave up" message shown), i.e. the caller must not also report a failure.
+     */
+    private fun tryAutomaticReconnect(cause: ReconnectCause, code: Int, reason: String): Boolean {
+        // A connection that stayed healthy for a minute resets the budget: a two-hour conversation
+        // must not run out of attempts because the server recycles the connection every ~10 min.
+        val now = System.currentTimeMillis()
+        if (lastReconnectStartedAt > 0L && now - lastReconnectStartedAt > RECONNECT_BUDGET_RESET_MILLIS) {
+            reconnectAttempts = 0
+        }
+        val decision = ReconnectPolicy.decide(
+            running = running.get(),
+            initiator = closeInitiator,
+            cause = cause,
+            attemptsUsed = reconnectAttempts
+        )
+        return when (decision) {
+            ReconnectDecision.NO_RECONNECT_STOPPED,
+            ReconnectDecision.NO_RECONNECT_INTENTIONAL -> false
+
+            ReconnectDecision.GIVE_UP -> {
+                giveUpAfterReconnects(code, reason)
+                true
+            }
+
+            ReconnectDecision.RECONNECT,
+            ReconnectDecision.RECONNECT_AFTER_GO_AWAY -> {
+                if (reconnectScheduled) {
+                    true
+                } else {
+                    scheduleReconnect(cause, code, reason)
+                    true
+                }
+            }
+        }
+    }
+
+    private fun scheduleReconnect(cause: ReconnectCause, code: Int, reason: String) {
+        reconnectScheduled = true
+        reconnectAttempts += 1
+        lastReconnectCause = cause
+        lastReconnectStartedAt = System.currentTimeMillis()
+        val attempt = reconnectAttempts
+        val delay = if (cause == ReconnectCause.GO_AWAY) {
+            ReconnectPolicy.goAwayDelayMillis(lastGoAwayMillis)
+        } else {
+            ReconnectPolicy.backoffMillis(attempt)
+        }
+        val handleState = if (resumption.handleForReconnect() != null) "yes" else "none"
+        lastReconnectNote = "reconnect #$attempt in ${delay}ms (cause=$cause, code=$code, " +
+            "reason=${reason.take(40)}, handle=$handleState)"
+        // One short, non-alarming line. No error bubble, no "session ended".
+        onStatus("সংযোগ আবার জোড়া লাগছে… ($attempt/${ReconnectPolicy.MAX_ATTEMPTS})")
+        runCatching {
+            setupTimer.schedule({
+                reconnectScheduled = false
+                if (!running.get() || closeInitiator.intentional) return@schedule
+                openSocketForReconnect()
+            }, delay, TimeUnit.MILLISECONDS)
+        }.onFailure { reconnectScheduled = false }
+    }
+
+    /**
+     * Replaces the dead socket without touching the microphone: the recorder keeps running, the
+     * playback track keeps its queue, and only the socket is rebuilt with the resumption handle.
+     */
+    private fun openSocketForReconnect() {
+        val old = socket
+        socket = null
+        runCatching {
+            closeInitiator = CloseInitiator.RECONNECT
+            old?.close(1000, "reconnecting")
+        }
+        closeInitiator = CloseInitiator.NONE
+        setupDone.set(false)
+        // Frames captured while the new socket handshakes are dropped by the capture loop.
+        connect()
+    }
+
+    /** Schedules the reconnect that a `goAway` asks for, before the connection is torn down. */
+    private fun scheduleGoAwayReconnect(timeLeftMillis: Long) {
+        lastGoAwayMillis = timeLeftMillis
+        if (!running.get()) return
+        tryAutomaticReconnect(ReconnectCause.GO_AWAY, 0, "goAway")
+    }
+
+    private fun giveUpAfterReconnects(code: Int, reason: String) {
+        lastReconnectNote = "gave up after $reconnectAttempts attempts " +
+            "(last close=$code, reason=${reason.take(40)})"
+        if (closeRunning()) {
+            if (terminalErrorReported.compareAndSet(false, true)) {
+                onError(
+                    ReconnectPolicy.giveUpMessage(reconnectAttempts) +
+                        "\n(code=$code, reason=${reason.ifBlank { "none" }})\n${diagnosticSummary()}"
+                )
+            } else {
+                onStatus(ReconnectPolicy.giveUpMessage(reconnectAttempts))
+            }
+            onState(LiveState.FAILED)
+        }
+    }
+
     private fun startAudioCapture() {
+        // 0.2.9: a reconnect must NOT create a second AudioRecord — the first one is still live and
+        // the user must not hear/feel the microphone restart.
+        if (recorder != null && microphoneStarted) {
+            setupDone.set(true)
+            return
+        }
         if (!running.get() || !setupDone.get()) return
         try {
             val minBuffer = AudioRecord.getMinBufferSize(
@@ -918,7 +1162,13 @@ class GeminiLiveVoice(
                                 .put("data", payload))
                         )
                         val activeSocket = socket
-                        if (activeSocket == null || !activeSocket.send(message.toString())) {
+                        // 0.2.9: during a reconnect the socket is null or still handshaking on
+                        // purpose. Dropping those frames is correct; failing the session is not.
+                        if (activeSocket == null || !setupDone.get()) {
+                            if (running.get()) continue else break
+                        }
+                        if (!activeSocket!!.send(message.toString())) {
+                            if (reconnectScheduled || !running.get()) continue
                             fail("মাইক্রোফোন অডিও WebSocket-এ পাঠানো যায়নি। পাঠানো chunk: ${audioChunksSent.get()}")
                             break
                         }
@@ -984,7 +1234,15 @@ class GeminiLiveVoice(
         }, "gemini-live-playback").apply { isDaemon = true; start() }
     }
 
-    fun stop() {
+    /**
+     * Ends the session deliberately.
+     *
+     * @param initiator who asked for it — recorded *before* the socket is closed so a following
+     *   `onFailure("Socket closed")` is recognised as our own close instead of being shown to the
+     *   user as "the session broke". It is also the flag that blocks an automatic reconnect.
+     */
+    fun stop(initiator: CloseInitiator = CloseInitiator.USER_STOP) {
+        closeInitiator = initiator
         if (!running.getAndSet(false)) return
         try {
             timeSyncTask?.cancel(false)

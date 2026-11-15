@@ -227,7 +227,13 @@ object LiveSessionConfig {
         searchTool: LiveSearchTool,
         inputTranscription: Boolean = true,
         outputTranscription: Boolean = true,
-        micSensitivity: MicSensitivity = MicSensitivity.DEFAULT
+        micSensitivity: MicSensitivity = MicSensitivity.DEFAULT,
+        /**
+         * 0.2.9: the handle from the previous `SessionResumptionUpdate`, so a reconnect continues
+         * the same conversation instead of starting a new one.
+         * https://ai.google.dev/gemini-api/docs/live-session#session-resumption
+         */
+        sessionResumptionHandle: String? = null
     ): String {
         val generationConfig = linkedMapOf<String, Any?>(
             "responseModalities" to listOf("AUDIO"),
@@ -253,6 +259,14 @@ object LiveSessionConfig {
         // models the docs list as supporting it, and never for NORMAL (server defaults).
         if (MicVadSupport.shouldSend(model, micSensitivity)) {
             micSensitivity.realtimeInputConfigJson()?.let { setup["realtimeInputConfig"] = it }
+        }
+        // Session resumption is always requested (so the server starts sending
+        // SessionResumptionUpdate frames); the handle is only added when we have one to resume.
+        // The docs describe both shapes: "If not present then a new session is created."
+        setup["sessionResumption"] = if (sessionResumptionHandle.isNullOrBlank()) {
+            emptyMap<String, Any?>()
+        } else {
+            linkedMapOf<String, Any?>("handle" to sessionResumptionHandle)
         }
 
         return MiniJson.encode(linkedMapOf<String, Any?>("setup" to setup))

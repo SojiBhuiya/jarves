@@ -2,6 +2,15 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 0.2.9: a live conversation is a long-lived WebSocket plus continuous capture, so the
+         process must not be frozen while the screen is off. Documented requirements for the
+         microphone foreground-service type:
+         https://developer.android.com/develop/background-work/services/fgs/service-types#microphone
+         FOREGROUND_SERVICE is the base permission (Android 14+ requires it in addition to the
+         type-specific one); POST_NOTIFICATIONS (Android 13+) is needed for the visible notification. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 0.2.7 in-app updater: needed to hand a downloaded APK to the system installer.
          https://developer.android.com/guide/topics/manifest/uses-permission#android.permission.REQUEST_INSTALL_PACKAGES -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
@@ -25,6 +34,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 0.2.9: keeps the microphone session alive in the background (type "microphone"). -->
+        <service
+            android:name=".LiveSessionService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
 
         <!-- The updater downloads into the app cache and shares that one file with the installer. -->
         <provider

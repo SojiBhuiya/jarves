@@ -12,8 +12,8 @@ android {
         applicationId = "com.sojibhuiya.jarves"
         minSdk = 26
         targetSdk = 35
-        versionCode = 10
-        versionName = "0.2.8"
+        versionCode = 11
+        versionName = "0.2.9"
     }
 
     // ---- 0.2.7: ONE fixed signing key for every installed APK.

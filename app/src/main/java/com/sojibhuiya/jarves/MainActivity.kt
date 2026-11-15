@@ -85,6 +85,7 @@ import com.sojibhuiya.jarves.intelligence.GroundingAvailability
 import com.sojibhuiya.jarves.intelligence.LiveState
 import com.sojibhuiya.jarves.intelligence.LiveStateRouting
 import com.sojibhuiya.jarves.intelligence.VoiceSearchModeSettings
+import com.sojibhuiya.jarves.intelligence.CloseInitiator
 import com.sojibhuiya.jarves.intelligence.MicSensitivity
 import com.sojibhuiya.jarves.intelligence.MicSensitivitySettings
 import com.sojibhuiya.jarves.intelligence.VoiceSearchMode
@@ -93,6 +94,7 @@ import com.sojibhuiya.jarves.storage.ApiProvidersModule
 import com.sojibhuiya.jarves.storage.ConversationModule
 import com.sojibhuiya.jarves.ui.chats.ChatsScreen
 import com.sojibhuiya.jarves.storage.AndroidMicSensitivityStore
+import com.sojibhuiya.jarves.system.SessionEnvironmentReader
 import com.sojibhuiya.jarves.storage.AndroidVoiceModeStore
 import com.sojibhuiya.jarves.storage.PrefKeys
 import com.sojibhuiya.jarves.storage.jarvesDataStore
@@ -132,6 +134,10 @@ private fun AgiApp() {
     // 0.2.8: mic sensitivity is read once, like the mode, so Settings and the session agree.
     val micSettings = remember { MicSensitivitySettings(AndroidMicSensitivityStore(context.applicationContext)) }
     var micSensitivity by remember { mutableStateOf(micSettings.current()) }
+    // 0.2.9: real readings for the end-of-session diagnostic (foreground, screen, network change,
+    // battery saver). Created once, so the ConnectivityManager callback is registered once.
+    val environmentReader = remember { SessionEnvironmentReader(context.applicationContext) }
+    var lastEndDiagnostics by remember { mutableStateOf("none") }
     var screen by remember { mutableStateOf(JarvesNavigation.HOME) }
 
     // ---- 0.2.7 in-app updater. The install itself is done by the system installer; this app only
@@ -268,7 +274,7 @@ private fun AgiApp() {
      * Gemini Live connection starts without the previous conversation's context.
      */
     fun startNewChat() {
-        engine?.stop()
+        engine?.stop(CloseInitiator.NEW_CHAT)
         engine = null
         connected = false
         connecting = false
@@ -317,7 +323,7 @@ private fun AgiApp() {
             context.jarvesDataStore.edit { it[PrefKeys.GEMINI_ENABLED] = record.enabled }
         }
         if (!record.enabled && engine != null) {
-            engine?.stop()
+            engine?.stop(CloseInitiator.PROVIDER_DISABLED)
             engine = null
             connected = false
             connecting = false
@@ -375,9 +381,11 @@ private fun AgiApp() {
                 },
                 mode = voiceMode,
                 micSensitivity = micSensitivity,
+                environmentProvider = environmentReader,
                 onSessionEnd = { report ->
                     scope.launch {
                         status = report.message()
+                        lastEndDiagnostics = live.endDiagnostics()
                         appendSearchReport(report.message())
                     }
                 },
@@ -391,6 +399,8 @@ private fun AgiApp() {
                         connected = next.connected
                         connecting = next.connecting
                         if (next.releaseEngine) {
+                            // The conversation is over: drop the foreground service too.
+                            LiveSessionService.stop(context.applicationContext)
                             engine = null
                             if (state == LiveState.ENDED) {
                                 flushTranscript(fromUser = true)
@@ -407,6 +417,7 @@ private fun AgiApp() {
                 onError = { message ->
                     scope.launch {
                         status = message
+                        lastEndDiagnostics = live.endDiagnostics()
                         connected = false
                         connecting = false
                         engine = null
@@ -414,6 +425,10 @@ private fun AgiApp() {
                 }
             )
             engine = live
+            // 0.2.9: keep the process alive for the whole conversation (microphone foreground
+            // service). Started here — with the activity visible — because the platform refuses to
+            // create a microphone foreground service from the background.
+            LiveSessionService.start(context.applicationContext)
             live.start()
         }
     }
@@ -422,9 +437,30 @@ private fun AgiApp() {
         if (granted) startLive() else status = "Live Voice ব্যবহারের জন্য Microphone permission দিন"
     }
 
+    /**
+     * 0.2.9: the microphone foreground service shows a notification. On Android 13+ that needs
+     * POST_NOTIFICATIONS; refusing it does not stop the session, it only hides the notification,
+     * so the request is fire-and-forget.
+     */
+    val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    LaunchedEffect(Unit) {
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
     val latestEngine = rememberUpdatedState(engine)
     DisposableEffect(Unit) {
-        onDispose { latestEngine.value?.stop() }
+        onDispose {
+            // Activity leaving composition (destroy, config change, task removed): name it, then
+            // make sure neither the socket nor the foreground service outlives the UI.
+            latestEngine.value?.stop(CloseInitiator.LIFECYCLE)
+            LiveSessionService.stop(context.applicationContext)
+        }
     }
 
     val background = Brush.verticalGradient(listOf(Color(0xFF071321), Color(0xFF02060D)))
@@ -554,6 +590,7 @@ private fun AgiApp() {
                                 micSettings.save(chosen)
                             },
                             lastAutoTrace = engine?.lastAutoSearchTrace() ?: "none",
+                            lastEndDiagnostics = engine?.endDiagnostics() ?: lastEndDiagnostics,
                             onSelectMode = { chosen ->
                                 voiceMode = chosen
                                 modeSettings.save(chosen)
@@ -579,10 +616,11 @@ private fun AgiApp() {
                                 if (engine != null) {
                                     flushTranscript(fromUser = true)
                                     flushTranscript(fromUser = false)
-                                    engine?.stop()
+                                    engine?.stop(CloseInitiator.USER_STOP)
                                     engine = null
                                     connected = false
                                     connecting = false
+                                    LiveSessionService.stop(context.applicationContext)
                                 } else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                                     startLive()
                                 } else micPermission.launch(Manifest.permission.RECORD_AUDIO)
@@ -714,7 +752,8 @@ private fun SettingsScreen(
     onSelectMode: (VoiceSearchMode) -> Unit = {},
     micSensitivity: MicSensitivity = MicSensitivity.DEFAULT,
     onSelectMicSensitivity: (MicSensitivity) -> Unit = {},
-    lastAutoTrace: String = "none"
+    lastAutoTrace: String = "none",
+    lastEndDiagnostics: String = "none"
 ) {
     var editingName by remember(assistantName) { mutableStateOf(assistantName.isBlank()) }
     var draftName by remember(assistantName) { mutableStateOf(assistantName) }
@@ -725,6 +764,8 @@ private fun SettingsScreen(
         append("Jarves $appVersionName").append('\n')
         append("mode=").append(voiceMode.label).append(" | mic=").append(micSensitivity.label).append('\n')
         append(lastAutoTrace).append('\n')
+        append("--- শেষ সেশন ---").append('\n')
+        append(lastEndDiagnostics).append('\n')
         if (status.isNotBlank()) append(status)
     }
 
