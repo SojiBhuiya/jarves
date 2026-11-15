@@ -45,6 +45,18 @@ class LiveSessionService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun onCreate() {
+        super.onCreate()
+        // 0.2.10: ActivityManager#getRunningServices is deprecated for third-party apps, so the
+        // diagnostics answer "is the service running?" from this flag instead of asking Android.
+        active.set(true)
+    }
+
+    override fun onDestroy() {
+        active.set(false)
+        super.onDestroy()
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -94,6 +106,11 @@ class LiveSessionService : Service() {
 
     companion object {
         private const val CHANNEL_ID = "jarves_live_session"
+
+        /** True while the foreground service exists. Read by the diagnostics block. */
+        private val active = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        fun isRunning(): Boolean = active.get()
         private const val NOTIFICATION_ID = 4101
 
         /**
@@ -114,6 +131,7 @@ class LiveSessionService : Service() {
         /** Stops the service and removes the notification. Safe to call when it is not running. */
         fun stop(context: Context) {
             runCatching { context.stopService(Intent(context, LiveSessionService::class.java)) }
+            active.set(false)
         }
     }
 }

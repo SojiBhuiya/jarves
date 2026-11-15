@@ -14,7 +14,16 @@ enum class ReconnectCause {
     SOCKET_FAILURE,
 
     /** The peer sent a close frame with a code that is not a normal end. */
-    SERVER_CLOSE
+    SERVER_CLOSE,
+
+    /** 0.2.10: the network came back after we had been waiting for it. */
+    NETWORK_BACK,
+
+    /** 0.2.10: a new default network appeared while the session was healthy. */
+    NEW_NETWORK,
+
+    /** 0.2.10: a microphone audio **send** failed — the socket failure one step earlier. */
+    AUDIO_SEND_FAILED
 }
 
 enum class ReconnectDecision(val automatic: Boolean) {

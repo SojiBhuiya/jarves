@@ -27,7 +27,11 @@ import java.util.concurrent.atomic.AtomicInteger
  * Every reading is wrapped: a missing service or a revoked permission must never break a session,
  * it only makes the field "unknown".
  */
-class SessionEnvironmentReader(context: Context) : SessionEnvironmentProvider {
+class SessionEnvironmentReader(
+    context: Context,
+    /** 0.2.10: the same monitor the reconnect logic uses, so both read one truth. */
+    private val networkMonitor: AndroidNetworkMonitor? = null
+) : SessionEnvironmentProvider {
 
     private val app = context.applicationContext
     private val power = app.getSystemService(Context.POWER_SERVICE) as? PowerManager
@@ -114,13 +118,19 @@ class SessionEnvironmentReader(context: Context) : SessionEnvironmentProvider {
     }
 
     override fun snapshot(): SessionEnvironment {
-        val changedAgo = lastNetworkChangeAt?.let { System.currentTimeMillis() - it }
+        val now = System.currentTimeMillis()
+        val changedAgo = lastNetworkChangeAt?.let { now - it }
+        // 0.2.10: prefer the richer reader (it knows about onLost and the failure reason); the
+        // in-class callback above stays as the fallback for a reader built without a monitor.
+        val fromMonitor = networkMonitor?.snapshot()
         return SessionEnvironment(
             appVisible = startedActivities.get() > 0,
             screenInteractive = runCatching { power?.isInteractive }.getOrNull(),
             keyguardLocked = runCatching { keyguard?.isKeyguardLocked }.getOrNull(),
-            networkType = networkType,
-            networkChangedAgoMillis = changedAgo,
+            networkType = fromMonitor?.type ?: networkType,
+            networkChangedAgoMillis = fromMonitor?.changedAtMillis?.let { now - it } ?: changedAgo,
+            networkLostAgoMillis = fromMonitor?.lastLostAtMillis?.let { now - it },
+            networkUnknownReason = fromMonitor?.unknownReason.orEmpty(),
             powerSaveMode = runCatching { power?.isPowerSaveMode }.getOrNull()
         )
     }

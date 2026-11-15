@@ -94,7 +94,9 @@ import com.sojibhuiya.jarves.storage.ApiProvidersModule
 import com.sojibhuiya.jarves.storage.ConversationModule
 import com.sojibhuiya.jarves.ui.chats.ChatsScreen
 import com.sojibhuiya.jarves.storage.AndroidMicSensitivityStore
+import com.sojibhuiya.jarves.system.AndroidNetworkMonitor
 import com.sojibhuiya.jarves.system.SessionEnvironmentReader
+import com.sojibhuiya.jarves.system.SystemChecks
 import com.sojibhuiya.jarves.storage.AndroidVoiceModeStore
 import com.sojibhuiya.jarves.storage.PrefKeys
 import com.sojibhuiya.jarves.storage.jarvesDataStore
@@ -136,7 +138,12 @@ private fun AgiApp() {
     var micSensitivity by remember { mutableStateOf(micSettings.current()) }
     // 0.2.9: real readings for the end-of-session diagnostic (foreground, screen, network change,
     // battery saver). Created once, so the ConnectivityManager callback is registered once.
-    val environmentReader = remember { SessionEnvironmentReader(context.applicationContext) }
+    // 0.2.10: one network monitor for the whole app — the reconnect logic and the diagnostics read
+    // the same values, so they can never disagree.
+    val networkMonitor = remember { AndroidNetworkMonitor(context.applicationContext) }
+    val environmentReader = remember {
+        SessionEnvironmentReader(context.applicationContext, networkMonitor)
+    }
     var lastEndDiagnostics by remember { mutableStateOf("none") }
     var screen by remember { mutableStateOf(JarvesNavigation.HOME) }
 
@@ -385,6 +392,10 @@ private fun AgiApp() {
                 mode = voiceMode,
                 micSensitivity = micSensitivity,
                 environmentProvider = environmentReader,
+                networkMonitor = networkMonitor,
+                systemDiagnostics = {
+                    SystemChecks.line(context.applicationContext, LiveSessionService.isRunning())
+                },
                 onSessionEnd = { report ->
                     scope.launch {
                         status = report.message()

@@ -29,6 +29,10 @@ import com.sojibhuiya.jarves.intelligence.VoiceSearchMode
 import com.sojibhuiya.jarves.intelligence.LiveToolProtocol
 import com.sojibhuiya.jarves.intelligence.CloseInitiator
 import com.sojibhuiya.jarves.intelligence.MicSensitivity
+import com.sojibhuiya.jarves.intelligence.NetworkMonitor
+import com.sojibhuiya.jarves.intelligence.NetworkSnapshot
+import com.sojibhuiya.jarves.intelligence.ReconnectAction
+import com.sojibhuiya.jarves.intelligence.ReconnectCoordinator
 import com.sojibhuiya.jarves.intelligence.ReconnectCause
 import com.sojibhuiya.jarves.intelligence.ReconnectDecision
 import com.sojibhuiya.jarves.intelligence.ReconnectPolicy
@@ -100,7 +104,17 @@ class GeminiLiveVoice(
      * [SessionEnvironmentProvider]; tests pass a fake, and the default is "unknown" everywhere.
      */
     environmentProvider: SessionEnvironmentProvider =
-        SessionEnvironmentProvider { SessionEnvironment.UNKNOWN }
+        SessionEnvironmentProvider { SessionEnvironment.UNKNOWN },
+    /**
+     * 0.2.10: the real network, so a reconnect can wait for it instead of spending attempts on a
+     * dead link. Defaults to [NetworkMonitor.NONE] ("unknown") for plain-JVM tests.
+     */
+    networkMonitor: NetworkMonitor = NetworkMonitor.NONE,
+    /**
+     * 0.2.10: the Service / notification / battery-optimisation / Data-Saver line. Supplied by the
+     * Android layer; the default keeps the engine JVM-only.
+     */
+    systemDiagnostics: () -> String = { "unknown (no Android context)" }
 ) {
     companion object {
         /**
@@ -253,17 +267,27 @@ class GeminiLiveVoice(
     @Volatile private var lastReconnectStartedAt: Long = 0L
     @Volatile private var lastGoAwayMillis: Long = 0L
     @Volatile private var lastReconnectNote: String = "none"
+    /** 0.2.10: network-aware reconnect budget/waiting state (pure, unit-tested). */
+    private val reconnectPlan = ReconnectCoordinator()
+    @Volatile private var waitingForNetworkSince: Long = 0L
+    @Volatile private var reconnectHadHandle: Boolean = true
+    @Volatile private var itWasAReconnect: Boolean = false
+    private var networkWatchInstalled: Boolean = false
     /**
      * Injected on Android (see [SessionEnvironmentReader]); "unknown" until [init] runs, which is
      * exactly the right answer for a plain-JVM test.
      */
     private var envProvider: SessionEnvironmentProvider =
         SessionEnvironmentProvider { SessionEnvironment.UNKNOWN }
+    private var netMonitor: NetworkMonitor = NetworkMonitor.NONE
+    private var systemLine: () -> String = { "unknown" }
 
     init {
         // Constructor parameters are not properties here on purpose: the engine must stay
         // constructible from a plain-JVM test with no Android context.
         envProvider = environmentProvider
+        netMonitor = networkMonitor
+        systemLine = systemDiagnostics
     }
     /** True once this session actually produced grounding metadata. */
     @Volatile private var groundingSeen = false
@@ -427,9 +451,14 @@ class GeminiLiveVoice(
         lastGoAwayMillis = 0L
         lastReconnectCause = ReconnectCause.NONE
         lastReconnectNote = "none"
+        reconnectPlan.reset()
+        waitingForNetworkSince = 0L
+        reconnectHadHandle = true
+        itWasAReconnect = false
         lastTimeSyncMillis = 0L
         lastTimeSyncDateKey = ""
         startSearchRunner()
+        installNetworkWatch()
         onStatus("Gemini Live-এ সংযোগ হচ্ছে…")
         onState(LiveState.CONNECTING)
         startTimeSyncLoop()
@@ -554,8 +583,21 @@ class GeminiLiveVoice(
                         setupTimeout = null
                         startAudioPlayback()
                         startAudioCapture()
+                        // 0.2.10: after an automatic reconnect the user is told plainly what
+                        // happened — "পুনরায় সংযুক্ত" with the handle, or that the context may be
+                        // lost when there was no handle to resume with.
+                        val reconnected = itWasAReconnect
+                        if (reconnected) {
+                            reconnectPlan.onAttemptSucceeded(System.currentTimeMillis())
+                            reconnectAttempts = 0
+                            itWasAReconnect = false
+                        }
                         onStatus(
                             when {
+                                reconnected && !reconnectHadHandle ->
+                                    ReconnectCoordinator.STATUS_RECONNECTED + " — " +
+                                        ReconnectCoordinator.STATUS_CONTEXT_MAY_BE_LOST
+                                reconnected -> ReconnectCoordinator.STATUS_RECONNECTED
                                 searchToolMode == LiveSearchTool.GOOGLE_SEARCH_BUILT_IN ->
                                     CONNECTED_WITH_BUILTIN_SEARCH_STATUS
                                 groundingAvailable -> CONNECTED_WITH_SEARCH_STATUS
@@ -792,7 +834,9 @@ class GeminiLiveVoice(
         resumption = resumption,
         goAwaySeen = goAwaySeen,
         reconnectCause = lastReconnectCause
-    ) + "\nReconnect: " + lastReconnectNote
+    ) + "\nReconnect: " + lastReconnectNote +
+        "\nReconnect timeline: " + reconnectPlan.timelineText() +
+        "\nSystem: " + runCatching { systemLine() }.getOrDefault("unknown (line failed)")
 
     /**
      * What the OS gives this app for echo/noise handling. The recorder uses
@@ -1009,66 +1053,126 @@ class GeminiLiveVoice(
     // -------------------------------------------------------------------------------------
 
     /**
-     * Decides and schedules at most [ReconnectPolicy.MAX_ATTEMPTS] automatic attempts.
+     * The single entry point for **every** unexpected end of the socket: an `onFailure`, a close
+     * frame from the peer, a `goAway`, and — new in 0.2.10 — a failed audio **send**, which is the
+     * same failure one step earlier.
      *
-     * @return true when the end of the socket was handled here (reconnect scheduled or the final
-     *   "gave up" message shown), i.e. the caller must not also report a failure.
+     * 0.2.9 phone report: airplane mode toggled → the capture loop's `send()` returned false → it
+     * called `fail()`, which is terminal and set `running=false`, so the reconnect path saw a
+     * stopped engine and never ran (diagnostics said `Closed by: session failure (fail())` while
+     * a perfectly good resume handle was sitting unused). Now the capture loop comes here instead.
+     *
+     * @return true when this end was handled (reconnect scheduled, or waiting for the network, or
+     *   "gave up" shown), i.e. the caller must not also report a failure.
      */
     private fun tryAutomaticReconnect(cause: ReconnectCause, code: Int, reason: String): Boolean {
-        // A connection that stayed healthy for a minute resets the budget: a two-hour conversation
-        // must not run out of attempts because the server recycles the connection every ~10 min.
-        val now = System.currentTimeMillis()
-        if (lastReconnectStartedAt > 0L && now - lastReconnectStartedAt > RECONNECT_BUDGET_RESET_MILLIS) {
-            reconnectAttempts = 0
-        }
-        val decision = ReconnectPolicy.decide(
+        // The intentional-close gate is the same one ReconnectPolicy uses and is unit-tested:
+        // the user pressed stop, the lifecycle ended, a new chat started, the provider was turned
+        // off, or this is our own retry — never reconnect after any of those.
+        val gate = ReconnectPolicy.decide(
             running = running.get(),
             initiator = closeInitiator,
             cause = cause,
             attemptsUsed = reconnectAttempts
         )
-        return when (decision) {
-            ReconnectDecision.NO_RECONNECT_STOPPED,
-            ReconnectDecision.NO_RECONNECT_INTENTIONAL -> false
+        if (gate == ReconnectDecision.NO_RECONNECT_STOPPED ||
+            gate == ReconnectDecision.NO_RECONNECT_INTENTIONAL
+        ) {
+            return false
+        }
+        if (reconnectScheduled) return true
 
-            ReconnectDecision.GIVE_UP -> {
-                giveUpAfterReconnects(code, reason)
+        val now = System.currentTimeMillis()
+        lastReconnectCause = cause
+        // A connection that stayed healthy for a minute resets the budget, so a long conversation
+        // survives the ~10-minute connection lifetime the docs describe.
+        if (lastReconnectStartedAt > 0L && now - lastReconnectStartedAt > RECONNECT_BUDGET_RESET_MILLIS) {
+            reconnectPlan.reset()
+            reconnectAttempts = 0
+        }
+
+        val network = netMonitor.snapshot()
+        val action = when (cause) {
+            ReconnectCause.GO_AWAY -> reconnectPlan.onNetworkAvailable(now, network).let { probed ->
+                // A goAway is not a failure: go straight to the scheduled reconnect.
+                if (probed is ReconnectAction.Attempt) probed else
+                    ReconnectAction.Attempt(attempt = 0, delayMillis = ReconnectPolicy.goAwayDelayMillis(lastGoAwayMillis))
+            }
+            else -> reconnectPlan.onUnexpectedFailure(now, network, "$cause: $reason")
+        }
+
+        return when (action) {
+            is ReconnectAction.WaitForNetwork -> {
+                waitingForNetworkSince = now
+                reconnectAttempts = reconnectPlan.attemptsUsed
+                lastReconnectNote = "waiting for network (no attempt spent, deadline=${ReconnectCoordinator.NETWORK_WAIT_SECONDS}s)"
+                onStatus(ReconnectCoordinator.STATUS_WAITING_FOR_NETWORK)
+                scheduleNetworkDeadline(now)
                 true
             }
 
-            ReconnectDecision.RECONNECT,
-            ReconnectDecision.RECONNECT_AFTER_GO_AWAY -> {
-                if (reconnectScheduled) {
-                    true
-                } else {
-                    scheduleReconnect(cause, code, reason)
-                    true
-                }
+            is ReconnectAction.Attempt -> {
+                reconnectAttempts = reconnectPlan.attemptsUsed
+                scheduleReconnect(cause, code, reason, action.delayMillis, action.attempt)
+                true
             }
+
+            is ReconnectAction.GiveUp -> {
+                giveUpAfterReconnects(code, reason, action.message)
+                true
+            }
+
+            ReconnectAction.None -> false
         }
     }
 
-    private fun scheduleReconnect(cause: ReconnectCause, code: Int, reason: String) {
+    /** Schedules the 2-minute "still no network" check, so waiting never becomes forever. */
+    private fun scheduleNetworkDeadline(waitingSince: Long) {
+        runCatching {
+            setupTimer.schedule({
+                if (!running.get() || reconnectScheduled) return@schedule
+                val action = reconnectPlan.checkNetworkDeadline(System.currentTimeMillis(), waitingSince)
+                if (action is ReconnectAction.GiveUp) {
+                    waitingForNetworkSince = 0L
+                    giveUpAfterReconnects(0, "no network for ~2 minutes", action.message)
+                }
+            }, ReconnectCoordinator.NETWORK_WAIT_SECONDS, TimeUnit.SECONDS)
+        }
+    }
+
+    private fun scheduleReconnect(
+        cause: ReconnectCause,
+        code: Int,
+        reason: String,
+        delay: Long,
+        attempt: Int
+    ) {
         reconnectScheduled = true
-        reconnectAttempts += 1
         lastReconnectCause = cause
         lastReconnectStartedAt = System.currentTimeMillis()
-        val attempt = reconnectAttempts
-        val delay = if (cause == ReconnectCause.GO_AWAY) {
-            ReconnectPolicy.goAwayDelayMillis(lastGoAwayMillis)
-        } else {
-            ReconnectPolicy.backoffMillis(attempt)
-        }
-        val handleState = if (resumption.handleForReconnect() != null) "yes" else "none"
+        val handle = resumption.handleForReconnect()
+        val handleState = if (handle != null) "yes" else "none"
         lastReconnectNote = "reconnect #$attempt in ${delay}ms (cause=$cause, code=$code, " +
-            "reason=${reason.take(40)}, handle=$handleState)"
+            "reason=${reason.take(40)}, handle=$handleState, network=${netMonitor.snapshot().type})"
         // One short, non-alarming line. No error bubble, no "session ended".
-        onStatus("সংযোগ আবার জোড়া লাগছে… ($attempt/${ReconnectPolicy.MAX_ATTEMPTS})")
+        onStatus(
+            if (attempt > 0) "সংযোগ আবার জোড়া লাগছে… ($attempt/${ReconnectCoordinator.MAX_ATTEMPTS_DISPLAY})"
+            else "নতুন নেটওয়ার্ক — আবার যুক্ত হচ্ছি…"
+        )
         runCatching {
             setupTimer.schedule({
                 reconnectScheduled = false
                 if (!running.get() || closeInitiator.intentional) return@schedule
-                openSocketForReconnect()
+                if (!netMonitor.snapshot().available) {
+                    // The network vanished again while we were counting down: do not waste the
+                    // attempt — go back to waiting.
+                    waitingForNetworkSince = System.currentTimeMillis()
+                    onStatus(ReconnectCoordinator.STATUS_WAITING_FOR_NETWORK)
+                    scheduleNetworkDeadline(waitingForNetworkSince)
+                    return@schedule
+                }
+                reconnectPlan.onAttemptStarted(System.currentTimeMillis(), attempt)
+                openSocketForReconnect(attempt, handle != null)
             }, delay, TimeUnit.MILLISECONDS)
         }.onFailure { reconnectScheduled = false }
     }
@@ -1077,7 +1181,7 @@ class GeminiLiveVoice(
      * Replaces the dead socket without touching the microphone: the recorder keeps running, the
      * playback track keeps its queue, and only the socket is rebuilt with the resumption handle.
      */
-    private fun openSocketForReconnect() {
+    private fun openSocketForReconnect(attempt: Int = 0, hasHandle: Boolean = true) {
         val old = socket
         socket = null
         runCatching {
@@ -1086,6 +1190,10 @@ class GeminiLiveVoice(
         }
         closeInitiator = CloseInitiator.NONE
         setupDone.set(false)
+        // Remembered so setupComplete can say the right thing: with a handle the conversation
+        // continues; without one the context is gone and the user is told so.
+        reconnectHadHandle = hasHandle
+        itWasAReconnect = attempt > 0 || lastReconnectStartedAt > 0L
         // Frames captured while the new socket handshakes are dropped by the capture loop.
         connect()
     }
@@ -1097,17 +1205,58 @@ class GeminiLiveVoice(
         tryAutomaticReconnect(ReconnectCause.GO_AWAY, 0, "goAway")
     }
 
-    private fun giveUpAfterReconnects(code: Int, reason: String) {
+    /**
+     * A default network appeared. Two cases:
+     *  * we were waiting for it → the first attempt runs ~1 s later, with the resume handle;
+     *  * the session was healthy and the phone switched networks → one proactive reconnect, so the
+     *    conversation is moved onto the working network instead of dying on the old one.
+     */
+    private fun onNetworkAvailable(snapshot: NetworkSnapshot) {
+        if (!running.get() || closeInitiator.intentional) return
+        val now = System.currentTimeMillis()
+        if (reconnectPlan.waitingForNetwork) {
+            val action = reconnectPlan.onNetworkAvailable(now, snapshot)
+            if (action is ReconnectAction.Attempt) {
+                waitingForNetworkSince = 0L
+                reconnectAttempts = reconnectPlan.attemptsUsed
+                onStatus("ইন্টারনেট ফিরে এসেছে — আবার যুক্ত হচ্ছি…")
+                scheduleReconnect(
+                    ReconnectCause.NETWORK_BACK, 0, "network available", action.delayMillis, action.attempt
+                )
+            }
+            return
+        }
+        if (!setupDone.get() || socket == null) return
+        val proactive = reconnectPlan.onNewNetworkWhileHealthy(now, snapshot)
+        if (proactive is ReconnectAction.Attempt) {
+            lastReconnectCause = ReconnectCause.NEW_NETWORK
+            scheduleReconnect(
+                ReconnectCause.NEW_NETWORK, 0, "new default network (${snapshot.type})",
+                proactive.delayMillis, proactive.attempt
+            )
+        }
+    }
+
+    private fun onNetworkLost(snapshot: NetworkSnapshot) {
+        if (!running.get()) return
+        reconnectPlan.onNetworkLost(System.currentTimeMillis())
+        lastReconnectNote = "network lost (type=${snapshot.type})"
+        // The socket is usually dead a moment later; the failure path will show the calm line.
+    }
+
+    private fun giveUpAfterReconnects(code: Int, reason: String, message: String) {
         lastReconnectNote = "gave up after $reconnectAttempts attempts " +
             "(last close=$code, reason=${reason.take(40)})"
+        reconnectPlan.reset()
+        waitingForNetworkSince = 0L
         if (closeRunning()) {
+            // closeRunning() also stops the microphone: after giving up, nothing keeps recording.
             if (terminalErrorReported.compareAndSet(false, true)) {
                 onError(
-                    ReconnectPolicy.giveUpMessage(reconnectAttempts) +
-                        "\n(code=$code, reason=${reason.ifBlank { "none" }})\n${diagnosticSummary()}"
+                    message + "\n(code=$code, reason=${reason.ifBlank { "none" }})\n${diagnosticSummary()}"
                 )
             } else {
-                onStatus(ReconnectPolicy.giveUpMessage(reconnectAttempts))
+                onStatus(message)
             }
             onState(LiveState.FAILED)
         }
@@ -1168,7 +1317,18 @@ class GeminiLiveVoice(
                             if (running.get()) continue else break
                         }
                         if (!activeSocket!!.send(message.toString())) {
+                            // 0.2.10 FIX for the phone report: this used to call fail(), which is
+                            // terminal and set running=false - so the reconnect path saw a stopped
+                            // engine and the resume handle was never used ("airplane mode on/off").
+                            // A failed audio send is the socket failure one step earlier: hand it to
+                            // the same reconnect path and keep the microphone running.
                             if (reconnectScheduled || !running.get()) continue
+                            val handled = tryAutomaticReconnect(
+                                ReconnectCause.AUDIO_SEND_FAILED,
+                                0,
+                                "microphone audio send failed (chunk ${audioChunksSent.get()})"
+                            )
+                            if (handled) continue
                             fail("মাইক্রোফোন অডিও WebSocket-এ পাঠানো যায়নি। পাঠানো chunk: ${audioChunksSent.get()}")
                             break
                         }
@@ -1253,6 +1413,19 @@ class GeminiLiveVoice(
         stopAudio()
         onStatus("Live voice \u09ac\u09a8\u09cd\u09a7")
         onState(LiveState.ENDED)
+    }
+
+    /**
+     * 0.2.10: one listener pair per engine. `onAvailable` is what turns "ইন্টারনেটের অপেক্ষা করছি…"
+     * into a reconnect, and what moves a healthy session onto a new network.
+     */
+    private fun installNetworkWatch() {
+        if (networkWatchInstalled) return
+        networkWatchInstalled = true
+        runCatching {
+            netMonitor.onAvailable { snapshot -> onNetworkAvailable(snapshot) }
+            netMonitor.onLost { snapshot -> onNetworkLost(snapshot) }
+        }
     }
 
     private fun stopAudio() {

@@ -15,6 +15,10 @@ data class SessionEnvironment(
     val networkType: String = "unknown",
     /** Milliseconds since the default network last changed, or null when it never changed. */
     val networkChangedAgoMillis: Long? = null,
+    /** 0.2.10: milliseconds since the last `onLost`, or null when none was seen. */
+    val networkLostAgoMillis: Long? = null,
+    /** 0.2.10: why the type is unknown (e.g. the permission is missing). Empty when known. */
+    val networkUnknownReason: String = "",
     /** `PowerManager.isPowerSaveMode`. */
     val powerSaveMode: Boolean? = null
 ) {
@@ -62,8 +66,9 @@ object SessionDiagnostics {
         append('\n').append("App: ").append(visibleWord(environment.appVisible))
         append(" | Screen: ").append(interactiveWord(environment.screenInteractive))
         append(" | Locked: ").append(lockedWord(environment.keyguardLocked))
-        append('\n').append("Network: ").append(environment.networkType)
+        append('\n').append("Network: ").append(networkTypeWord(environment))
         append(networkChangeWord(environment.networkChangedAgoMillis))
+        append(lostWord(environment.networkLostAgoMillis))
         append(" | Battery saver: ").append(batteryWord(environment.powerSaveMode))
         append('\n').append(resumption.describe())
     }
@@ -72,6 +77,22 @@ object SessionDiagnostics {
         millis <= 0L -> "0s"
         millis < 60_000L -> "${millis / 1000}s"
         else -> "${millis / 60_000}m${(millis % 60_000) / 1000}s"
+    }
+
+    /** `wifi` / `mobile` / `none`, or "unknown (reason)" — never a silent "unknown". */
+    private fun networkTypeWord(environment: SessionEnvironment): String {
+        val type = environment.networkType.ifBlank { "unknown" }
+        return if (type == "unknown" && environment.networkUnknownReason.isNotBlank()) {
+            "unknown (" + environment.networkUnknownReason + ")"
+        } else {
+            type
+        }
+    }
+
+    private fun lostWord(agoMillis: Long?): String = when {
+        agoMillis == null -> " | last onLost: never"
+        agoMillis < 0L -> " | last onLost: unknown"
+        else -> " | last onLost: ${"%.1f".format(agoMillis / 1000.0)}s ago"
     }
 
     private fun visibleWord(value: Boolean?): String = when (value) {

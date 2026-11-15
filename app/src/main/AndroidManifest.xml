@@ -2,6 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 0.2.10: without this the network-aware reconnect could not see the network at all — the
+         platform threw SecurityException, the exception was swallowed, and the diagnostics line
+         said "Network: unknown" forever (the 0.2.9 phone report).
+         https://developer.android.com/reference/android/Manifest.permission#ACCESS_NETWORK_STATE -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- 0.2.9: a live conversation is a long-lived WebSocket plus continuous capture, so the
          process must not be frozen while the screen is off. Documented requirements for the
          microphone foreground-service type:
