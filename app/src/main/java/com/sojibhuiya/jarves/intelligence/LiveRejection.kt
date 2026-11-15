@@ -180,8 +180,10 @@ object LiveSessionPlan {
         code: Int,
         reason: String
     ): SessionAction {
-        // The recovery is only ever considered before the session is live: after setupComplete a
-        // failure is real and must be surfaced, never silently re-connected.
+        // The tool-recovery retry is only ever considered before the session is live. (0.2.9: a
+        // failure *after* setupComplete is still reported as SessionAction.FAIL here, but the
+        // engine now gives session-resumption its up-to-3 attempts first — see
+        // GeminiLiveVoice.tryAutomaticReconnect — and only the final failure reaches the user.)
         if (!setupComplete && code != 1000) {
             val rejection = LiveRejection.classify(code, reason, toolsRequested = hadSearchTool)
             if (rejection == Rejection.TOOL_REFUSED && hadSearchTool && !fallbackUsed) {

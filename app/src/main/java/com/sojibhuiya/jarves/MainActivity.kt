@@ -363,6 +363,9 @@ private fun AgiApp() {
                 connecting = false
                 return@launch
             }
+            // 0.2.9 fix: the callbacks below cannot see `live` while it is being constructed
+            // (Kotlin: "unresolved reference"), so they read it through this holder.
+            var created: GeminiLiveVoice? = null
             val live = GeminiLiveVoice(
                 apiKey = credentialKey,
                 assistantName = assistantName,
@@ -385,7 +388,7 @@ private fun AgiApp() {
                 onSessionEnd = { report ->
                     scope.launch {
                         status = report.message()
-                        lastEndDiagnostics = live.endDiagnostics()
+                        lastEndDiagnostics = created?.endDiagnostics() ?: lastEndDiagnostics
                         appendSearchReport(report.message())
                     }
                 },
@@ -417,13 +420,14 @@ private fun AgiApp() {
                 onError = { message ->
                     scope.launch {
                         status = message
-                        lastEndDiagnostics = live.endDiagnostics()
+                        lastEndDiagnostics = created?.endDiagnostics() ?: lastEndDiagnostics
                         connected = false
                         connecting = false
                         engine = null
                     }
                 }
             )
+            created = live
             engine = live
             // 0.2.9: keep the process alive for the whole conversation (microphone foreground
             // service). Started here — with the activity visible — because the platform refuses to
