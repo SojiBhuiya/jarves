@@ -178,6 +178,108 @@ class LiveSessionConfigTest {
         assertNull(fallback["tools"])
     }
 
+    // ---- 0.2.12 (B1): injected text must finish the turn ---------------------------------
+
+    @Test
+    fun injectedTextCompletesTheTurnSoTheServerActuallyGenerates() {
+        // API reference (https://ai.google.dev/api/live): "If true, indicates that the server
+        // content generation should start with the currently accumulated prompt. Otherwise, the
+        // server awaits additional messages before starting generation."
+        val json = LiveSessionConfig.turnCompletingClientContentJson(
+            GroundingPolicy.fallbackNotice(groundingAvailable = true)
+        )
+        val clientContent = (MiniJson.parse(json) as Map<*, *>)["clientContent"] as Map<*, *>
+        assertEquals("the injected text must start a generation", true, clientContent["turnComplete"])
+        assertEquals(setOf("role", "parts"), ((clientContent["turns"] as List<*>).single() as Map<*, *>).keys)
+    }
+
+    @Test
+    fun bothInjectedMessagesUseTheTurnCompletingHelper() {
+        // The two paths that inject text into a running session: the "could not verify" notice and
+        // the date/time refresh. Both are built through the same helper, so neither can silently
+        // fall back to turnComplete = false again.
+        val notice = LiveSessionConfig.turnCompletingClientContentJson(
+            GroundingPolicy.fallbackNotice(groundingAvailable = false)
+        )
+        val timeSync = LiveSessionConfig.turnCompletingClientContentJson(
+            TimeContext.refreshMessage(snapshot)
+        )
+        for (json in listOf(notice, timeSync)) {
+            val clientContent = (MiniJson.parse(json) as Map<*, *>)["clientContent"] as Map<*, *>
+            assertEquals(true, clientContent["turnComplete"])
+            val text = (((clientContent["turns"] as List<*>).single() as Map<*, *>)["parts"] as List<*>)
+                .single().let { (it as Map<*, *>)["text"] as String }
+            assertTrue(text.isNotBlank())
+        }
+    }
+
+    // ---- 0.2.12 (D1): transcription language hints ---------------------------------------
+
+    @Test
+    fun inputTranscriptionCarriesBengaliAndEnglishHints() {
+        // API reference, AudioTranscriptionConfig (https://ai.google.dev/api/live):
+        // "`languageCodes[]` — Optional. BCP-47 language codes providing hints about the languages
+        //  present in the audio. If omitted or empty, defaults to automatic language detection."
+        val setup = setup(true)["setup"] as Map<*, *>
+        val transcription = setup["inputAudioTranscription"] as Map<*, *>
+        assertEquals(listOf("bn-BD", "en-US"), transcription["languageCodes"])
+        assertEquals(LiveSessionConfig.TRANSCRIPTION_LANGUAGE_CODES, transcription["languageCodes"])
+        assertEquals(setOf("languageCodes"), transcription.keys)
+    }
+
+    @Test
+    fun outputTranscriptionStaysUntouchedBecauseOnlyTheInstructionControlsSpeech() {
+        val setup = setup(true)["setup"] as Map<*, *>
+        // No languageCodes here: the docs offer no field that changes the *spoken* language, so the
+        // LANGUAGE RULE in the system instruction remains the only lever. Adding a hint here would
+        // only claim something the app cannot prove.
+        assertEquals(emptyMap<String, Any?>(), setup["outputAudioTranscription"])
+    }
+
+    @Test
+    fun theFallbackToNoSearchKeepsTheSameTranscriptionHints() {
+        val grounded = setup(true)["setup"] as Map<*, *>
+        val fallback = setup(false)["setup"] as Map<*, *>
+        assertEquals(grounded["inputAudioTranscription"], fallback["inputAudioTranscription"])
+    }
+
+    // ---- 0.2.12 (D2): exactly one "say it first" rule ------------------------------------
+
+    @Test
+    fun thereIsExactlyOneRuleThatAsksForTheSpokenAcknowledgement() {
+        val text = LiveSessionConfig.systemInstruction(
+            "Jarves", snapshot, LiveSearchTool.FUNCTION_NON_BLOCKING
+        )
+        assertEquals("one acknowledgement rule, not two", 1, countOf(text, "say exactly one short line"))
+        assertFalse(
+            "the second, contradictory 'Before calling it, say one short line' rule is gone",
+            text.contains("Before calling it, say one short line")
+        )
+        // ...and the wording the phone asked for is still offered.
+        assertTrue(text.contains("দেখছি"))
+        assertTrue(text.contains("দেখে নিচ্ছি"))
+    }
+
+    @Test
+    fun theSearchInstructionIsShorterThanTheTwoRuleVersion() {
+        val text = LiveSessionConfig.systemInstruction(
+            "Jarves", snapshot, LiveSearchTool.FUNCTION_NON_BLOCKING
+        )
+        // The duplicate paragraph was ~230 characters of the instruction; the one-rule version must
+        // stay below a ceiling so it cannot grow back by accident.
+        assertTrue("instruction length ${text.length}", text.length < 3_000)
+    }
+
+    private fun countOf(haystack: String, needle: String): Int {
+        var count = 0
+        var index = haystack.indexOf(needle)
+        while (index >= 0) {
+            count++
+            index = haystack.indexOf(needle, index + needle.length)
+        }
+        return count
+    }
+
     @Test
     fun clientContentMessagesAreWellFormed() {
         val json = LiveSessionConfig.clientContentJson(TimeContext.refreshMessage(snapshot))

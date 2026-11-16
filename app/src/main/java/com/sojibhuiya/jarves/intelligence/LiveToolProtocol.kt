@@ -90,15 +90,21 @@ object LiveToolProtocol {
                     linkedMapOf<String, Any?>(
                         "id" to callId,
                         "name" to LiveSessionConfig.FUNCTION_SEARCH_WEB,
-                        // The API reference types `scheduling` as a field of FunctionResponse
-                        // (https://ai.google.dev/api/generate-content#FunctionResponse), so it is
-                        // sent there. The live-tools guide's own snippet shows it *inside* the
-                        // `response` object, so the same value is repeated there: whichever shape
-                        // the server reads, it reads the value we chose.
-                        "response" to linkedMapOf<String, Any?>(
-                            "result" to result,
-                            "scheduling" to scheduling
-                        ),
+                        // The result object. It carries the human-readable summary and nothing else.
+                        "response" to linkedMapOf<String, Any?>("result" to result),
+                        // 0.2.12 (B7): `scheduling` is sent in exactly one place — the place the
+                        // API reference defines it in. `FunctionResponse` field table,
+                        // https://ai.google.dev/api/generate-content#FunctionResponse:
+                        //   "**scheduling**: string enum — Optional. Specifies how the response
+                        //    should be scheduled in the conversation. Only applicable to
+                        //    NON_BLOCKING function calls, is ignored otherwise. Defaults to
+                        //    WHEN_IDLE."
+                        // 0.2.11 also repeated it *inside* `response`, because the SDK snippets in
+                        // the live-tools guide build `response={... , "scheduling": ...}`. The
+                        // reference types `response` as a free-form Struct with no such field, so
+                        // the copy was an undocumented extra key. It is gone; and because the
+                        // documented default is already WHEN_IDLE, the wire behaviour we rely on
+                        // cannot change by removing it.
                         "scheduling" to scheduling
                     )
                 )

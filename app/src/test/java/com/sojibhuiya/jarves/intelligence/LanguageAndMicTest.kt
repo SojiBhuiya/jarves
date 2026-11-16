@@ -62,15 +62,35 @@ class LanguageAndMicTest {
     }
 
     @Test
-    fun noLanguageCodeFieldIsEverSent() {
-        // Language is restricted through the instruction only (docs), never as a config field.
-        listOf(VoiceSearchMode.AUTO, VoiceSearchMode.VOICE_ONLY, VoiceSearchMode.SEARCH_ONLY).forEach {
-            assertFalse(MiniJson.encode(setup(it)).contains("languageCode"))
+    fun noSpeechLanguageCodeIsEverSent() {
+        // The spoken language is restricted through the instruction only: the docs offer no config
+        // field that changes it, so none may appear (in particular not inside speechConfig).
+        listOf(VoiceSearchMode.AUTO, VoiceSearchMode.VOICE_ONLY, VoiceSearchMode.SEARCH_ONLY).forEach { mode ->
+            val setupMap = setup(mode)
+            val speechConfig = (setupMap["generationConfig"] as Map<*, *>)["speechConfig"] as Map<*, *>
+            assertFalse("speechConfig must not carry a language code", speechConfig.containsKey("languageCode"))
+            assertFalse(
+                "no top-level languageCode either",
+                setupMap.containsKey("languageCode") || setupMap.containsKey("languageCodes")
+            )
         }
         assertFalse(
             LiveSessionConfig.searchSessionSetupJson(LiveModels.SEARCH_NATIVE_AUDIO, LiveModels.VOICE_NAME)
                 .contains("languageCode")
         )
+    }
+
+    @Test
+    fun theOnlyLanguageHintIsTheDocumentedTranscriptionHint() {
+        // 0.2.12 (D1): AudioTranscriptionConfig.languageCodes is the one documented language field
+        // (https://ai.google.dev/api/live#AudioTranscriptionConfig) and it steers the *transcription*
+        // only. It must be a hint list, Bengali first, and never a forced single code.
+        val setupMap = setup(VoiceSearchMode.AUTO)
+        val transcription = setupMap["inputAudioTranscription"] as Map<*, *>
+        assertEquals(listOf("bn-BD", "en-US"), transcription["languageCodes"])
+        assertEquals(setOf("languageCodes"), transcription.keys)
+        // The output side stays untouched, so nothing claims to control the spoken language.
+        assertEquals(emptyMap<String, Any?>(), setupMap["outputAudioTranscription"])
     }
 
     // ---- mic sensitivity -------------------------------------------------------------

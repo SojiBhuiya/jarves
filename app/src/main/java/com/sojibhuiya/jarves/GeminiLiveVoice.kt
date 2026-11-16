@@ -22,6 +22,7 @@ import java.util.concurrent.atomic.AtomicLong
 import com.sojibhuiya.jarves.intelligence.FreshnessClassifier
 import com.sojibhuiya.jarves.intelligence.GroundedSource
 import com.sojibhuiya.jarves.intelligence.GroundingParser
+import com.sojibhuiya.jarves.intelligence.LiveFailureRouter
 import com.sojibhuiya.jarves.intelligence.LiveSearchTool
 import com.sojibhuiya.jarves.intelligence.LiveModels
 import com.sojibhuiya.jarves.intelligence.SessionEndReport
@@ -166,7 +167,7 @@ class GeminiLiveVoice(
             "\u09b8\u0982\u09af\u09c1\u0995\u09cd\u09a4\u0964 \u098f\u0996\u09a8 \u0995\u09a5\u09be \u09ac\u09b2\u09c1\u09a8 (\u09b2\u09be\u0987\u09ad \u09b8\u09be\u09b0\u09cd\u099a \u099b\u09be\u09a1\u09bc\u09be \u2014 \u09b2\u09be\u0987\u09ad \u09a4\u09a5\u09cd\u09af \u09af\u09be\u099a\u09be\u0987 \u0995\u09b0\u09be \u09af\u09be\u09ac\u09c7 \u09a8\u09be)"
 
         /** Identifies this build in the on-device diagnostic block. */
-        const val FIX_TAG = "design4-5"
+        const val FIX_TAG = "0.2.12-a2a3a4-b1d1d2b7"
 
         /**
          * The mode/model/tool/close line of the diagnostic block. Pure and public so it is
@@ -227,6 +228,13 @@ class GeminiLiveVoice(
     @Volatile private var closeCallback = "none"
     /** Whether the close frame was echoed back, completing the closing handshake. */
     @Volatile private var closeEchoed = false
+    /**
+     * 0.2.12: the failure decisions (read error, bad frame, playback error, user stop) live in a
+     * pure, unit-tested state machine so they can never drift apart again.
+     */
+    private val failureRouter = LiveFailureRouter()
+    /** The last frame that was skipped because it could not be parsed (diagnostics only). */
+    @Volatile private var lastSkippedFrame = "none"
 
     // ---- Real-time intelligence state
     /** Whether the setup message asked for Google Search grounding. */
@@ -421,6 +429,7 @@ class GeminiLiveVoice(
             return
         }
         if (!running.compareAndSet(false, true)) return
+        failureRouter.onSessionStarted()
         terminalErrorReported.set(false)
         setupDone.set(false)
         setupCompleteReceived = false
@@ -620,6 +629,7 @@ class GeminiLiveVoice(
                         searchTimeline.start(System.currentTimeMillis())
                         setupTimeout?.cancel(false)
                         setupTimeout = null
+                        failureRouter.onReconnectSucceeded()
                         startAudioPlayback()
                         startAudioCapture()
                         // 0.2.10: after an automatic reconnect the user is told plainly what
@@ -758,7 +768,16 @@ class GeminiLiveVoice(
 
                     if (root.has("goAway")) onStatus("সংযোগ পুনরায় চালু করতে হবে")
                 } catch (e: Exception) {
-                    fail("Live response পড়তে সমস্যা: ${e.message ?: "unknown"}")
+                    // 0.2.12: one unparseable frame must never end a working conversation. The
+                    // frame is skipped and counted (see Settings → Advanced → Diagnostics); only a
+                    // session that has already ended ignores it silently.
+                    val action = failureRouter.onFrameParseError()
+                    if (action == LiveFailureRouter.Action.SKIP_FRAME) {
+                        lastSkippedFrame = "${e.javaClass.simpleName}: ${e.message ?: "unknown"}"
+                        if (failureRouter.skippedFrames == 1) {
+                            onStatus("একটি অস্বাভাবিক সার্ভার ফ্রেম বাদ দেওয়া হয়েছে (সেশন চলছে)")
+                        }
+                    }
                 }
             }
 
@@ -840,7 +859,10 @@ class GeminiLiveVoice(
         if (needsLiveSources && !groundingForTurn && !noticeSentForTurn) {
             noticeSentForTurn = true
             webSocket.send(
-                LiveSessionConfig.clientContentJson(
+                // 0.2.12 (B1): turnComplete = true, otherwise the server only accumulates this
+                // text and never speaks it (https://ai.google.dev/api/live — "Otherwise, the
+                // server awaits additional messages before starting generation").
+                LiveSessionConfig.turnCompletingClientContentJson(
                     GroundingPolicy.fallbackNotice(groundingAvailable)
                 )
             )
@@ -864,7 +886,11 @@ class GeminiLiveVoice(
         if (!dayChanged && !stale) return
         lastTimeSyncMillis = now
         lastTimeSyncDateKey = snapshot.dateKey
-        runCatching { target.send(LiveSessionConfig.clientContentJson(TimeContext.refreshMessage(snapshot))) }
+        runCatching {
+            target.send(
+                LiveSessionConfig.turnCompletingClientContentJson(TimeContext.refreshMessage(snapshot))
+            )
+        }
     }
 
     private fun startTimeSyncLoop() {
@@ -890,6 +916,8 @@ class GeminiLiveVoice(
             "Echo: $closeEchoed | Search: ${if (groundingAvailable) "on" else "off"} " +
             "(tool=$searchToolMode, legacyFallback=$groundingFallbackUsed) | " +
             "Setup tools: $setupDeclaredTool | toolCalls: $toolCallCount | " +
+            "Skipped frames: ${failureRouter.skippedFrames} (last: $lastSkippedFrame) | " +
+            failureRouter.describe() + " | " +
             diagnosticsFor(activeMode, searchToolMode, lastCloseCode, lastCloseReason) + " | " +
             "Last query: $lastToolQuery | Last search: $lastSearchOutcome | " +
             "Last search model: $lastSearchModel | ${searchBackend?.describe() ?: "Search models: none"} | " +
@@ -1205,12 +1233,14 @@ class GeminiLiveVoice(
 
     /** Ends the session and stops audio. Returns false when it was already finished. */
     private fun closeRunning(): Boolean {
+        failureRouter.onSessionEnded()
         if (!running.getAndSet(false)) return false
         stopAudio()
         return true
     }
 
     private fun fail(message: String) {
+        failureRouter.onSessionEnded()
         setupTimeout?.cancel(false)
         setupTimeout = null
         if (running.getAndSet(false)) {
@@ -1324,6 +1354,7 @@ class GeminiLiveVoice(
         attempt: Int
     ) {
         reconnectScheduled = true
+        failureRouter.onReconnectScheduled()
         lastReconnectCause = cause
         lastReconnectStartedAt = System.currentTimeMillis()
         val handle = resumption.handleForReconnect()
@@ -1522,7 +1553,25 @@ class GeminiLiveVoice(
                             AudioRecord.ERROR_DEAD_OBJECT -> "AudioRecord.ERROR_DEAD_OBJECT"
                             else -> "AudioRecord read error $count"
                         }
-                        fail("Microphone read ব্যর্থ: $reason। পাঠানো chunk: ${audioChunksSent.get()}")
+                        // 0.2.12 (A3): a dead microphone is the socket failure one step earlier, and
+                        // Android usually kills the recorder when the network drops. Hand it to the
+                        // same reconnect path as a failed send instead of ending the session, so the
+                        // resume handle is actually used. The dead recorder is released here, and
+                        // startAudioCapture() recreates it after the next setupComplete.
+                        val action = failureRouter.onAudioReadError()
+                        if (action == LiveFailureRouter.Action.RECONNECT) {
+                            releaseDeadMicrophone(reason)
+                            val handled = tryAutomaticReconnect(
+                                ReconnectCause.AUDIO_READ_FAILED,
+                                0,
+                                "microphone read failed: $reason (chunk ${audioChunksSent.get()})"
+                            )
+                            if (!handled) {
+                                fail("Microphone read ব্যর্থ: $reason। পাঠানো chunk: ${audioChunksSent.get()}")
+                            }
+                        } else if (running.get() && !reconnectScheduled) {
+                            fail("Microphone read ব্যর্থ: $reason। পাঠানো chunk: ${audioChunksSent.get()}")
+                        }
                         break
                     }
                 }
@@ -1531,6 +1580,21 @@ class GeminiLiveVoice(
             microphoneStateDetail = "error: ${e.message ?: "unknown"}"
             fail("Microphone error: ${e.message ?: "unknown"}")
         }
+    }
+
+    /**
+     * 0.2.12 (A3): a recorder whose `read()` returned an error code is unusable
+     * (`ERROR_DEAD_OBJECT` after a network drop is the usual case). It is released here — without
+     * touching the socket or the session state — so `startAudioCapture()` can build a fresh
+     * `AudioRecord` after the reconnect's `setupComplete`. Without this the reconnect would resume
+     * the conversation with a dead microphone.
+     */
+    private fun releaseDeadMicrophone(reason: String) {
+        microphoneStarted = false
+        microphoneStateDetail = "released after a read error ($reason)"
+        runCatching { recorder?.stop() }
+        runCatching { recorder?.release() }
+        recorder = null
     }
 
     private fun startAudioPlayback() {
@@ -1561,7 +1625,18 @@ class GeminiLiveVoice(
                         if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
                         track.write(pcm, 0, pcm.size, AudioTrack.WRITE_BLOCKING)
                     } catch (e: Exception) {
-                        onError("Audio playback error: ${e.message ?: "unknown"}")
+                        // 0.2.12 (A2): this used to call onError() only, which the UI treated as
+                        // "drop the engine reference" while the microphone, the playback thread and
+                        // the foreground service kept running — a ghost session that could talk to
+                        // a second session started later. A failed playback means the session can
+                        // no longer speak, so it is ended cleanly: fail() closes the socket, stops
+                        // the audio, emits LiveState.FAILED and the UI stops the foreground service
+                        // (LiveStateRouting.releaseEngine).
+                        val action = failureRouter.onPlaybackError()
+                        if (action == LiveFailureRouter.Action.STOP_TERMINAL) {
+                            fail("Audio playback error: ${e.message ?: "unknown"}")
+                        }
+                        break
                     }
                 }
             } catch (_: InterruptedException) {
@@ -1578,6 +1653,8 @@ class GeminiLiveVoice(
      *   user as "the session broke". It is also the flag that blocks an automatic reconnect.
      */
     fun stop(initiator: CloseInitiator = CloseInitiator.USER_STOP) {
+        // A user stop is terminal by definition: no reconnect may follow it.
+        failureRouter.onSessionEnded()
         closeInitiator = initiator
         if (!running.getAndSet(false)) return
         try {

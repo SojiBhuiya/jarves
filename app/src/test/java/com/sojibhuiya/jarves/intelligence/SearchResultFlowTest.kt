@@ -388,7 +388,7 @@ class SearchResultFlowTest {
     // ---- the frame itself --------------------------------------------------------------------
 
     @Test
-    fun theDeliveredFrameCarriesWhenIdleInBothDocumentedPlaces() {
+    fun theDeliveredFrameCarriesWhenIdleInTheOneDocumentedPlace() {
         val payload = SearchResultText.toolResponse(
             SearchResultItem("call-1", "আজকের দাম", "১,৯৮,০০০ টাকা।", "Example News")
         )
@@ -398,7 +398,13 @@ class SearchResultFlowTest {
         val response = ((MiniJson.parse(json) as Map<*, *>)["toolResponse"] as Map<*, *>)
             .let { it["functionResponses"] as List<*> }.single() as Map<*, *>
         assertEquals("WHEN_IDLE", response["scheduling"])
-        assertEquals("WHEN_IDLE", (response["response"] as Map<*, *>)["scheduling"])
+        // 0.2.12 (B7): one place only — the field the API reference defines on FunctionResponse
+        // (https://ai.google.dev/api/generate-content#FunctionResponse). `response` is a free-form
+        // Struct and carries the result alone.
+        assertFalse(
+            "no second, undocumented scheduling copy inside the result object",
+            (response["response"] as Map<*, *>).containsKey("scheduling")
+        )
         val result = (response["response"] as Map<*, *>)["result"] as String
         assertNotNull(result)
         assertTrue(result.contains("আজকের দাম"))

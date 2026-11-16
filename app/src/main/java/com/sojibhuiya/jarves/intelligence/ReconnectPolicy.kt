@@ -23,7 +23,14 @@ enum class ReconnectCause {
     NEW_NETWORK,
 
     /** 0.2.10: a microphone audio **send** failed — the socket failure one step earlier. */
-    AUDIO_SEND_FAILED
+    AUDIO_SEND_FAILED,
+
+    /**
+     * 0.2.12: `AudioRecord.read()` returned an error code (`ERROR_DEAD_OBJECT`, …). Android usually
+     * kills the recorder when the network drops, so this is the same failure one step earlier and
+     * takes the same reconnect path — the 0.2.10 fix covered only the send side.
+     */
+    AUDIO_READ_FAILED
 }
 
 enum class ReconnectDecision(val automatic: Boolean) {

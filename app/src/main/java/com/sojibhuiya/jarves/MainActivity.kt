@@ -435,6 +435,11 @@ private fun AgiApp() {
                         connected = false
                         connecting = false
                         engine = null
+                        // 0.2.12 (A2): a terminal error means the engine has already stopped itself
+                        // (fail() closes the socket and the audio). The foreground service must not
+                        // outlive it, otherwise a notification keeps promising a session that no
+                        // longer exists. stop() on a service that is not running is a no-op.
+                        LiveSessionService.stop(context.applicationContext)
                     }
                 }
             )

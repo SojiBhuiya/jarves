@@ -143,11 +143,16 @@ object LiveSessionConfig {
             )
             // 0.2.11 (problem 1): the phone showed the acknowledgement only AFTER the search
             // finished, so the order and the phrasing are now explicit.
+            // 0.2.12 (D2): there used to be a *second* "say one short line first" rule further down
+            // ("Before calling it, say one short line … \"দেখে নিচ্ছি\""). Two conflicting orders for
+            // one action is the most likely reason the acknowledgement sometimes never came. There
+            // is now exactly one rule, it is the first thing the model reads about searching, and
+            // it keeps every wording the phone report asked for.
             appendLine(
-                "STEP 1 — the moment you decide to search, BEFORE calling `$FUNCTION_SEARCH_WEB`, say " +
-                    "exactly one short line aloud in the user's language, varying it: \"দেখছি\", " +
-                    "\"দেখে জানাচ্ছি\", \"একটু সময় দিন\". Call the tool only after you have said it. " +
-                    "Do not stay silent while a search is running."
+                "STEP 1 — the moment you decide to search, and BEFORE calling `$FUNCTION_SEARCH_WEB`, " +
+                    "say exactly one short line aloud in the user's language, varying it: " +
+                    "\"দেখছি\", \"দেখে নিচ্ছি\", \"একটু সময় দিন\". Call the tool only after you " +
+                    "have said it. Never stay silent while a search is running."
             )
             appendLine(
                 "STEP 2 — when the result arrives: if nothing has happened since you asked, answer " +
@@ -156,10 +161,8 @@ object LiveSessionConfig {
                     "Never cut off or replace an answer that is already being spoken."
             )
             appendLine(
-                "Before calling it, say one short line in the user's language: \"দেখে নিচ্ছি\". Then " +
-                    "give the answer in a few plain Bengali sentences and name the source you used. " +
-                    "Do not guess before the result arrives. If the result says the search failed, say " +
-                    "so plainly. Never invent facts or links."
+                "Do not guess before the result arrives; name the source you used. If the search " +
+                    "failed, say so plainly instead of inventing facts or links."
             )
         } else {
             appendLine(
@@ -267,7 +270,21 @@ object LiveSessionConfig {
         // Exactly one function tool, and never `googleSearch` (Design 4).
         val tools = toolsJson(searchTool)
         if (tools.isNotEmpty()) setup["tools"] = tools
-        if (inputTranscription) setup["inputAudioTranscription"] = emptyMap<String, Any?>()
+        // 0.2.12 (D1): the API reference types this object as AudioTranscriptionConfig
+        // (https://ai.google.dev/api/live#AudioTranscriptionConfig):
+        //   "`languageCodes[]` — Optional. BCP-47 language codes providing hints about the languages
+        //    present in the audio. If omitted or empty, defaults to automatic language detection."
+        // With no hints the transcriber guessed, which is the phone report "Bengali spoken, Spanish
+        // written". Two hints only (the user speaks Bengali, English and Banglish) — a longer list
+        // would dilute the hint.
+        // Honest limit: this steers the *transcription text*, not the spoken language. The spoken
+        // language is governed by the LANGUAGE RULE in the system instruction (the docs offer no
+        // languageCode field for the native-audio output).
+        if (inputTranscription) {
+            setup["inputAudioTranscription"] = linkedMapOf<String, Any?>(
+                "languageCodes" to TRANSCRIPTION_LANGUAGE_CODES
+            )
+        }
         if (outputTranscription) setup["outputAudioTranscription"] = emptyMap<String, Any?>()
         // 0.2.8: conservative automatic VAD so nearby voices do not start a turn. Only sent for
         // models the docs list as supporting it, and never for NORMAL (server defaults).
@@ -327,7 +344,35 @@ object LiveSessionConfig {
         return MiniJson.encode(linkedMapOf<String, Any?>("setup" to setup))
     }
 
-    /** clientContent message carrying free text into the running session. */
+    /**
+     * 0.2.12: BCP-47 hints for the input transcription (docs: AudioTranscriptionConfig). Bengali
+     * first because it is the language the user mostly speaks, English second because Banglish
+     * mixes it in.
+     */
+    val TRANSCRIPTION_LANGUAGE_CODES: List<String> = listOf("bn-BD", "en-US")
+
+    /**
+     * 0.2.12 (B1): text the app injects into a running session (the "could not verify" notice and
+     * the date/time refresh) **must** finish the turn, otherwise the server only accumulates it.
+     *
+     * API reference, BidiGenerateContentClientContent (https://ai.google.dev/api/live):
+     * "`turnComplete` — Optional. If true, indicates that the server content generation should
+     *  start with the currently accumulated prompt. Otherwise, the server awaits additional
+     *  messages before starting generation."
+     *
+     * 0.2.11 sent both of these with `turnComplete = false`, so they sat in the context and the
+     * model was never prompted to speak — "the honest notice never reaches the user".
+     */
+    fun turnCompletingClientContentJson(text: String): String =
+        clientContentJson(text = text, turnComplete = true)
+
+    /**
+     * clientContent message carrying free text into the running session.
+     *
+     * @param turnComplete true makes the server start generating from the accumulated prompt; the
+     *   app path for injected text uses [turnCompletingClientContentJson] so the flag can never be
+     *   forgotten again.
+     */
     fun clientContentJson(text: String, turnComplete: Boolean = false): String =
         MiniJson.encode(
             linkedMapOf<String, Any?>(

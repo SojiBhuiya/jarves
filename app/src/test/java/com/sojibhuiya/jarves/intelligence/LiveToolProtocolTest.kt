@@ -151,11 +151,17 @@ class LiveToolProtocolTest {
 
         val json = LiveToolProtocol.toolResponseJson("c", short, LiveToolProtocol.schedulingFor(short))
         assertTrue(json.contains("\"scheduling\":\"WHEN_IDLE\""))
-        // The same value is repeated inside `response`, where the live-tools guide's snippet puts
-        // it, so the server reads the chosen value in either documented shape.
+        // 0.2.12 (B7): `scheduling` is sent exactly once, in the place the API reference defines it
+        // (a field of FunctionResponse, https://ai.google.dev/api/generate-content#FunctionResponse).
+        // `response` is a free-form Struct with no such field, so the 0.2.11 copy inside it is gone.
         val response = (((MiniJson.parse(json) as Map<*, *>)["toolResponse"] as Map<*, *>)
             ["functionResponses"] as List<*>).single() as Map<*, *>
-        assertEquals("WHEN_IDLE", (response["response"] as Map<*, *>)["scheduling"])
+        assertEquals(
+            "the result object must carry the result and nothing undocumented",
+            setOf("result"),
+            (response["response"] as Map<*, *>).keys
+        )
+        assertEquals("exactly one scheduling field", 1, Regex("\"scheduling\"").findAll(json).count())
     }
 
     @Test
