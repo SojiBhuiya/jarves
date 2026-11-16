@@ -147,7 +147,15 @@ class VoiceSearchModeTest {
         val speech = gen["speechConfig"] as Map<*, *>
         val voice = ((speech["voiceConfig"] as Map<*, *>)["prebuiltVoiceConfig"] as Map<*, *>)["voiceName"]
         assertEquals(LiveModels.VOICE_NAME, voice)
-        assertFalse(MiniJson.encode(setup).contains("languageCode"))
+        // 0.2.12 (D1): the only language field in the frame is the documented transcription hint
+        // (AudioTranscriptionConfig.languageCodes, https://ai.google.dev/api/live). Nothing may set
+        // a *spoken* language: no speechConfig.languageCode, no top-level code.
+        assertFalse("speech must not carry a language code", speech.containsKey("languageCode"))
+        assertFalse("no top-level language field", setup.containsKey("languageCode"))
+        assertTrue(
+            "the transcription hint is the only language field",
+            MiniJson.encode(setup).contains("\"languageCodes\":[\"bn-BD\",\"en-US\"]")
+        )
     }
 
     // ---- Voice only ----------------------------------------------------------------
