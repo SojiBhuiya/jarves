@@ -111,7 +111,9 @@ class LiveToolProtocolTest {
 
     @Test
     fun toolResponseHasTheExactDocumentedShape() {
-        val json = LiveToolProtocol.toolResponseJson("call-1", "উত্তর: ৩২°C", "INTERRUPT")
+        val json = LiveToolProtocol.toolResponseJson(
+            "call-1", "উত্তর: ৩২°C", LiveToolProtocol.SCHEDULING_WHEN_IDLE
+        )
         val root = MiniJson.parse(json) as Map<*, *>
 
         // Nothing but toolResponse at the top level: the server rejects unknown siblings.
@@ -122,7 +124,7 @@ class LiveToolProtocolTest {
 
         assertEquals("call-1", response["id"])                       // matched by id, not order
         assertEquals("search_web", response["name"])
-        assertEquals("INTERRUPT", response["scheduling"])
+        assertEquals("WHEN_IDLE", response["scheduling"])
         assertEquals("উত্তর: ৩২°C", (response["response"] as Map<*, *>)["result"])
         // `response` carries the result object, never a bare string.
         assertNotNull(response["response"])
@@ -130,23 +132,30 @@ class LiveToolProtocolTest {
     }
 
     @Test
-    fun theDefaultSchedulingIsInterruptSoAShortAnswerIsSpokenAtOnce() {
+    fun theDefaultSchedulingIsWhenIdleSoAnAnswerInProgressIsNeverCutOff() {
         val json = LiveToolProtocol.toolResponseJson("call-1", "short")
         val response = ((MiniJson.parse(json) as Map<*, *>)["toolResponse"] as Map<*, *>)
             .let { it["functionResponses"] as List<*> }.single() as Map<*, *>
-        assertEquals(LiveToolProtocol.SCHEDULING_INTERRUPT, response["scheduling"])
-        assertEquals("INTERRUPT", response["scheduling"])
+        assertEquals(LiveToolProtocol.SCHEDULING_WHEN_IDLE, response["scheduling"])
+        assertEquals("WHEN_IDLE", response["scheduling"])
     }
 
     @Test
-    fun aLongResultWaitsForIdleSoItDoesNotCutTheUserOff() {
-        val short = "x".repeat(100)
+    fun everySearchResultWaitsForIdleWhetherItIsShortOrLong() {
+        // 0.2.10 sent short results with INTERRUPT, which is documented as "interrupt ongoing
+        // generation" — the 0.2.11 phone report. There is no length threshold any more.
+        val short = "x".repeat(10)
         val long = "x".repeat(5_000)
-        assertEquals("INTERRUPT", LiveToolProtocol.schedulingFor(short))
+        assertEquals("WHEN_IDLE", LiveToolProtocol.schedulingFor(short))
         assertEquals("WHEN_IDLE", LiveToolProtocol.schedulingFor(long))
 
-        val json = LiveToolProtocol.toolResponseJson("c", long, LiveToolProtocol.schedulingFor(long))
+        val json = LiveToolProtocol.toolResponseJson("c", short, LiveToolProtocol.schedulingFor(short))
         assertTrue(json.contains("\"scheduling\":\"WHEN_IDLE\""))
+        // The same value is repeated inside `response`, where the live-tools guide's snippet puts
+        // it, so the server reads the chosen value in either documented shape.
+        val response = (((MiniJson.parse(json) as Map<*, *>)["toolResponse"] as Map<*, *>)
+            ["functionResponses"] as List<*>).single() as Map<*, *>
+        assertEquals("WHEN_IDLE", (response["response"] as Map<*, *>)["scheduling"])
     }
 
     @Test

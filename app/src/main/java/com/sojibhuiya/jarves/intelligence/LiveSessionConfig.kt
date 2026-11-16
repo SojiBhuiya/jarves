@@ -141,10 +141,24 @@ object LiveSessionConfig {
                     "today's date, or \"who is the current …\". Never call it for small talk, " +
                     "arithmetic or definitions."
             )
+            // 0.2.11 (problem 1): the phone showed the acknowledgement only AFTER the search
+            // finished, so the order and the phrasing are now explicit.
             appendLine(
-                "Before calling it, say one short line in the user's language: \"দেখে নিচ্ছি\". Do not " +
-                    "guess before the result arrives. Then give the answer in a few plain Bengali " +
-                    "sentences and name the source you used. If the result says the search failed, say " +
+                "STEP 1 — the moment you decide to search, BEFORE calling `$FUNCTION_SEARCH_WEB`, say " +
+                    "exactly one short line aloud in the user's language, varying it: \"দেখছি\", " +
+                    "\"দেখে জানাচ্ছি\", \"একটু সময় দিন\". Call the tool only after you have said it. " +
+                    "Do not stay silent while a search is running."
+            )
+            appendLine(
+                "STEP 2 — when the result arrives: if nothing has happened since you asked, answer " +
+                    "naturally. If the user asked something else in the meantime, FIRST name their " +
+                    "earlier question — \"আপনি … জানতে চেয়েছিলেন, তার উত্তর: …\" — and then answer. " +
+                    "Never cut off or replace an answer that is already being spoken."
+            )
+            appendLine(
+                "Before calling it, say one short line in the user's language: \"দেখে নিচ্ছি\". Then " +
+                    "give the answer in a few plain Bengali sentences and name the source you used. " +
+                    "Do not guess before the result arrives. If the result says the search failed, say " +
                     "so plainly. Never invent facts or links."
             )
         } else {

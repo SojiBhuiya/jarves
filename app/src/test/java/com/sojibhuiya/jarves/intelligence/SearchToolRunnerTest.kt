@@ -178,7 +178,7 @@ class SearchToolRunnerTest {
     }
 
     @Test
-    fun schedulingIsChosenFromTheResultLength() {
+    fun aLongResultIsDeliveredWithWhenIdle() {
         val transport = GatedTransport(
             body = """{"candidates":[{"content":{"parts":[{"text":"${"লম্বা উত্তর ".repeat(200)}"}]}}]}"""
         )

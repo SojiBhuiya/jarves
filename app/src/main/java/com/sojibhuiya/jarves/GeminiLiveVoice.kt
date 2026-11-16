@@ -28,7 +28,12 @@ import com.sojibhuiya.jarves.intelligence.SessionEndReport
 import com.sojibhuiya.jarves.intelligence.VoiceSearchMode
 import com.sojibhuiya.jarves.intelligence.LiveToolProtocol
 import com.sojibhuiya.jarves.intelligence.CloseInitiator
+import com.sojibhuiya.jarves.intelligence.IdleAnnouncementTracker
 import com.sojibhuiya.jarves.intelligence.MicSensitivity
+import com.sojibhuiya.jarves.intelligence.PendingResultQueue
+import com.sojibhuiya.jarves.intelligence.SearchResultItem
+import com.sojibhuiya.jarves.intelligence.SearchResultText
+import com.sojibhuiya.jarves.intelligence.SearchTimeline
 import com.sojibhuiya.jarves.intelligence.NetworkMonitor
 import com.sojibhuiya.jarves.intelligence.NetworkSnapshot
 import com.sojibhuiya.jarves.intelligence.ReconnectAction
@@ -161,7 +166,7 @@ class GeminiLiveVoice(
             "\u09b8\u0982\u09af\u09c1\u0995\u09cd\u09a4\u0964 \u098f\u0996\u09a8 \u0995\u09a5\u09be \u09ac\u09b2\u09c1\u09a8 (\u09b2\u09be\u0987\u09ad \u09b8\u09be\u09b0\u09cd\u099a \u099b\u09be\u09a1\u09bc\u09be \u2014 \u09b2\u09be\u0987\u09ad \u09a4\u09a5\u09cd\u09af \u09af\u09be\u099a\u09be\u0987 \u0995\u09b0\u09be \u09af\u09be\u09ac\u09c7 \u09a8\u09be)"
 
         /** Identifies this build in the on-device diagnostic block. */
-        const val FIX_TAG = "design4-4"
+        const val FIX_TAG = "design4-5"
 
         /**
          * The mode/model/tool/close line of the diagnostic block. Pure and public so it is
@@ -241,6 +246,27 @@ class GeminiLiveVoice(
     @Volatile private var lastAutoTrace: String = "none"
     @Volatile private var lastToolCallSeen: String = "none"
     @Volatile private var lastToolResponseDelivery: String = "none"
+
+    // ---- 0.2.11: acknowledgement timing, ordered result delivery and the chat safety net ----
+    /** Per-search timeline for the diagnostics block (task A). */
+    private val searchTimeline = SearchTimeline(SearchTimeline.CAPACITY_DEFAULT)
+    /** Results waiting for the model to be idle, in the order the searches finished (task C4). */
+    private val pendingResults = PendingResultQueue()
+    /** "Was the result actually spoken?" — one nudge at most (task C5). */
+    private val announceTracker = IdleAnnouncementTracker()
+    /** True while the model is producing a turn (result delivery must wait for idle). */
+    @Volatile private var modelGenerating = false
+    /** True when the pending result arrived after newer conversation (task C3 wording). */
+    @Volatile private var answersInProgressWhenResultArrived = 0
+    /** Set when the user asks something after a toolCall, so the later result names its question. */
+    @Volatile private var newerQuestionSinceToolCall = false
+    @Volatile private var firstAudioAfterToolCallMarked = false
+    @Volatile private var awaitingFirstAudioForResult = false
+    @Volatile private var currentResultCallId: String = ""
+    @Volatile private var lastResultReminder: String = "none"
+    /** callId -> the order the question was asked, so two results keep the user's order (task C4). */
+    private val searchOrder = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val searchOrderCounter = java.util.concurrent.atomic.AtomicLong(0)
 
     /** Auto mode: one search per user question; reset after every model turn. */
     private val searchBudget = SearchBudget(MAX_SEARCHES_PER_QUESTION)
@@ -440,6 +466,17 @@ class GeminiLiveVoice(
         lastAutoTrace = "none"
         lastToolCallSeen = "none"
         lastToolResponseDelivery = "none"
+        searchTimeline.clear()
+        pendingResults.clear()
+        modelGenerating = false
+        answersInProgressWhenResultArrived = 0
+        newerQuestionSinceToolCall = false
+        firstAudioAfterToolCallMarked = false
+        awaitingFirstAudioForResult = false
+        currentResultCallId = ""
+        lastResultReminder = "none"
+        searchOrder.clear()
+        searchOrderCounter.set(0)
         // 0.2.9 session-end forensics + resumption, one session at a time.
         closeInitiator = CloseInitiator.NONE
         resumption.clear()
@@ -579,6 +616,8 @@ class GeminiLiveVoice(
                     if (root.has("setupComplete")) {
                         setupDone.set(true)
                         setupCompleteReceived = true
+                        // Task A: every timeline event is an offset from this moment.
+                        searchTimeline.start(System.currentTimeMillis())
                         setupTimeout?.cancel(false)
                         setupTimeout = null
                         startAudioPlayback()
@@ -619,7 +658,18 @@ class GeminiLiveVoice(
                         }
                         val calls = LiveToolProtocol.parseSearchCalls(text)
                         if (calls.isNotEmpty()) {
+                            // Task A + B: the toolCall is the moment the acknowledgement was due.
+                            searchTimeline.mark(
+                                "toolCall received (n=${calls.size}, q=${calls.first().query.take(40)})"
+                            )
+                            // Task C3: anything the user asks from now on is "newer conversation",
+                            // so a result arriving later must name its question.
+                            newerQuestionSinceToolCall = false
+                            firstAudioAfterToolCallMarked = false
                             toolCallCount += calls.size
+                            calls.forEach { call ->
+                                searchOrder.putIfAbsent(call.callId, searchOrderCounter.incrementAndGet())
+                            }
                             lastToolQuery = calls.first().query.take(60)
                             lastToolCallSeen = "toolCall received (id=${calls.first().callId.take(24)}, " +
                                 "q=${calls.first().query.take(40)}, model=${LiveModels.modelFor(activeMode)})"
@@ -645,13 +695,25 @@ class GeminiLiveVoice(
                         if (serverContent.optBoolean("interrupted", false)) {
                             playbackQueue.clear()
                             try { player?.pause(); player?.flush(); player?.play() } catch (_: Exception) {}
+                            modelGenerating = false
+                            if (pendingResults.size > 0) {
+                                answersInProgressWhenResultArrived++
+                                searchTimeline.mark("model turn interrupted (barge-in)")
+                            }
                             onStatus("আপনার কথা শুনছি…")
                         }
 
                         serverContent.optJSONObject("inputTranscription")?.optString("text")
-                            ?.takeIf { it.isNotBlank() }?.let { chunk ->
+                            ?.takeIf { it.isNotBlank()}?.let { chunk ->
                                 turnUserSpeech.append(' ').append(chunk)
                                 onTranscript(chunk, false)
+                                // The user is now talking about something else while a search is
+                                // still running: the result that arrives later must name its own
+                                // question instead of being dropped into this new topic.
+                                if (pendingResults.size > 0 || searchRunner != null) {
+                                    newerQuestionSinceToolCall = true
+                                    searchTimeline.mark("user speech while search pending")
+                                }
                             }
 
                         serverContent.optJSONObject("outputTranscription")?.optString("text")
@@ -659,15 +721,38 @@ class GeminiLiveVoice(
 
                         val parts = serverContent.optJSONObject("modelTurn")?.optJSONArray("parts")
                         if (parts != null) {
+                            var audioSeen = false
                             for (i in 0 until parts.length()) {
                                 val inline = parts.optJSONObject(i)?.optJSONObject("inlineData")
                                 val encoded = inline?.optString("data").orEmpty()
-                                if (encoded.isNotBlank()) playbackQueue.offer(Base64.decode(encoded, Base64.DEFAULT))
+                                if (encoded.isNotBlank()) {
+                                    playbackQueue.offer(Base64.decode(encoded, Base64.DEFAULT))
+                                    audioSeen = true
+                                }
+                            }
+                            if (audioSeen) {
+                                modelGenerating = true
+                                // Task B evidence: did the model speak *before* the result came, or
+                                // only alongside it? This mark is what the phone report needs.
+                                if (!firstAudioAfterToolCallMarked && toolCallCount > 0) {
+                                    firstAudioAfterToolCallMarked = true
+                                    searchTimeline.mark("first model audio after toolCall")
+                                }
+                                if (awaitingFirstAudioForResult) {
+                                    awaitingFirstAudioForResult = false
+                                    searchTimeline.mark("first audio of the announced result")
+                                }
+                                announceTracker.onAudio(System.currentTimeMillis())
                             }
                         }
                         if (serverContent.optBoolean("turnComplete", false)) {
                             onStatus("শুনছি… আপনি কথা বলতে পারেন")
+                            searchTimeline.mark("turn boundary (turnComplete)")
+                            modelGenerating = false
                             finishTurn(webSocket)
+                            // Task C: the model is idle — hand it the next pending result, one at a
+                            // time and in order. This is the whole point of WHEN_IDLE.
+                            deliverNextPendingResult("turnComplete")
                         }
                     }
 
@@ -809,7 +894,12 @@ class GeminiLiveVoice(
             "Last query: $lastToolQuery | Last search: $lastSearchOutcome | " +
             "Last search model: $lastSearchModel | ${searchBackend?.describe() ?: "Search models: none"} | " +
             "Mic sensitivity: ${micSensitivity.label} | Audio effects: ${audioEffectsSummary()} | " +
-            "build: $FIX_TAG" + "\n" + lastAutoTrace + "\n" + endDiagnostics()
+            "build: $FIX_TAG" + "\n" + lastAutoTrace +
+            "\nSearch timeline: " + searchTimeline.text() +
+            "\nPending results: " + (pendingResults.questions().ifEmpty { listOf("none") }.joinToString(" | ")) +
+            " | Announcement: " + announceTracker.describe(System.currentTimeMillis()) +
+            " | Reminder: $lastResultReminder" +
+            "\n" + endDiagnostics()
     }
 
     // -------------------------------------------------------------------------------------
@@ -876,30 +966,33 @@ class GeminiLiveVoice(
         searchRunner = SearchToolRunner(
             backend = backend,
             onResult = { call, answer, scheduling ->
-                // The result is always sent, success or failure: a silent call would leave the
-                // model waiting and the user without an answer.
-                // Never claim the result reached the model: the send is checked and reported.
-                val delivered = sendToolResponse(
-                    LiveToolProtocol.toolResponseJson(call.callId, answer.asToolResult(), scheduling)
+                // ---- 0.2.11 (task C) -------------------------------------------------------
+                // The answer is no longer handed to the model unconditionally and no longer only
+                // as a grown-up tool payload: it is (1) built with the user's own question, at most
+                // three plain sentences and the source name, (2) always written into the chat, and
+                // (3) sent to the 3.8 session with WHEN_IDLE — either now, if the model is idle, or
+                // through the pending queue, so an answer in progress is never cut off.
+                val now = System.currentTimeMillis()
+                val item = SearchResultItem(
+                    callId = call.callId,
+                    question = call.query.trim().ifBlank { lastToolQuery },
+                    answer = if (answer.isSuccess) SearchResultText.limitSentences(answer.text) else "",
+                    sourceName = answer.sources.firstOrNull()?.title.orEmpty(),
+                    success = answer.isSuccess,
+                    askedAtMillis = 0L,
+                    receivedAtMillis = now,
+                    orderIndex = searchOrder[call.callId] ?: 0L,
+                    askedBeforeResult = newerQuestionSinceToolCall || answersInProgressWhenResultArrived > 0
                 )
-                lastToolResponseDelivery = if (delivered) {
-                    "toolResponse sent (id=${call.callId.take(24)}, scheduling=$scheduling, " +
-                        "3.8 session open=true)"
-                } else {
-                    "toolResponse NOT sent — the 3.8 session was already closed " +
-                        "(close=$lastCloseCode ${lastCloseReason.take(40)})"
-                }
-                lastAutoTrace = (answer.trace.ifBlank { "Auto steps: none" }) +
-                    " -> " + lastToolResponseDelivery
-                if (!delivered) {
-                    runCatching {
-                        onSearchReport(
-                            "সার্চের ফল ৩.৮ সেশনে পাঠানো যায়নি — সেশন বন্ধ ছিল " +
-                                "(step=${answer.step.ifBlank { "toolResponse" }} | close=$lastCloseCode, " +
-                                "${lastCloseReason.take(60)}).\n${answer.failureReport()}"
-                        )
-                    }
-                }
+                // Task C5 safety net #1: the result is in the chat even if the voice never says it.
+                runCatching { onSearchReport(SearchResultText.chatLine(item)) }
+                // Task A: the second session's own steps (setup sent / socket open / setupComplete /
+                // question sent / first transcription / turnComplete, each with its own ms) come
+                // straight from the search session's trace.
+                searchTimeline.mark("search trace [${answer.trace.ifBlank { "none" }}]")
+                searchTimeline.mark(
+                    "search text received (ok=${answer.isSuccess}, ${answer.elapsedMillis}ms)"
+                )
                 lastSearchModel = answer.model.ifBlank { "unknown" } +
                     (if (answer.attempted.size > 1) " (tried ${answer.attempted.joinToString(">")})" else "") +
                     (if (answer.skipped.isNotEmpty()) " (skipped ${answer.skipped.joinToString(", ")})" else "")
@@ -916,14 +1009,97 @@ class GeminiLiveVoice(
                     if (answer.sources.isNotEmpty()) runCatching { onGrounding(answer.sources) }
                     runCatching { onStatus("সার্চ শেষ — ফল জানানো হচ্ছে") }
                 } else {
-                    // The technical reason is shown too: without it a user cannot tell a genuine
-                    // connection problem from an app fault, which is exactly what went wrong in 0.2.2.
                     runCatching { onStatus("সার্চ করা যায়নি — $lastSearchOutcome") }
-                    // 0.2.4: the same facts, in a place the user can actually select and copy.
+                    // 0.2.4 kept: the technical reason stays selectable and copyable.
                     runCatching { onSearchReport(answer.failureReport()) }
+                }
+                lastAutoTrace = (answer.trace.ifBlank { "Auto steps: none" })
+                if (modelGenerating) {
+                    // The model is mid-answer: wait for the turn boundary instead of interrupting.
+                    answersInProgressWhenResultArrived++
+                    pendingResults.enqueue(item)
+                    searchTimeline.mark("result queued (model busy, pending=${pendingResults.size})")
+                    lastToolResponseDelivery = "queued until idle (id=${call.callId.take(24)}, " +
+                        "pending=${pendingResults.size})"
+                } else {
+                    deliverResult(item, scheduling)
                 }
             },
             onEvent = { line -> runCatching { onStatus(line) } }
+        )
+    }
+
+    /**
+     * Sends one result to the 3.8 session with the scheduling value the caller chose (always
+     * `WHEN_IDLE` for search results, see [LiveToolProtocol.schedulingFor]) and arms the 8-second
+     * "did it actually get spoken?" reminder.
+     */
+    private fun deliverResult(item: SearchResultItem, scheduling: String) {
+        val sent = sendToolResponse(
+            LiveToolProtocol.toolResponseJson(item.callId, SearchResultText.toolResponse(item), scheduling)
+        )
+        val now = System.currentTimeMillis()
+        lastToolResponseDelivery = if (sent) {
+            "toolResponse sent (id=${item.callId.take(24)}, scheduling=$scheduling, " +
+                "askedBeforeResult=${item.askedBeforeResult}, 3.8 session open=true)"
+        } else {
+            "toolResponse NOT sent — the 3.8 session was already closed " +
+                "(close=$lastCloseCode ${lastCloseReason.take(40)})"
+        }
+        searchTimeline.mark("toolResponse sent (scheduling=$scheduling, sent=$sent)")
+        if (!sent) {
+            runCatching {
+                onSearchReport(
+                    "সার্চের ফল ৩.৮ সেশনে পাঠানো যায়নি — সেশন বন্ধ ছিল " +
+                        "(close=$lastCloseCode, ${lastCloseReason.take(60)})."
+                )
+            }
+            return
+        }
+        currentResultCallId = item.callId
+        awaitingFirstAudioForResult = true
+        announceTracker.onResultSent(item.callId, now)
+        // Task C5 safety net #2: one check, 8 s later, on the existing session timer. No new thread.
+        runCatching {
+            setupTimer.schedule({
+                runCatching { checkAnnouncementReminder(item.callId) }
+            }, IdleAnnouncementTracker.IDLE_AUDIO_GRACE_MILLIS, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    /**
+     * Called at every turn boundary (the model is idle). Hands over the oldest pending result, one
+     * per idle turn, so two searches are announced one after the other instead of on top of each
+     * other (task C4).
+     */
+    private fun deliverNextPendingResult(reason: String) {
+        if (modelGenerating) return
+        val next = pendingResults.poll() ?: return
+        searchTimeline.mark("delivering queued result at $reason (pending=${pendingResults.size})")
+        deliverResult(next, LiveToolProtocol.SCHEDULING_WHEN_IDLE)
+        if (pendingResults.size == 0) {
+            answersInProgressWhenResultArrived = 0
+            newerQuestionSinceToolCall = false
+        }
+    }
+
+    /**
+     * Task C5: the result was accepted but nothing was said. Recorded in diagnostics, and the model
+     * is nudged **at most once** — never a loop, never synthesised audio.
+     */
+    private fun checkAnnouncementReminder(callId: String) {
+        val now = System.currentTimeMillis()
+        if (!announceTracker.shouldRemind(now)) return
+        lastResultReminder = "no audio ${IdleAnnouncementTracker.IDLE_AUDIO_GRACE_MILLIS}ms after " +
+            "toolResponse id=${callId.take(24)} — one reminder sent"
+        searchTimeline.mark("8s with no audio after the result — one reminder")
+        sendToolResponse(
+            LiveToolProtocol.toolResponseJson(
+                callId = callId,
+                result = "The search answer above has not been spoken yet. Say it now, briefly, in the " +
+                    "user's language, and name the source.",
+                scheduling = LiveToolProtocol.SCHEDULING_WHEN_IDLE
+            )
         )
     }
 

@@ -335,12 +335,14 @@ class AutoSearchFlowTest {
 
         assertEquals("abc123", response["id"])
         assertEquals("search_web", response["name"])
-        assertEquals("INTERRUPT", response["scheduling"])
+        // 0.2.11: WHEN_IDLE, so a result that arrives while the model is answering waits its
+        // turn instead of interrupting. Documented enum values: SILENT / WHEN_IDLE / INTERRUPT.
+        assertEquals("WHEN_IDLE", response["scheduling"])
         assertNotNull(response["response"])
-        // Documented enum values: SILENT / WHEN_IDLE / INTERRUPT
         assertTrue(
             setOf("SILENT", "WHEN_IDLE", "INTERRUPT")
                 .contains(LiveToolProtocol.schedulingFor("x"))
         )
+        assertEquals("WHEN_IDLE", LiveToolProtocol.schedulingFor("x"))
     }
 }

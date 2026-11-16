@@ -90,10 +90,13 @@ class SearchToolRunner(
             job.cancel()                     // never started, so nothing ran
             if (refusal == Refusal.OVER_CAPACITY) {
                 onEvent("একসাথে বেশি সার্চ — অপেক্ষা করতে বলা হচ্ছে")
+                // 0.2.11: a refusal is still a result. It goes through the same path as a real one
+                // (chat message + WHEN_IDLE) so a busy search can neither interrupt the answer in
+                // progress nor vanish silently.
                 deliver(
                     call,
                     GroundedAnswer(query = call.query, text = "", failure = GroundedSearchFailure.BUSY),
-                    LiveToolProtocol.SCHEDULING_INTERRUPT
+                    LiveToolProtocol.SCHEDULING_WHEN_IDLE
                 )
             } else {
                 // A duplicate callId is answered once, by the run that already owns it.

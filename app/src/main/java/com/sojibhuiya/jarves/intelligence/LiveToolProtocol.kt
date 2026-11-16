@@ -82,7 +82,7 @@ object LiveToolProtocol {
     fun toolResponseJson(
         callId: String,
         result: String,
-        scheduling: String = SCHEDULING_INTERRUPT
+        scheduling: String = SCHEDULING_WHEN_IDLE
     ): String = MiniJson.encode(
         linkedMapOf<String, Any?>(
             "toolResponse" to linkedMapOf<String, Any?>(
@@ -90,7 +90,15 @@ object LiveToolProtocol {
                     linkedMapOf<String, Any?>(
                         "id" to callId,
                         "name" to LiveSessionConfig.FUNCTION_SEARCH_WEB,
-                        "response" to linkedMapOf<String, Any?>("result" to result),
+                        // The API reference types `scheduling` as a field of FunctionResponse
+                        // (https://ai.google.dev/api/generate-content#FunctionResponse), so it is
+                        // sent there. The live-tools guide's own snippet shows it *inside* the
+                        // `response` object, so the same value is repeated there: whichever shape
+                        // the server reads, it reads the value we chose.
+                        "response" to linkedMapOf<String, Any?>(
+                            "result" to result,
+                            "scheduling" to scheduling
+                        ),
                         "scheduling" to scheduling
                     )
                 )
@@ -99,24 +107,34 @@ object LiveToolProtocol {
     )
 
     /**
-     * `INTERRUPT` for a short result the user is waiting for; `WHEN_IDLE` for a long one, so a
-     * multi-paragraph answer does not interrupt a sentence mid-sentence.
-     */
-    /**
-     * Which `FunctionResponse.scheduling` to use for a search result.
+     * Which `FunctionResponse.scheduling` to use for a search result: **always `WHEN_IDLE`**.
      *
-     * Docs (https://ai.google.dev/gemini-api/docs/live-tools → "Asynchronous function calling",
-     * "supported on `gemini-3.8-live`"):
-     *  * `INTERRUPT` — "Interrupt what it's doing and tell you about the response it got right away";
-     *  * `WHEN_IDLE` — "Wait until it's finished with what it's currently doing";
-     *  * `SILENT` — "do nothing and use that knowledge later on in the discussion".
+     * 0.2.10 and earlier used `INTERRUPT` for results shorter than `LONG_RESULT_CHARS`, which is
+     * exactly the 0.2.11 phone report: the user asked Q1 (search), then Q2 before the result came;
+     * when Q1's result arrived it interrupted Q2's answer and Q2 was lost.
      *
-     * A short search answer is what the user is waiting for and the model has already said
-     * "দেখে নিচ্ছি", so it is announced immediately (INTERRUPT). A long result must not cut off what
-     * the model is currently saying, so it waits (WHEN_IDLE).
+     * What the docs say (`FunctionResponse.scheduling`,
+     * https://ai.google.dev/api/generate-content#FunctionResponse):
+     *  * "Only applicable to NON_BLOCKING function calls, is ignored otherwise. **Defaults to
+     *    WHEN_IDLE**."
+     *  * `SILENT` — "Only add the result to the conversation context, do not interrupt or trigger
+     *    generation."
+     *  * `WHEN_IDLE` — "Add the result to the conversation context, and prompt to generate output
+     *    **without interrupting ongoing generation**."
+     *  * `INTERRUPT` — "Add the result to the conversation context, **interrupt ongoing
+     *    generation** and prompt to generate output."
+     *
+     * and the guide (https://ai.google.dev/gemini-api/docs/live-tools → "Asynchronous function
+     * calling", supported on `gemini-3.8-live`): `INTERRUPT` = "Interrupt what it's doing and tell
+     * you about the response it got right away", `WHEN_IDLE` = "Wait until it's finished with
+     * what it's currently doing".
+     *
+     * So `WHEN_IDLE` is the documented value that waits for the current output to finish, which is
+     * precisely what the phone needs. There is no length threshold any more: the value is the same
+     * for every search result.
      */
     fun schedulingFor(result: String, longThresholdChars: Int = LONG_RESULT_CHARS): String =
-        if (result.length > longThresholdChars) SCHEDULING_WHEN_IDLE else SCHEDULING_INTERRUPT
+        SCHEDULING_WHEN_IDLE
 
     /** Upper bound on a query we are willing to send to the REST model. */
     const val MAX_QUERY_CHARS = 512
