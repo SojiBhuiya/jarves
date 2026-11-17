@@ -66,7 +66,8 @@ class GroundingTest {
         assertEquals(2, assessment.hostCount)
         assertTrue(assessment.isVerified)
         assertTrue(GroundingPolicy.guidanceFor(assessment)!!.contains("2 independent sources"))
-        assertEquals("Sources: thedailystar.net, en.wikipedia.org", GroundingPolicy.sourceSummary(assessment))
+        // 0.2.14 (task D): site names from the metadata, not hosts — see SearchAnswerRulesTest.
+        assertEquals("Sources: The Daily Star, Wikipedia", GroundingPolicy.sourceSummary(assessment))
     }
 
     @Test

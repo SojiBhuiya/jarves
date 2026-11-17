@@ -434,7 +434,10 @@ private fun AgiApp() {
                 },
                 onTranscript = { text, isAssistant -> onTranscriptChunk(text, isAssistant) },
                 onGrounding = { sources ->
-                    pendingSources = sources.map { ChatSource(title = it.title, url = it.url) }
+                    // 0.2.14 (task D): the stored/rendered title is the real site name from the
+                    // grounding metadata; when the metadata only has a redirect wrapper the label
+                    // says so, instead of showing "google.com" for every publisher.
+                    pendingSources = sources.map { ChatSource(title = it.label, url = it.url) }
                 },
                 onSearchReport = { report -> scope.launch { appendSearchReport(report) } },
                 onError = { message ->

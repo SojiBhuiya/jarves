@@ -54,13 +54,24 @@ object GroundingPolicy {
         return GroundingAssessment(confidence, hosts.size, report.sources)
     }
 
-    /** "Sources: a.com, b.com" — used for the spoken citation and stored in chat history. */
+    /**
+     * "Sources: The Daily Star, Wikipedia" — the spoken citation and the stored chat line.
+     *
+     * 0.2.14 (task D): the **site name from the grounding metadata** is shown when there is one,
+     * because the URL is frequently a Google redirect wrapper; that case is marked
+     * `(redirect link)` instead of printing `google.com` as if it were the publisher.
+     * Corroboration counting still uses [GroundedSource.host], so confidence is unchanged.
+     */
     fun sourceSummary(assessment: GroundingAssessment): String? {
         if (assessment.sources.isEmpty()) return null
-        val hosts = assessment.sources.map { it.host }.filter { it.isNotEmpty() }.distinct()
-        if (hosts.isEmpty()) return null
-        return "Sources: " + hosts.joinToString(", ")
+        val names = assessment.sources.map { it.label }.filter { it.isNotEmpty() }.distinct()
+        if (names.isEmpty()) return null
+        return "Sources: " + names.joinToString(", ")
     }
+
+    /** Task D: true when *every* source is only a redirect wrapper. */
+    fun onlyRedirectLinks(assessment: GroundingAssessment): Boolean =
+        assessment.sources.isNotEmpty() && assessment.sources.all { it.isRedirect }
 
     /** Guidance handed to the model for this turn, or null when nothing needs saying. */
     fun guidanceFor(assessment: GroundingAssessment): String? = when (assessment.confidence) {

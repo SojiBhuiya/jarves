@@ -89,7 +89,15 @@ data class GroundedAnswer(
     /** 0.2.8: which step of the Auto search failed (empty when it succeeded). */
     val step: String = "",
     /** 0.2.8: the step-by-step trace with timings, shown in the Diagnostic block. */
-    val trace: String = ""
+    val trace: String = "",
+    /** 0.2.14 (task A): words in the transcribed answer, 0 when there is no answer. */
+    val answerWords: Int = 0,
+    /**
+     * 0.2.14 (task A): milliseconds between the first transcription chunk and
+     * `generationComplete` — the time the native-audio model spends speaking an answer whose audio
+     * is thrown away. 0 when the turn ended before/without `generationComplete`.
+     */
+    val transcriptToCompleteMillis: Long = 0L
 ) {
     /**
      * The report shown in the chat bubble when a search fails: what failed, the real HTTP status
@@ -121,6 +129,18 @@ data class GroundedAnswer(
                 .append("ms | total=").append(elapsedMillis).append("ms | chars=").append(textLength)
             if (closeCode != 0) append(" | close=").append(closeCode)
         }
+        if (answerWords > 0 || transcriptToCompleteMillis > 0L) {
+            append('\n').append(
+                SearchAnswerRules.metricsLine(
+                    totalMillis = elapsedMillis,
+                    connectMillis = connectMillis,
+                    firstTranscriptMillis = firstTranscriptMillis,
+                    transcriptToCompleteMillis = transcriptToCompleteMillis,
+                    words = answerWords,
+                    chars = textLength
+                )
+            )
+        }
         if (serverMessage.isBlank() && detail.isBlank()) {
             append('\n').append("Google: (no error text returned)")
         }
@@ -139,7 +159,9 @@ data class GroundedAnswer(
         else -> buildString {
             append(text)
             append("\n\nSources:")
-            sources.take(MAX_RESULT_SOURCES).forEach { append("\n- ").append(it.title).append(": ").append(it.url) }
+            // 0.2.14 (task D): the name handed to the voice model is the site name from the
+            // metadata ("The Daily Star"), never a grounding redirect wrapper.
+            sources.take(MAX_RESULT_SOURCES).forEach { append("\n- ").append(it.label).append(": ").append(it.url) }
             append("\n\nTell the user this briefly in their language and name the source you used.")
         }
     }

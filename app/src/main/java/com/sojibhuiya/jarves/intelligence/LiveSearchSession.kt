@@ -276,6 +276,16 @@ class LiveSearchSession(
             closeQuietly()
             val elapsed = since()
             val spoken = text.toString().trim()
+            // 0.2.14 (task A): the two numbers the phone measurement needed — how long the answer
+            // is, and how long the model spent between the first transcript and generationComplete
+            // (0.2.13 measured 8.6 s there for a ~30-word answer plus a source line).
+            val words = SearchAnswerRules.wordCount(spoken)
+            val transcriptToComplete =
+                if (firstTranscriptAt > 0L && finishedAt > firstTranscriptAt) finishedAt - firstTranscriptAt else 0L
+            steps += "answer $words words"
+            if (transcriptToComplete > 0L) {
+                steps += "transcript->complete ${formatSeconds(transcriptToComplete)}s"
+            }
             steps += "total ${elapsed}ms" + if (closeCode != 0) ", close $closeCode" else ""
 
             when {
@@ -290,7 +300,16 @@ class LiveSearchSession(
                     connectMillis = setupCompleteAt,
                     firstTranscriptMillis = firstTranscriptAt,
                     textLength = spoken.length,
-                    trace = traceLine(steps)
+                    answerWords = words,
+                    transcriptToCompleteMillis = transcriptToComplete,
+                    trace = traceLine(steps) + "\n" + SearchAnswerRules.metricsLine(
+                        totalMillis = elapsed,
+                        connectMillis = setupCompleteAt,
+                        firstTranscriptMillis = firstTranscriptAt,
+                        transcriptToCompleteMillis = transcriptToComplete,
+                        words = words,
+                        chars = spoken.length
+                    )
                 )
                 closeCode != 0 -> failure(
                     trimmed, failureFor(closeCode), SearchStep.CLOSED, closeCode,

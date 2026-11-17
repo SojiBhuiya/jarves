@@ -327,12 +327,9 @@ object LiveSessionConfig {
             "systemInstruction" to linkedMapOf<String, Any?>(
                 "parts" to listOf(
                     linkedMapOf<String, Any?>(
-                        "text" to (
-                            "You are a web search engine for a voice assistant. Use Google Search for " +
-                                "the question you are given. Answer in at most three short sentences, in " +
-                                "the language of the question, and state the source name. If you cannot " +
-                                "verify it, say so in one sentence. Never invent facts or links."
-                            )
+                        // 0.2.14 (task A): two short sentences, facts only, no spoken source line.
+                        // The site names come from groundingMetadata, not from the model's words.
+                        "text" to SearchAnswerRules.instruction()
                     )
                 )
             ),

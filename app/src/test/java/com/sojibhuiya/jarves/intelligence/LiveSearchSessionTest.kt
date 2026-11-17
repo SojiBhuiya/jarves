@@ -51,11 +51,44 @@ class LiveSearchSessionTest {
 
     private fun turnComplete(): String = """{"serverContent":{"turnComplete":true}}"""
 
+    private fun generationComplete(): String = """{"serverContent":{"generationComplete":true}}"""
+
     private val setupComplete = """{"setupComplete":{}}"""
 
     private fun grounding(): String =
         """{"serverContent":{"groundingMetadata":{"webSearchQueries":["weather dhaka"],""" +
             """"groundingChunks":[{"web":{"uri":"https://weather.example/dhaka","title":"Dhaka Weather"}}]}}}"""
+
+    // ---- 0.2.14 (task A): the two numbers the diagnostics now show -------------------
+
+    @Test
+    fun answerCarriesWordCountAndTranscriptToComplete() = runBlocking {
+        val transport = FakeTransport()
+        val session = LiveSearchSession(transport, timeoutMillis = 5_000)
+
+        val speaker = Thread {
+            Thread.sleep(20)
+            transport.server(setupComplete)
+            transport.server(transcript("ঢাকায় আজ ৩২ ডিগ্রি এবং রোদ।"))
+            Thread.sleep(40)
+            transport.server(generationComplete())
+        }
+        speaker.start()
+
+        val answer = session.search("আজ ঢাকার আবহাওয়া কেমন?")
+        speaker.join()
+
+        assertTrue("the answer must succeed", answer.isSuccess)
+        assertEquals(6, answer.answerWords)
+        assertTrue(
+            "transcript->complete must be measured, was ${answer.transcriptToCompleteMillis}ms",
+            answer.transcriptToCompleteMillis >= 20L
+        )
+        assertTrue(answer.trace, answer.trace.contains("answer 6 words"))
+        assertTrue(answer.trace, answer.trace.contains("transcript->complete"))
+        assertTrue(answer.trace, answer.trace.contains("Search metrics: total="))
+        assertFalse("no epoch/scientific numbers", answer.trace.contains("E7"))
+    }
 
     // ---- the happy path -------------------------------------------------------------
 
