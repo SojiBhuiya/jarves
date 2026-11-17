@@ -963,7 +963,7 @@ class GeminiLiveVoice(
             //  * whatever is injected is SILENT context (turnComplete = false, rule 4), so it informs
             //    the next turn instead of starting one;
             //  * a real failure is announced once, from the toolResponse (rule 2).
-            val searchPending = searchRunner != null || pendingResults.isNotEmpty()
+            val searchPending = searchRunner != null || pendingResults.size > 0
             val searchedThisTurn = toolCallCount > toolCallsAtTurnStart
             val allowed = NoticePolicy.shouldInject(
                 needsLiveSources = needsLiveSources,
