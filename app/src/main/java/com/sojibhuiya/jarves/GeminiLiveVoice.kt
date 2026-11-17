@@ -22,7 +22,12 @@ import java.util.concurrent.atomic.AtomicLong
 import com.sojibhuiya.jarves.intelligence.FreshnessClassifier
 import com.sojibhuiya.jarves.intelligence.GroundedSource
 import com.sojibhuiya.jarves.intelligence.GroundingParser
+import com.sojibhuiya.jarves.intelligence.CloseAlreadyConnected
+import com.sojibhuiya.jarves.intelligence.InterruptionLog
 import com.sojibhuiya.jarves.intelligence.LiveFailureRouter
+import com.sojibhuiya.jarves.intelligence.LivePingSetting
+import com.sojibhuiya.jarves.intelligence.ServerBusyRetry
+import com.sojibhuiya.jarves.intelligence.formatSeconds
 import com.sojibhuiya.jarves.intelligence.LiveSearchTool
 import com.sojibhuiya.jarves.intelligence.LiveModels
 import com.sojibhuiya.jarves.intelligence.SessionEndReport
@@ -120,7 +125,15 @@ class GeminiLiveVoice(
      * 0.2.10: the Service / notification / battery-optimisation / Data-Saver line. Supplied by the
      * Android layer; the default keeps the engine JVM-only.
      */
-    systemDiagnostics: () -> String = { "unknown (no Android context)" }
+    systemDiagnostics: () -> String = { "unknown (no Android context)" },
+    /**
+     * 0.2.13 (task 3): EXPERIMENT, off by default (0). When set to 15 or 20, OkHttp sends a
+     * WebSocket ping every that many seconds, which is the documented way to notice a half-open
+     * connection (OkHttp `pingInterval`). The Live docs say nothing about ping frames, RFC 6455
+     * §5.5.2 says a peer MUST answer a ping with a pong, and the real Gemini behaviour is NOT-RUN,
+     * so this stays behind a hidden setting.
+     */
+    private val pingIntervalSeconds: Int = 0
 ) {
     companion object {
         /**
@@ -130,6 +143,13 @@ class GeminiLiveVoice(
          */
         /** Auto mode: one search per user question, as the 0.2.7 spec requires. */
         const val MAX_SEARCHES_PER_QUESTION = 1
+
+        /**
+         * 0.2.13 (task 2): "do not queue more than a few seconds of audio". Input is 16 kHz mono
+         * PCM16 = 32 000 bytes/s, so 64 000 bytes is two seconds. Above this the queue is treated as
+         * backpressure and the socket is reconnected instead of buffering more.
+         */
+        const val MAX_SEND_QUEUE_BYTES = 64_000L
 
         /**
          * 0.2.9: a connection that stayed up this long resets the automatic-reconnect budget, so a
@@ -167,7 +187,7 @@ class GeminiLiveVoice(
             "\u09b8\u0982\u09af\u09c1\u0995\u09cd\u09a4\u0964 \u098f\u0996\u09a8 \u0995\u09a5\u09be \u09ac\u09b2\u09c1\u09a8 (\u09b2\u09be\u0987\u09ad \u09b8\u09be\u09b0\u09cd\u099a \u099b\u09be\u09a1\u09bc\u09be \u2014 \u09b2\u09be\u0987\u09ad \u09a4\u09a5\u09cd\u09af \u09af\u09be\u099a\u09be\u0987 \u0995\u09b0\u09be \u09af\u09be\u09ac\u09c7 \u09a8\u09be)"
 
         /** Identifies this build in the on-device diagnostic block. */
-        const val FIX_TAG = "0.2.12-a2a3a4-b1d1d2b7"
+        const val FIX_TAG = "0.2.13-reconnect-1008"
 
         /**
          * The mode/model/tool/close line of the diagnostic block. Pure and public so it is
@@ -235,6 +255,20 @@ class GeminiLiveVoice(
     private val failureRouter = LiveFailureRouter()
     /** The last frame that was skipped because it could not be parsed (diagnostics only). */
     @Volatile private var lastSkippedFrame = "none"
+
+    // ---- 0.2.13 (tasks 3 and 4): evidence for a send failure, and interruption timing ----
+    /** When the last frame arrived from the server — "how long has this socket been silent?". */
+    @Volatile private var lastServerMessageAtMillis: Long = 0L
+    /** When `send()` last returned true. */
+    @Volatile private var lastSendOkAtMillis: Long = 0L
+    /** Number of `send()` calls that returned false (or hit the backlog limit) on this session. */
+    @Volatile private var sendFailureCount: Int = 0
+    /** One line per send failure: queue size, silence, last good send, network, foreground. */
+    @Volatile private var lastSendFailureEvidence: String = "none"
+    /** Network type at the previous send, so a change can be shown. */
+    @Volatile private var lastSendNetworkType: String = "unknown"
+    /** 0.2.13 (task 4): how many interruptions, and how long each lasted. */
+    private val interruptions = InterruptionLog()
 
     // ---- Real-time intelligence state
     /** Whether the setup message asked for Google Search grounding. */
@@ -338,6 +372,10 @@ class GeminiLiveVoice(
     @Volatile private var setupTimeout: ScheduledFuture<*>? = null
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
+        // 0.2.13 (task 3): only when the hidden experiment is switched on. `pingInterval` makes
+        // OkHttp fail the socket when the peer stops answering pings, which is exactly the
+        // half-open case that produced AUDIO_SEND_FAILED on a connection the server still had open.
+        .apply { if (pingIntervalSeconds > 0) pingInterval(pingIntervalSeconds.toLong(), TimeUnit.SECONDS) }
         .build()
 
     /**
@@ -430,6 +468,16 @@ class GeminiLiveVoice(
         }
         if (!running.compareAndSet(false, true)) return
         failureRouter.onSessionStarted()
+        // 0.2.13 (task 4): the diagnostics timeline is relative to this instant, and the
+        // interruption counter starts from zero for every session.
+        val now = System.currentTimeMillis()
+        interruptions.onSessionStarted(now)
+        reconnectPlan.startTimeline(now)
+        lastServerMessageAtMillis = 0L
+        lastSendOkAtMillis = 0L
+        sendFailureCount = 0
+        lastSendFailureEvidence = "none"
+        lastSendNetworkType = "unknown"
         terminalErrorReported.set(false)
         setupDone.set(false)
         setupCompleteReceived = false
@@ -553,6 +601,7 @@ class GeminiLiveVoice(
                     return
                 }
                 setupMessageSent = true
+                lastSendOkAtMillis = System.currentTimeMillis()
                 setupDeclaredTool = when (searchToolMode) {
                     LiveSearchTool.NONE -> "none"
                     LiveSearchTool.GOOGLE_SEARCH_BUILT_IN -> "googleSearch(built-in)"
@@ -578,6 +627,9 @@ class GeminiLiveVoice(
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 if (socket !== webSocket) return
+                // 0.2.13 (task 3): "how long has this socket been silent?" — the cheapest half-open
+                // detector available without an experiment.
+                lastServerMessageAtMillis = System.currentTimeMillis()
                 try {
                     val root = JSONObject(text)
                     serverMessageCount += 1
@@ -630,6 +682,8 @@ class GeminiLiveVoice(
                         setupTimeout?.cancel(false)
                         setupTimeout = null
                         failureRouter.onReconnectSucceeded()
+                        // 0.2.13 (task 4): the session runs again — close the interruption record.
+                        interruptions.end(System.currentTimeMillis())
                         startAudioPlayback()
                         startAudioCapture()
                         // 0.2.10: after an automatic reconnect the user is told plainly what
@@ -808,6 +862,10 @@ class GeminiLiveVoice(
                 if (socket !== webSocket) return
                 closeCallback = "onClosing"
                 setupTimeout?.cancel(false)
+                // 0.2.13 (task 2): `1008 … already connected to an existing client` is transient —
+                // the server has not let go of the previous connection yet. It gets its own calm,
+                // slower schedule instead of the network retry budget.
+                if (tryServerBusyRetry(code, reason)) return
                 // THE FIX. OkHttp calls onClosed only after BOTH peers have closed, so a
                 // server-initiated close (which is what Gemini sends) never reaches a handler that
                 // lives on onClosed alone. Decide here instead: the flow echoes the close once and
@@ -829,6 +887,9 @@ class GeminiLiveVoice(
                 if (socket !== webSocket) return
                 closeCallback = "onClosed"
                 setupTimeout?.cancel(false)
+                // 0.2.13 (task 2): same transient 1008 handling as onClosing (the one-time guard in
+                // the close flow makes the second call a no-op).
+                if (tryServerBusyRetry(code, reason)) return
                 // Same handler as onClosing. The one-time guard makes the second call a no-op, so a
                 // close is never decided twice and never retried twice.
                 if (LiveRejection.isNonBlockingRejection(reason) && !setupCompleteReceived) {
@@ -918,6 +979,9 @@ class GeminiLiveVoice(
             "Setup tools: $setupDeclaredTool | toolCalls: $toolCallCount | " +
             "Skipped frames: ${failureRouter.skippedFrames} (last: $lastSkippedFrame) | " +
             failureRouter.describe() + " | " +
+            "Send failures: $sendFailureCount (last: $lastSendFailureEvidence) | " +
+            "Ping: ${LivePingSetting.describe(pingIntervalSeconds)} | " +
+            "Server busy: ${reconnectPlan.serverBusy.describe(System.currentTimeMillis())} | " +
             diagnosticsFor(activeMode, searchToolMode, lastCloseCode, lastCloseReason) + " | " +
             "Last query: $lastToolQuery | Last search: $lastSearchOutcome | " +
             "Last search model: $lastSearchModel | ${searchBackend?.describe() ?: "Search models: none"} | " +
@@ -954,6 +1018,7 @@ class GeminiLiveVoice(
         reconnectCause = lastReconnectCause
     ) + "\nReconnect: " + lastReconnectNote +
         "\nReconnect timeline: " + reconnectPlan.timelineText() +
+        "\n" + interruptions.line(System.currentTimeMillis()) +
         "\nSystem: " + runCatching { systemLine() }.getOrDefault("unknown (line failed)")
 
     /**
@@ -1271,6 +1336,84 @@ class GeminiLiveVoice(
      * @return true when this end was handled (reconnect scheduled, or waiting for the network, or
      *   "gave up" shown), i.e. the caller must not also report a failure.
      */
+    /**
+     * 0.2.13 (task 3): one line of measured evidence for a failed (or alarming) audio send.
+     *
+     * Nothing here is guessed: every value comes from OkHttp or from the system reader. It answers
+     * "why did `send()` fail on a socket the server still saw as connected?" — a half-open
+     * connection shows up as a large silence, a stale last-send time and often a network change.
+     */
+    private fun evidence(socketSendOk: Boolean, backlogBytes: Long, reason: String): String {
+        val now = System.currentTimeMillis()
+        val silentFor = if (lastServerMessageAtMillis <= 0L) -1L else now - lastServerMessageAtMillis
+        val sinceGoodSend = if (lastSendOkAtMillis <= 0L) -1L else now - lastSendOkAtMillis
+        val network = runCatching { netMonitor.snapshot() }.getOrDefault(NetworkSnapshot.UNKNOWN)
+        val networkChanged = network.type != lastSendNetworkType
+        val env = runCatching { envProvider.snapshot() }.getOrDefault(SessionEnvironment.UNKNOWN)
+        val foreground = when (env.appVisible) {
+            true -> "foreground"
+            false -> "background"
+            null -> "unknown"
+        }
+        val screen = when (env.screenInteractive) {
+            true -> "screen on"
+            false -> "screen off"
+            null -> "screen unknown"
+        }
+        lastSendNetworkType = network.type
+        return "send=" + (if (socketSendOk) "ok" else "false") +
+            ", queueSize=" + (if (backlogBytes < 0L) "unknown" else "${backlogBytes}B") +
+            ", sinceLastServerMessage=" + (if (silentFor < 0L) "none yet" else humanMillis(silentFor)) +
+            ", sinceLastGoodSend=" + (if (sinceGoodSend < 0L) "none yet" else humanMillis(sinceGoodSend)) +
+            ", network=${network.type}" + (if (networkChanged) " (CHANGED)" else "") +
+            ", app=$foreground ($screen)" +
+            ", reason=$reason"
+    }
+
+    /** `12.8s` — used inside the evidence line. */
+    private fun humanMillis(millis: Long): String = formatSeconds(millis) + "s"
+
+    /**
+     * 0.2.13 (task 2): `1008 "…already connected to an existing client"` is transient. It does not
+     * touch the three normal attempts; it waits 3 s, 5 s, 8 s, 12 s (about 30 s in total) and then
+     * ends the session cleanly. The status stays calm and the microphone keeps running, because the
+     * user is still talking — only the audio frames are dropped while the socket handshakes.
+     *
+     * @return true when the condition was recognised and handled (the caller must not also report a
+     *   failure); false when this is an ordinary close and the normal path applies.
+     */
+    private fun tryServerBusyRetry(code: Int, reason: String): Boolean {
+        if (!CloseAlreadyConnected.matches(code, reason)) return false
+        if (!running.get() || closeInitiator.intentional) return false
+        if (terminalErrorReported.get()) return false
+        interruptions.begin(System.currentTimeMillis(), CloseAlreadyConnected.describe(code, reason))
+        val action = reconnectPlan.onServerBusy(System.currentTimeMillis())
+        lastReconnectNote = "server busy (${CloseAlreadyConnected.describe(code, reason)}) -> " +
+            when (action) {
+                is ReconnectAction.RetryServerBusy -> "retry #${action.attempt} in ${action.delayMillis}ms"
+                is ReconnectAction.GiveUp -> "gave up"
+                else -> action.toString()
+            }
+        return when (action) {
+            is ReconnectAction.RetryServerBusy -> {
+                scheduleReconnect(
+                    ReconnectCause.SERVER_BUSY,
+                    code,
+                    reason,
+                    action.delayMillis,
+                    attempt = 0,
+                    statusOverride = ServerBusyRetry.STATUS_FIXING_CONNECTION
+                )
+                true
+            }
+            is ReconnectAction.GiveUp -> {
+                giveUpAfterReconnects(code, reason, action.message)
+                true
+            }
+            else -> false
+        }
+    }
+
     private fun tryAutomaticReconnect(cause: ReconnectCause, code: Int, reason: String): Boolean {
         // The intentional-close gate is the same one ReconnectPolicy uses and is unit-tested:
         // the user pressed stop, the lifecycle ended, a new chat started, the provider was turned
@@ -1289,6 +1432,8 @@ class GeminiLiveVoice(
         if (reconnectScheduled) return true
 
         val now = System.currentTimeMillis()
+        // 0.2.13 (task 4): the clock starts when the socket stops working and stops on setupComplete.
+        interruptions.begin(now, cause.name)
         lastReconnectCause = cause
         // A connection that stayed healthy for a minute resets the budget, so a long conversation
         // survives the ~10-minute connection lifetime the docs describe.
@@ -1323,6 +1468,21 @@ class GeminiLiveVoice(
                 true
             }
 
+            // 0.2.13: the busy schedule is produced by tryServerBusyRetry(), which schedules its own
+            // reconnect. This branch only keeps the `when` exhaustive; reaching it here would mean
+            // the policy returned a busy retry for a normal failure, handled the same way.
+            is ReconnectAction.RetryServerBusy -> {
+                scheduleReconnect(
+                    cause,
+                    code,
+                    reason,
+                    action.delayMillis,
+                    attempt = 0,
+                    statusOverride = ServerBusyRetry.STATUS_FIXING_CONNECTION
+                )
+                true
+            }
+
             is ReconnectAction.GiveUp -> {
                 giveUpAfterReconnects(code, reason, action.message)
                 true
@@ -1351,7 +1511,9 @@ class GeminiLiveVoice(
         code: Int,
         reason: String,
         delay: Long,
-        attempt: Int
+        attempt: Int,
+        /** 0.2.13: a caller-supplied calm line (used by the server-busy path). */
+        statusOverride: String? = null
     ) {
         reconnectScheduled = true
         failureRouter.onReconnectScheduled()
@@ -1363,8 +1525,11 @@ class GeminiLiveVoice(
             "reason=${reason.take(40)}, handle=$handleState, network=${netMonitor.snapshot().type})"
         // One short, non-alarming line. No error bubble, no "session ended".
         onStatus(
-            if (attempt > 0) "সংযোগ আবার জোড়া লাগছে… ($attempt/${ReconnectCoordinator.MAX_ATTEMPTS_DISPLAY})"
-            else "নতুন নেটওয়ার্ক — আবার যুক্ত হচ্ছি…"
+            statusOverride ?: if (attempt > 0) {
+                "সংযোগ আবার জোড়া লাগছে… ($attempt/${ReconnectCoordinator.MAX_ATTEMPTS_DISPLAY})"
+            } else {
+                "নতুন নেটওয়ার্ক — আবার যুক্ত হচ্ছি…"
+            }
         )
         runCatching {
             setupTimer.schedule({
@@ -1390,11 +1555,23 @@ class GeminiLiveVoice(
      */
     private fun openSocketForReconnect(attempt: Int = 0, hasHandle: Boolean = true) {
         val old = socket
+        // Detach first: from this instant the capture loop and every callback see `socket == null`
+        // (or the new socket), so no audio and no toolResponse can reach the old connection.
         socket = null
+        // 0.2.13 (task 1, the likely cause of the 1008 "already connected" loop): `close()` only
+        // *starts* a graceful shutdown and waits for the peer's close frame. On a half-open
+        // connection that answer never comes, so the old TCP connection — and with it the server's
+        // session attachment — outlived us, and the resume handshake on the new socket was refused.
+        // OkHttp documents the alternative: "Immediately and violently release resources held by
+        // this web socket, discarding any enqueued messages" (`WebSocket.cancel()`). So: a
+        // best-effort polite close first (the server sees an orderly 1000 and can clean up), then
+        // cancel() to guarantee the reader/writer and the TCP connection are gone before the new
+        // socket is opened.
         runCatching {
             closeInitiator = CloseInitiator.RECONNECT
             old?.close(1000, "reconnecting")
         }
+        runCatching { old?.cancel() }
         closeInitiator = CloseInitiator.NONE
         setupDone.set(false)
         // Remembered so setupComplete can say the right thing: with a handle the conversation
@@ -1523,7 +1700,40 @@ class GeminiLiveVoice(
                         if (activeSocket == null || !setupDone.get()) {
                             if (running.get()) continue else break
                         }
-                        if (!activeSocket!!.send(message.toString())) {
+                        // 0.2.13 (task 1): `socket` may have been swapped between the read above and
+                        // this line. Sending the chunk to the *previous* connection would be audio on
+                        // a socket we just cancelled, so the chunk is dropped instead.
+                        if (activeSocket !== socket || !running.get()) continue
+                        // 0.2.13 (task 2): never let a stalled connection accumulate audio. The
+                        // documented way to see the backlog is queueSize() ("Use queueSize to monitor
+                        // backpressure before sending"); above a couple of seconds of PCM the
+                        // reconnect is started instead of piling more frames into the queue.
+                        val backlog = runCatching { activeSocket.queueSize() }.getOrDefault(0L)
+                        if (backlog > MAX_SEND_QUEUE_BYTES) {
+                            if (reconnectScheduled || !running.get()) continue
+                            lastSendFailureEvidence = evidence(
+                                socketSendOk = true, backlogBytes = backlog, reason = "queue too large"
+                            )
+                            sendFailureCount += 1
+                            val handledBacklog = tryAutomaticReconnect(
+                                ReconnectCause.AUDIO_SEND_FAILED, 0, "send queue backlog ${backlog}B"
+                            )
+                            if (handledBacklog) continue
+                            fail("অডিও পাঠানোর queue বেড়েই চলছে (${backlog}B)। সংযোগ বন্ধ করছি।")
+                            break
+                        }
+                        if (!activeSocket.send(message.toString())) {
+                            // 0.2.13 (task 3): record *why* a send failed while the server still
+                            // thought the connection was alive. Everything below is measured, never
+                            // guessed: the send return value, OkHttp's own queue size, how long the
+                            // socket has been silent, when the last send worked, the network type and
+                            // whether it changed, and whether the app was in the foreground.
+                            sendFailureCount += 1
+                            lastSendFailureEvidence = evidence(
+                                socketSendOk = false,
+                                backlogBytes = runCatching { activeSocket.queueSize() }.getOrDefault(-1L),
+                                reason = "send() returned false"
+                            )
                             // 0.2.10 FIX for the phone report: this used to call fail(), which is
                             // terminal and set running=false - so the reconnect path saw a stopped
                             // engine and the resume handle was never used ("airplane mode on/off").
@@ -1539,6 +1749,7 @@ class GeminiLiveVoice(
                             fail("মাইক্রোফোন অডিও WebSocket-এ পাঠানো যায়নি। পাঠানো chunk: ${audioChunksSent.get()}")
                             break
                         }
+                        lastSendOkAtMillis = System.currentTimeMillis()
                         val chunks = audioChunksSent.incrementAndGet()
                         audioBytesSent.addAndGet(count.toLong())
                         if (chunks == 1L) onStatus("প্রথম microphone audio chunk পাঠানো হয়েছে")

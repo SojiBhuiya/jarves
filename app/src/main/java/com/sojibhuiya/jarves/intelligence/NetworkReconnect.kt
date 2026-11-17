@@ -62,6 +62,13 @@ sealed interface ReconnectAction {
     /** Open a new socket after [delayMillis], using the stored resume handle. */
     data class Attempt(val attempt: Int, val delayMillis: Long) : ReconnectAction
 
+    /**
+     * 0.2.13: the server refused the new connection with `1008 "…already connected to an existing
+     * client"`. Nothing is wrong with the network, so this has its own schedule and does **not**
+     * spend one of the [maxAttempts] normal attempts.
+     */
+    data class RetryServerBusy(val attempt: Int, val delayMillis: Long) : ReconnectAction
+
     /** Nothing to do (the user stopped, or the session is not running). */
     data object None : ReconnectAction
 
@@ -74,7 +81,13 @@ enum class GiveUpReason {
     ATTEMPTS_EXHAUSTED,
 
     /** The network never came back within the deadline. */
-    NO_NETWORK_TIMEOUT
+    NO_NETWORK_TIMEOUT,
+
+    /**
+     * 0.2.13: the server kept answering `1008 "already connected to an existing client"` for the
+     * whole server-busy budget (~30 s), so the session is ended cleanly instead of waiting forever.
+     */
+    SERVER_BUSY_TIMEOUT
 }
 
 /**
@@ -102,6 +115,15 @@ class ReconnectCoordinator(
 
     private val events = mutableListOf<String>()
 
+    /**
+     * 0.2.13 (task 4): every timeline entry is printed as `t+12.8s` relative to this moment, never
+     * as an epoch value. Set by [startTimeline] when a session starts.
+     */
+    private var sessionStartMillis: Long = 0L
+
+    /** 0.2.13: the 1008 "already connected" schedule (3 s, 5 s, 8 s, 12 s, ~30 s in total). */
+    val serverBusy: ServerBusyRetry = ServerBusyRetry()
+
     var attemptsUsed: Int = 0
         private set
 
@@ -123,6 +145,15 @@ class ReconnectCoordinator(
     fun timelineText(): String =
         if (events.isEmpty()) "none" else events.joinToString(" -> ")
 
+    /** 0.2.13 (task 4): timestamps below are relative to this instant. */
+    fun startTimeline(now: Long) {
+        sessionStartMillis = now
+        events.clear()
+    }
+
+    /** `t+12.8s` for the current call. */
+    private fun stamp(now: Long): String = formatRelativeMillis(now, sessionStartMillis)
+
     /** Resets everything for a brand-new session (the user started talking again). */
     fun reset() {
         attemptsUsed = 0
@@ -130,6 +161,7 @@ class ReconnectCoordinator(
         gaveUp = false
         giveUpReason = null
         lastAttemptAtMillis = 0L
+        serverBusy.reset()
         events.clear()
     }
 
@@ -204,7 +236,26 @@ class ReconnectCoordinator(
     fun onAttemptSucceeded(now: Long) {
         attemptsUsed = 0
         waitingForNetwork = false
+        // The session runs again: a later 1008 episode starts its schedule from 3 s again.
+        if (serverBusy.active) events += "${event(now)} server-busy cleared (${serverBusy.describe(now)})"
+        serverBusy.reset()
         events += "${event(now)} reconnected"
+    }
+
+    /**
+     * 0.2.13: the server refused the new socket with `1008 "…already connected to an existing
+     * client"`. Returns [ReconnectAction.RetryServerBusy] on its own schedule (3 s, 5 s, 8 s, 12 s)
+     * or [ReconnectAction.GiveUp] once the ~30 s budget is spent. [attemptsUsed] is untouched.
+     */
+    fun onServerBusy(now: Long): ReconnectAction {
+        if (gaveUp) return ReconnectAction.None
+        val delay = serverBusy.nextDelayMillis(now)
+        if (delay == null) {
+            events += "${event(now)} server still busy after ${serverBusy.describe(now)}"
+            return giveUp(now, GiveUpReason.SERVER_BUSY_TIMEOUT)
+        }
+        events += "${event(now)} server busy -> retry in ${delay}ms (${serverBusy.describe(now)})"
+        return ReconnectAction.RetryServerBusy(attempt = serverBusy.attemptsUsed, delayMillis = delay)
     }
 
     /** The socket that the reconnect opened failed too. */
@@ -240,7 +291,8 @@ class ReconnectCoordinator(
         return ReconnectAction.GiveUp(reason, messageFor(reason))
     }
 
-    private fun event(now: Long): String = "${now / 1000.0}s"
+    /** 0.2.13 (task 4): `t+12.8s` instead of an epoch value like `1.7E7s`. */
+    private fun event(now: Long): String = stamp(now)
 
     companion object {
 
@@ -260,6 +312,9 @@ class ReconnectCoordinator(
                 "প্রায় ২ মিনিট ধরে ইন্টারনেট নেই, তাই সংযোগ বন্ধ করছি। ইন্টারনেট চালু করে আবার শুরু করুন।"
             GiveUpReason.ATTEMPTS_EXHAUSTED ->
                 "ইন্টারনেট ঠিক আছে, কিন্তু ৩ বার চেষ্টা করেও সংযোগ হয়নি। একটু পরে আবার শুরু করুন।"
+            GiveUpReason.SERVER_BUSY_TIMEOUT ->
+                "সার্ভার এখনো পুরোনো সংযোগটা ছাড়েনি, তাই প্রায় ৩০ সেকেন্ড চেষ্টার পর বন্ধ করছি। " +
+                    "আবার শুরু করুন — সাধারণত সাথে সাথে যুক্ত হয়ে যায়।"
         }
 
         /** Diagnostics wording for the network line, including *why* it is unknown. */

@@ -30,7 +30,14 @@ enum class ReconnectCause {
      * kills the recorder when the network drops, so this is the same failure one step earlier and
      * takes the same reconnect path — the 0.2.10 fix covered only the send side.
      */
-    AUDIO_READ_FAILED
+    AUDIO_READ_FAILED,
+
+    /**
+     * 0.2.13: the server refused the new socket with `1008 "…already connected to an existing
+     * client"`. Transient by nature (the old connection has to be torn down by the server), so it
+     * has its own schedule and does not spend a normal attempt.
+     */
+    SERVER_BUSY
 }
 
 enum class ReconnectDecision(val automatic: Boolean) {

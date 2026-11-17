@@ -94,6 +94,9 @@ import com.sojibhuiya.jarves.storage.ApiProvidersModule
 import com.sojibhuiya.jarves.storage.ConversationModule
 import com.sojibhuiya.jarves.ui.chats.ChatsScreen
 import com.sojibhuiya.jarves.storage.AndroidMicSensitivityStore
+import com.sojibhuiya.jarves.storage.AndroidLivePingStore
+import com.sojibhuiya.jarves.intelligence.LivePingSetting
+import com.sojibhuiya.jarves.intelligence.LivePingSettings
 import com.sojibhuiya.jarves.system.AndroidNetworkMonitor
 import com.sojibhuiya.jarves.system.SessionEnvironmentReader
 import com.sojibhuiya.jarves.system.SystemChecks
@@ -136,6 +139,10 @@ private fun AgiApp() {
     // 0.2.8: mic sensitivity is read once, like the mode, so Settings and the session agree.
     val micSettings = remember { MicSensitivitySettings(AndroidMicSensitivityStore(context.applicationContext)) }
     var micSensitivity by remember { mutableStateOf(micSettings.current()) }
+    // 0.2.13 (task 3): the hidden WebSocket-ping experiment. Off unless the user turns it on in
+    // Settings → Advanced; nothing else in the app reads it.
+    val pingSettings = remember { LivePingSettings(AndroidLivePingStore(context.applicationContext)) }
+    var pingSeconds by remember { mutableStateOf(pingSettings.current()) }
     // 0.2.9: real readings for the end-of-session diagnostic (foreground, screen, network change,
     // battery saver). Created once, so the ConnectivityManager callback is registered once.
     // 0.2.10: one network monitor for the whole app — the reconnect logic and the diagnostics read
@@ -396,6 +403,8 @@ private fun AgiApp() {
                 systemDiagnostics = {
                     SystemChecks.line(context.applicationContext, LiveSessionService.isRunning())
                 },
+                // 0.2.13 (task 3): off by default; only the hidden Advanced row changes it.
+                pingIntervalSeconds = pingSeconds,
                 onSessionEnd = { report ->
                     scope.launch {
                         status = report.message()
@@ -609,6 +618,11 @@ private fun AgiApp() {
                                 micSensitivity = chosen
                                 micSettings.save(chosen)
                             },
+                            pingSeconds = pingSeconds,
+                            onSelectPingSeconds = { chosen ->
+                                pingSeconds = chosen
+                                pingSettings.save(chosen)
+                            },
                             lastAutoTrace = engine?.lastAutoSearchTrace() ?: "none",
                             lastEndDiagnostics = engine?.endDiagnostics() ?: lastEndDiagnostics,
                             onSelectMode = { chosen ->
@@ -772,6 +786,9 @@ private fun SettingsScreen(
     onSelectMode: (VoiceSearchMode) -> Unit = {},
     micSensitivity: MicSensitivity = MicSensitivity.DEFAULT,
     onSelectMicSensitivity: (MicSensitivity) -> Unit = {},
+    // 0.2.13 (task 3): the hidden ping experiment, 0 = off.
+    pingSeconds: Int = LivePingSetting.DEFAULT_SECONDS,
+    onSelectPingSeconds: (Int) -> Unit = {},
     lastAutoTrace: String = "none",
     lastEndDiagnostics: String = "none"
 ) {
@@ -1006,6 +1023,20 @@ private fun SettingsScreen(
                         )
                     }
                     Spacer(Modifier.height(8.dp))
+                    // 0.2.13 (task 3): HIDDEN EXPERIMENT. Off by default; it only changes how OkHttp
+                    // watches the socket for a half-open connection. Real Gemini behaviour with ping
+                    // frames is NOT-RUN until it is measured on the phone.
+                    SectionLabel("Ping experiment (half-open test)")
+                    Spacer(Modifier.height(4.dp))
+                    LivePingSetting.OPTIONS.forEach { seconds ->
+                        MicSensitivityRow(
+                            label = LivePingSetting.label(seconds),
+                            selected = seconds == pingSeconds,
+                            onClickLabel = "Ping ${LivePingSetting.label(seconds)}",
+                            onSelect = { onSelectPingSeconds(seconds) }
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
                     JarvesTextAction(
                         text = "Copy diagnostics",
                         onClick = { copyToClipboard(context, "Jarves diagnostics", diagnostics) }
@@ -1033,12 +1064,28 @@ private fun MicSensitivityRow(
     option: MicSensitivity,
     selected: Boolean,
     onSelect: () -> Unit
+) = MicSensitivityRow(
+    label = option.label,
+    selected = selected,
+    onClickLabel = "Select ${option.label}",
+    onSelect = onSelect,
+    detail = option.detail
+)
+
+/** Same radio row, driven by a plain label so 0.2.13 can reuse it for the ping experiment. */
+@Composable
+private fun MicSensitivityRow(
+    label: String,
+    selected: Boolean,
+    onClickLabel: String,
+    onSelect: () -> Unit,
+    detail: String? = null
 ) {
     Row(
         Modifier
             .fillMaxWidth()
             .heightIn(min = JarvesDimens.TouchTarget)
-            .clickable(onClickLabel = "Select ${option.label}", onClick = onSelect)
+            .clickable(onClickLabel = onClickLabel, onClick = onSelect)
             .padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -1065,17 +1112,19 @@ private fun MicSensitivityRow(
         Spacer(Modifier.width(10.dp))
         Column(Modifier.weight(1f)) {
             Text(
-                text = option.label,
+                text = label,
                 color = JarvesColors.TextPrimary,
                 fontSize = 13.sp,
                 fontWeight = FontWeight.Medium
             )
-            Text(
-                text = option.detail,
-                color = JarvesColors.TextMuted,
-                fontSize = 10.5.sp,
-                lineHeight = 14.sp
-            )
+            if (detail != null) {
+                Text(
+                    text = detail,
+                    color = JarvesColors.TextMuted,
+                    fontSize = 10.5.sp,
+                    lineHeight = 14.sp
+                )
+            }
         }
     }
 }

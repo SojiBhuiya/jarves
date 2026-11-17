@@ -33,6 +33,10 @@ class AudioSendReconnectTest {
         return when (val action = plan.onUnexpectedFailure(now, network, "AUDIO_SEND_FAILED")) {
             is ReconnectAction.WaitForNetwork -> "wait"
             is ReconnectAction.Attempt -> "attempt"
+            // 0.2.13: an audio-send failure is never a server-busy refusal, so this branch only
+            // exists to keep the `when` exhaustive. The dedicated 1008 test lives in
+            // ServerBusyRetryTest.
+            is ReconnectAction.RetryServerBusy -> "server-busy"
             is ReconnectAction.GiveUp -> "giveup"
             ReconnectAction.None -> "none"
         }
