@@ -125,7 +125,15 @@ class AutoSearchFlowTest {
         assertEquals(GroundedSearchFailure.TIMEOUT, answer.failure)
         assertEquals(SearchStep.SETUP_COMPLETE.label, answer.step)
         assertTrue(answer.detail.contains("setupComplete"))
-        assertTrue("only the setup frame may be sent", transport.sent.size == 1)
+        // 0.2.15 (rule 6): a setup timeout is retried exactly once, so two setup frames are sent and
+        // never the question — the question may only follow a setupComplete.
+        assertEquals("one setup frame per attempt (1 + 1 retry)", 2, transport.sent.size)
+        assertTrue(
+            "the question must never be sent before setupComplete: ${transport.sent}",
+            transport.sent.none { it.contains("clientContent") }
+        )
+        assertEquals("the retry must be visible", 2, answer.attempts)
+        assertTrue(answer.trace.contains("retried once"))
         assertTrue(answer.trace.contains("FAILED at ${SearchStep.SETUP_COMPLETE.label}"))
         assertTrue("the socket is closed", transport.closedWith != null)
     }

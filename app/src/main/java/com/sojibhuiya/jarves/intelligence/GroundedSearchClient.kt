@@ -92,6 +92,12 @@ data class GroundedAnswer(
     val trace: String = "",
     /** 0.2.14 (task A): words in the transcribed answer, 0 when there is no answer. */
     val answerWords: Int = 0,
+    /** 0.2.15 (rule 10): which rule ended the search — turnComplete / generationComplete / quiet gap / timeout. */
+    val endRule: String = "",
+    /** 0.2.15 (rule 10): the quiet gap the answer used, in milliseconds. */
+    val quietGapMillis: Long = 0L,
+    /** 0.2.15 (rule 6): sockets opened for this one search (1, or 2 after the setup timeout). */
+    val attempts: Int = 0,
     /**
      * 0.2.14 (task A): milliseconds between the first transcription chunk and
      * `generationComplete` — the time the native-audio model spends speaking an answer whose audio

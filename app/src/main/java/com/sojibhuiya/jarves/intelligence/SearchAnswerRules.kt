@@ -84,13 +84,24 @@ object SearchAnswerRules {
         firstTranscriptMillis: Long,
         transcriptToCompleteMillis: Long,
         words: Int,
-        chars: Int
+        chars: Int,
+        /** 0.2.15 (rule 10): turnComplete / generationComplete / quiet gap / timeout / closed. */
+        endRule: String = "",
+        /** 0.2.15 (rule 10): the quiet gap constant this build used. */
+        quietGapMillis: Long = 0L,
+        /** 0.2.15 (rule 6): sockets opened for this search (2 only after a setup timeout). */
+        attempts: Int = 0
     ): String = buildString {
         append("Search metrics: total=").append(seconds(totalMillis))
         append(" | connect=").append(secondsOrNa(connectMillis))
         append(" | first transcript=").append(secondsOrNa(firstTranscriptMillis))
         append(" | transcript->complete=").append(secondsOrNa(transcriptToCompleteMillis))
         append(" | answer=").append(words).append(" words (").append(chars).append(" chars)")
+        if (endRule.isNotBlank()) append(" | ended=").append(endRule)
+        if (quietGapMillis > 0L) {
+            append(" (quiet gap ").append(formatSeconds(quietGapMillis)).append("s)")
+        }
+        if (attempts > 0) append(" | attempts=").append(attempts)
     }
 
     private fun seconds(millis: Long): String = formatSeconds(millis) + "s"

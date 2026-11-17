@@ -148,11 +148,17 @@ object LiveSessionConfig {
             // one action is the most likely reason the acknowledgement sometimes never came. There
             // is now exactly one rule, it is the first thing the model reads about searching, and
             // it keeps every wording the phone report asked for.
+            // 0.2.15 (rules 1-3): the phone report had the ack, then an apology, then a second
+            // apology while a search that eventually SUCCEEDED was still running. The rules below
+            // say one ack and then silence, and they make "could not verify" depend on the result.
             appendLine(
                 "STEP 1 — the moment you decide to search, and BEFORE calling `$FUNCTION_SEARCH_WEB`, " +
                     "say exactly one short line aloud in the user's language, varying it: " +
                     "\"দেখছি\", \"দেখে নিচ্ছি\", \"একটু সময় দিন\". Call the tool only after you " +
-                    "have said it. Never stay silent while a search is running."
+                    "have said it. One line, once: never repeat or rephrase it."
+            )
+            appendLine(
+                "WHILE THE SEARCH RUNS — nothing more: no apology, no second ack; wait for the result."
             )
             appendLine(
                 "STEP 2 — when the result arrives: if nothing has happened since you asked, answer " +
@@ -160,9 +166,12 @@ object LiveSessionConfig {
                     "earlier question — \"আপনি … জানতে চেয়েছিলেন, তার উত্তর: …\" — and then answer. " +
                     "Never cut off or replace an answer that is already being spoken."
             )
+            // 0.2.15 (rule 3): silence is only allowed to break for a REAL failure, and the failure
+            // text that the app reserves for that case is the one in GroundingPolicy.
             appendLine(
-                "Do not guess before the result arrives; name the source you used. If the search " +
-                    "failed, say so plainly instead of inventing facts or links."
+                "WHEN THE RESULT ARRIVES — say you could not verify it ONLY if the result reports a " +
+                    "failure, once, in one sentence. Do not guess before the result arrives; name the " +
+                    "source you used."
             )
         } else {
             appendLine(
@@ -172,10 +181,12 @@ object LiveSessionConfig {
                     "remembered facts as confirmed current information."
             )
         }
+        // 0.2.15: trimmed (same rule, fewer characters) so the two new turn-rule lines fit under the
+        // 3,000-character ceiling the test enforces instead of raising the ceiling.
         appendLine(
-            "Prefer the most recent sources. When a fact is disputed, compare the sources, report the " +
-                "disagreement instead of choosing one side silently, and separate what is confirmed from " +
-                "what is uncertain. Name the sources you used, briefly, in the spoken answer."
+            "Prefer the most recent sources. For a disputed fact report the disagreement instead of " +
+                "choosing one side silently, and separate confirmed from uncertain. Name the sources " +
+                "briefly, in the spoken answer."
         )
         appendLine(
             "Stable knowledge (history, definitions, fixed past events, mathematics) does not need a " +
@@ -362,6 +373,17 @@ object LiveSessionConfig {
      */
     fun turnCompletingClientContentJson(text: String): String =
         clientContentJson(text = text, turnComplete = true)
+
+    /**
+     * 0.2.15 (rule 4): **silent** context. `turnComplete = false`, which the API reference defines as
+     * "Otherwise, the server awaits additional messages before starting generation"
+     * (https://ai.google.dev/api/live → BidiGenerateContentClientContent). Used for everything the
+     * app injects on its own (time sync, honesty notices, internal state): the model sees it on its
+     * next real turn instead of being interrupted by it — the 0.2.12 change to `turnComplete = true`
+     * was what made Jarves speak unprompted and cut its own sentences.
+     */
+    fun silentContextJson(text: String): String =
+        clientContentJson(text = text, turnComplete = TurnRules.SILENT_INJECTION_TURN_COMPLETE)
 
     /**
      * clientContent message carrying free text into the running session.

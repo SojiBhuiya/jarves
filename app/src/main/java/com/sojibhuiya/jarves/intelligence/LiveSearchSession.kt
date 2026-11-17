@@ -71,6 +71,12 @@ sealed interface LiveEvent {
     data object SetupComplete : LiveEvent
     data class Transcript(val text: String) : LiveEvent
     data class Sources(val sources: List<GroundedSource>) : LiveEvent
+    /**
+     * 0.2.15 (rule 10): an audio chunk of the model's own speech. The text of the search answer comes
+     * from `outputTranscription`, but audio still counts as "the server is talking", so the quiet-gap
+     * rule must see it.
+     */
+    data class ModelAudio(val chunks: Int) : LiveEvent
     data object GenerationComplete : LiveEvent
     data object TurnComplete : LiveEvent
     data class Error(val message: String) : LiveEvent
@@ -174,15 +180,48 @@ class LiveSearchSession(
                 0, "empty query", 0, 0, 0, 0, emptyList()
             )
         }
+        // 0.2.15 (rule 6): a setupComplete timeout gets ONE retry — it is the signature of a slow
+        // socket, not of a bad question, and the user experiences the pair as one search.
+        var result = runAttempt(trimmed)
+        // Only the *setup timeout* is retried: an error frame also reports the SETUP_COMPLETE step,
+        // but it names a different failure and must keep its own meaning (0.2.14 behaviour).
+        if (!result.isSuccess && result.failure == GroundedSearchFailure.TIMEOUT &&
+            result.step == SearchStep.SETUP_COMPLETE.label
+        ) {
+            val first = result
+            val second = runAttempt(trimmed, attemptNumber = 2)
+            result = second.copy(
+                attempts = 2,
+                trace = "Auto steps: attempt 1 failed (" + first.detail.take(60) +
+                    ") -> retried once (rule 6)\n" + second.trace
+            )
+        }
+        if (result.attempts == 0) result = result.copy(attempts = 1)
+        result
+    }
+
+    /**
+     * One socket, one question. Called by [search] once, or twice after a setup timeout.
+     *
+     * 0.2.15 (rule 10): the answer is complete as soon as **any** of these happens —
+     * `turnComplete`, `generationComplete`, or a quiet gap of [TurnRules.QUIET_GAP_MILLIS] after the
+     * first transcription with no further `serverContent` of any kind. The 20 s timeout stays as the
+     * last resort, and [SearchEndRule] records which rule fired for the diagnostics.
+     */
+    private suspend fun runAttempt(trimmed: String, attemptNumber: Int = 1): GroundedAnswer {
         val started = clock()
-        fun since() = clock() - started
+        // 0.2.15: the offset is never 0, because 0 is the "not seen yet" sentinel for setupComplete,
+        // the first transcription and the last server content. With a driven (test) clock an answer
+        // at exactly 0 ms would otherwise look missing and the quiet-gap rule could never fire.
+        fun since() = (clock() - started).coerceAtLeast(1L)
         val steps = mutableListOf<String>()
         val queue = ArrayBlockingQueue<LiveEvent>(128)
+        val messageLog = ServerMessageLog()
 
         val connection = try {
-            transport.open(model, QueueListener(queue))
+            transport.open(model, QueueListener(queue, clock, messageLog))
         } catch (e: Exception) {
-            return@withContext failure(
+            return failure(
                 trimmed, GroundedSearchFailure.INTERNAL, SearchStep.TRANSPORT_OPEN, 0,
                 e.javaClass.simpleName, 0, 0, since(), 0, steps
             )
@@ -192,7 +231,7 @@ class LiveSearchSession(
         try {
             if (!connection.send(setupFrame())) {
                 closeQuietly()
-                return@withContext failure(
+                return failure(
                     trimmed, GroundedSearchFailure.INTERNAL, SearchStep.SETUP_SENT, 0,
                     "setup could not be sent", 0, 0, since(), 0, steps
                 )
@@ -203,7 +242,9 @@ class LiveSearchSession(
             var setupCompleteAt = 0L
             var turnSentAt = 0L
             var firstTranscriptAt = 0L
+            var lastServerContentAt = 0L
             var finishedAt = 0L
+            var endRule: SearchEndRule? = null
             var closeCode = 0
             var closeReason = ""
             var serverError = ""
@@ -223,7 +264,22 @@ class LiveSearchSession(
                 }
                 val remaining = deadline - clock()
                 if (remaining <= 0) break
-                val event = queue.poll(remaining.coerceAtMost(200L), TimeUnit.MILLISECONDS) ?: continue
+                val event = queue.poll(remaining.coerceAtMost(200L), TimeUnit.MILLISECONDS)
+                if (event == null) {
+                    // 0.2.15 (rule 10): the quiet-gap rule. Nothing at all (no transcription, no
+                    // audio chunk) for N seconds after the first transcription means the turn is over
+                    // even if the server never sends turnComplete — which is exactly what the 0.2.14
+                    // phone log showed (11-word answer, then 13 s of nothing until the 20 s cap).
+                    if (firstTranscriptAt > 0L && lastServerContentAt > 0L) {
+                        val quiet = clock() - lastServerContentAt
+                        if (quiet >= TurnRules.QUIET_GAP_MILLIS) {
+                            finishedAt = since()
+                            endRule = SearchEndRule.QUIET_GAP
+                            steps += "quiet gap ${formatSeconds(quiet)}s -> ended"
+                        }
+                    }
+                    continue
+                }
                 when (event) {
                     is LiveEvent.Open -> {
                         if (openedAt == 0L) {
@@ -249,17 +305,32 @@ class LiveSearchSession(
                         }
                     }
                     is LiveEvent.Transcript -> {
+                        lastServerContentAt = clock()
                         if (firstTranscriptAt == 0L) {
                             firstTranscriptAt = since()
                             steps += "first transcription ${firstTranscriptAt}ms"
                         }
                         text.append(event.text)
                     }
-                    is LiveEvent.Sources -> event.sources.forEach { sources[it.url] = it }
-                    is LiveEvent.GenerationComplete, is LiveEvent.TurnComplete -> {
+                    is LiveEvent.ModelAudio -> lastServerContentAt = clock()
+                    is LiveEvent.Sources -> {
+                        lastServerContentAt = clock()
+                        event.sources.forEach { sources[it.url] = it }
+                    }
+                    is LiveEvent.GenerationComplete -> {
+                        lastServerContentAt = clock()
                         if (finishedAt == 0L) {
                             finishedAt = since()
-                            steps += "${if (event is LiveEvent.GenerationComplete) "generationComplete" else "turnComplete"} ${finishedAt}ms"
+                            endRule = SearchEndRule.GENERATION_COMPLETE
+                            steps += "generationComplete ${finishedAt}ms"
+                        }
+                    }
+                    is LiveEvent.TurnComplete -> {
+                        lastServerContentAt = clock()
+                        if (finishedAt == 0L) {
+                            finishedAt = since()
+                            endRule = SearchEndRule.TURN_COMPLETE
+                            steps += "turnComplete ${finishedAt}ms"
                         }
                     }
                     is LiveEvent.Error -> {
@@ -269,26 +340,36 @@ class LiveSearchSession(
                     is LiveEvent.Closed -> {
                         closeCode = event.code
                         closeReason = event.reason
-                        if (finishedAt == 0L) stepFailure = SearchStep.CLOSED
+                        if (finishedAt == 0L) {
+                            stepFailure = SearchStep.CLOSED
+                            endRule = SearchEndRule.CLOSED
+                        }
                     }
                 }
             }
             closeQuietly()
             val elapsed = since()
             val spoken = text.toString().trim()
-            // 0.2.14 (task A): the two numbers the phone measurement needed — how long the answer
-            // is, and how long the model spent between the first transcript and generationComplete
-            // (0.2.13 measured 8.6 s there for a ~30-word answer plus a source line).
             val words = SearchAnswerRules.wordCount(spoken)
             val transcriptToComplete =
                 if (firstTranscriptAt > 0L && finishedAt > firstTranscriptAt) finishedAt - firstTranscriptAt else 0L
+            // 0.2.15 (rule 10): which rule ended this answer, so the phone log answers the question
+            // "why 20 s?" without a guess.
+            val rule = endRule ?: when {
+                stepFailure != null -> SearchEndRule.FAILED
+                elapsed >= timeoutMillis -> SearchEndRule.TIMEOUT
+                else -> SearchEndRule.FAILED
+            }
             steps += "answer $words words"
             if (transcriptToComplete > 0L) {
                 steps += "transcript->complete ${formatSeconds(transcriptToComplete)}s"
             }
+            steps += "ended " + rule.label + " (quiet gap ${formatSeconds(TurnRules.QUIET_GAP_MILLIS)}s)"
             steps += "total ${elapsed}ms" + if (closeCode != 0) ", close $closeCode" else ""
 
-            when {
+            return when {
+                // 0.2.15 (rule 11): a quiet gap or the 20 s cap is NOT a failure when text arrived —
+                // the collected text goes back to the voice model as a normal result.
                 spoken.isNotEmpty() -> GroundedAnswer(
                     query = trimmed,
                     text = spoken,
@@ -302,23 +383,29 @@ class LiveSearchSession(
                     textLength = spoken.length,
                     answerWords = words,
                     transcriptToCompleteMillis = transcriptToComplete,
+                    endRule = rule.label,
+                    quietGapMillis = TurnRules.QUIET_GAP_MILLIS,
                     trace = traceLine(steps) + "\n" + SearchAnswerRules.metricsLine(
                         totalMillis = elapsed,
                         connectMillis = setupCompleteAt,
                         firstTranscriptMillis = firstTranscriptAt,
                         transcriptToCompleteMillis = transcriptToComplete,
                         words = words,
-                        chars = spoken.length
-                    )
+                        chars = spoken.length,
+                        endRule = rule.label,
+                        quietGapMillis = TurnRules.QUIET_GAP_MILLIS,
+                        attempts = attemptNumber
+                    ) + "\n" + searchMessageLine(messageLog, started)
                 )
                 closeCode != 0 -> failure(
                     trimmed, failureFor(closeCode), SearchStep.CLOSED, closeCode,
                     closeReason.ifBlank { "closed by server" }, setupCompleteAt, firstTranscriptAt,
-                    elapsed, 0, steps
+                    elapsed, 0, steps, endRule = rule
                 )
                 serverError.isNotBlank() -> failure(
                     trimmed, GroundedSearchFailure.HTTP, SearchStep.SETUP_COMPLETE, 0, serverError,
-                    setupCompleteAt, firstTranscriptAt, elapsed, 0, steps, googleMessage = serverError
+                    setupCompleteAt, firstTranscriptAt, elapsed, 0, steps, googleMessage = serverError,
+                    endRule = rule
                 )
                 stepFailure != null -> failure(
                     trimmed,
@@ -326,26 +413,32 @@ class LiveSearchSession(
                     else GroundedSearchFailure.INTERNAL,
                     stepFailure, 0,
                     failureDetail.ifBlank { "stopped at ${stepFailure.label}" },
-                    setupCompleteAt, firstTranscriptAt, elapsed, 0, steps
+                    setupCompleteAt, firstTranscriptAt, elapsed, 0, steps, endRule = rule
                 )
                 elapsed >= timeoutMillis -> failure(
                     trimmed, GroundedSearchFailure.TIMEOUT, SearchStep.FIRST_TRANSCRIPT, 0,
                     "no answer within ${timeoutMillis}ms", setupCompleteAt, firstTranscriptAt,
-                    elapsed, 0, steps
+                    elapsed, 0, steps, endRule = rule
                 )
                 else -> failure(
                     trimmed, GroundedSearchFailure.EMPTY, SearchStep.FIRST_TRANSCRIPT, 0,
-                    "no transcription text", setupCompleteAt, firstTranscriptAt, elapsed, 0, steps
+                    "no transcription text", setupCompleteAt, firstTranscriptAt, elapsed, 0, steps,
+                    endRule = rule
                 )
             }
         } catch (e: Exception) {
             closeQuietly()
-            failure(
+            return failure(
                 trimmed, GroundedSearchFailure.INTERNAL, SearchStep.TRANSPORT_OPEN, 0,
                 e.javaClass.simpleName, 0, 0, since(), 0, steps
             )
         }
     }
+
+    /** Rule 9: the last 100 server messages of this attempt, with `t+seconds` and the gaps. */
+    private fun searchMessageLine(log: ServerMessageLog, started: Long): String =
+        "Search messages (last ${TurnRules.SEARCH_MESSAGE_LOG_CAPACITY}, t+ from session start): " +
+            log.text(started)
 
     private fun traceLine(steps: List<String>): String =
         if (steps.isEmpty()) "" else "Auto steps: " + steps.joinToString(" -> ")
@@ -361,7 +454,9 @@ class LiveSearchSession(
         elapsedMillis: Long,
         textLength: Int,
         steps: List<String>,
-        googleMessage: String = ""
+        googleMessage: String = "",
+        /** 0.2.15 (rule 10): which rule ended the attempt, shown in the diagnostics. */
+        endRule: SearchEndRule = SearchEndRule.FAILED
     ): GroundedAnswer = GroundedAnswer(
         query = query,
         text = "",
@@ -375,6 +470,8 @@ class LiveSearchSession(
         firstTranscriptMillis = firstTranscriptMillis,
         textLength = textLength,
         step = step.label,
+        endRule = endRule.label,
+        quietGapMillis = TurnRules.QUIET_GAP_MILLIS,
         trace = traceLine(steps + "FAILED at ${step.label} after ${elapsedMillis}ms")
     )
 
@@ -385,12 +482,18 @@ class LiveSearchSession(
     /** One text turn with `turnComplete = true`, sent only after `setupComplete`. */
     fun textTurn(query: String): String = LiveSessionConfig.clientContentJson(query, turnComplete = true)
 
-    private class QueueListener(private val queue: ArrayBlockingQueue<LiveEvent>) : LiveSearchListener {
+    private class QueueListener(
+        private val queue: ArrayBlockingQueue<LiveEvent>,
+        private val clock: () -> Long,
+        /** 0.2.15 (rule 9): every raw message, logged where it arrives. */
+        private val messageLog: ServerMessageLog
+    ) : LiveSearchListener {
         override fun onOpen() {
             queue.offer(LiveEvent.Open)
         }
 
         override fun onServerMessage(text: String) {
+            runCatching { messageLog.record(clock(), text) }
             LiveSearchProtocol.events(text).forEach { queue.offer(it) }
         }
 
@@ -406,8 +509,12 @@ class LiveSearchSession(
     companion object {
         const val DEFAULT_TIMEOUT_MILLIS = 20_000L
 
-        /** A socket that never answers the setup is reported long before the 20 s answer deadline. */
-        const val DEFAULT_SETUP_TIMEOUT_MILLIS = 8_000L
+        /**
+         * 0.2.15 (rule 6): the setup wait. Raised from 8 s to 15 s — the phone saw
+         * "no setupComplete within 8000ms" on a session that was merely slow (0.2.14 measured
+         * `socket open 3171ms`, `setupComplete 4004ms`, so 8 s was tight on a busy network).
+         */
+        const val DEFAULT_SETUP_TIMEOUT_MILLIS = TurnRules.SETUP_TIMEOUT_MILLIS
 
         const val WEBSOCKET_ENDPOINT =
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
@@ -447,6 +554,13 @@ object LiveSearchProtocol {
             }
             val report = GroundingParser.fromServerMessage(text)
             if (report.sources.isNotEmpty()) out += LiveEvent.Sources(report.sources)
+            // 0.2.15 (rule 10): audio counts as server activity for the quiet-gap rule.
+            val audioParts = ((serverContent["modelTurn"] as? Map<*, *>)?.get("parts") as? List<*>)
+                .orEmpty()
+                .count { part ->
+                    ((part as? Map<*, *>)?.get("inlineData") as? Map<*, *>)?.get("data") != null
+                }
+            if (audioParts > 0) out += LiveEvent.ModelAudio(audioParts)
             if (serverContent["generationComplete"] == true) out += LiveEvent.GenerationComplete
             if (serverContent["turnComplete"] == true) out += LiveEvent.TurnComplete
         }

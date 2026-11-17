@@ -25,7 +25,12 @@ import com.sojibhuiya.jarves.intelligence.GroundingParser
 import com.sojibhuiya.jarves.intelligence.CloseAlreadyConnected
 import com.sojibhuiya.jarves.intelligence.InterruptionLog
 import com.sojibhuiya.jarves.intelligence.LiveFailureRouter
+import com.sojibhuiya.jarves.intelligence.InjectionLedger
+import com.sojibhuiya.jarves.intelligence.NoticePolicy
 import com.sojibhuiya.jarves.intelligence.LivePingSetting
+import com.sojibhuiya.jarves.intelligence.SearchTurnGuard
+import com.sojibhuiya.jarves.intelligence.TurnRules
+import com.sojibhuiya.jarves.intelligence.TurnTranscript
 import com.sojibhuiya.jarves.intelligence.ServerBusyRetry
 import com.sojibhuiya.jarves.intelligence.formatSeconds
 import com.sojibhuiya.jarves.intelligence.LiveSearchTool
@@ -187,7 +192,7 @@ class GeminiLiveVoice(
             "\u09b8\u0982\u09af\u09c1\u0995\u09cd\u09a4\u0964 \u098f\u0996\u09a8 \u0995\u09a5\u09be \u09ac\u09b2\u09c1\u09a8 (\u09b2\u09be\u0987\u09ad \u09b8\u09be\u09b0\u09cd\u099a \u099b\u09be\u09a1\u09bc\u09be \u2014 \u09b2\u09be\u0987\u09ad \u09a4\u09a5\u09cd\u09af \u09af\u09be\u099a\u09be\u0987 \u0995\u09b0\u09be \u09af\u09be\u09ac\u09c7 \u09a8\u09be)"
 
         /** Identifies this build in the on-device diagnostic block. */
-        const val FIX_TAG = "0.2.14-short-answer-real-sites"
+        const val FIX_TAG = "0.2.15-one-ack-one-failure"
 
         /**
          * The mode/model/tool/close line of the diagnostic block. Pure and public so it is
@@ -269,6 +274,18 @@ class GeminiLiveVoice(
     @Volatile private var lastSendNetworkType: String = "unknown"
     /** 0.2.13 (task 4): how many interruptions, and how long each lasted. */
     private val interruptions = InterruptionLog()
+
+    // ---- 0.2.15 (rules 1-5, 7): one answer = one turn ----
+    /** Rules 1-3: while a search is pending, nothing may be injected and no apology is allowed. */
+    private val searchTurnGuard = SearchTurnGuard()
+    /** Rule 5: consecutive outputTranscription chunks of one turn, flushed only at a turn end. */
+    private val assistantTurn = TurnTranscript()
+    /** Rule 7: every clientContent / toolResponse the app sent, and whether the model reacted. */
+    private val injectionLedger = InjectionLedger()
+    /** Rule 5: how many chat messages the old per-chunk behaviour produced (diagnostics). */
+    @Volatile private var assistantTurnFlushes: Int = 0
+    /** Rule 1: `toolCallCount` at the start of the current turn, so a search is attributed to it. */
+    @Volatile private var toolCallsAtTurnStart: Int = 0
 
     // ---- Real-time intelligence state
     /** Whether the setup message asked for Google Search grounding. */
@@ -734,6 +751,9 @@ class GeminiLiveVoice(
                             calls.forEach { call ->
                                 searchOrder.putIfAbsent(call.callId, searchOrderCounter.incrementAndGet())
                             }
+                            // 0.2.15 (rule 1): from here until the toolResponse the model may say
+                            // at most one short acknowledgement and nothing else.
+                            searchTurnGuard.onToolCall()
                             lastToolQuery = calls.first().query.take(60)
                             lastToolCallSeen = "toolCall received (id=${calls.first().callId.take(24)}, " +
                                 "q=${calls.first().query.take(40)}, model=${LiveModels.modelFor(activeMode)})"
@@ -757,6 +777,8 @@ class GeminiLiveVoice(
                     val serverContent = root.optJSONObject("serverContent")
                     if (serverContent != null) {
                         if (serverContent.optBoolean("interrupted", false)) {
+                            // Rule 5: an interruption is a real turn end as well.
+                            flushAssistantTurn()
                             playbackQueue.clear()
                             try { player?.pause(); player?.flush(); player?.play() } catch (_: Exception) {}
                             modelGenerating = false
@@ -769,6 +791,9 @@ class GeminiLiveVoice(
 
                         serverContent.optJSONObject("inputTranscription")?.optString("text")
                             ?.takeIf { it.isNotBlank()}?.let { chunk ->
+                                // Rule 5: the user started a new turn — whatever the model had
+                                // said belongs to the previous one and is flushed as its own message.
+                                flushAssistantTurn()
                                 turnUserSpeech.append(' ').append(chunk)
                                 onTranscript(chunk, false)
                                 // The user is now talking about something else while a search is
@@ -781,7 +806,14 @@ class GeminiLiveVoice(
                             }
 
                         serverContent.optJSONObject("outputTranscription")?.optString("text")
-                            ?.takeIf { it.isNotBlank() }?.let { onTranscript(it, true) }
+                            ?.takeIf { it.isNotBlank() }?.let { chunk ->
+                                // 0.2.15 (rule 5): accumulated, NOT emitted. 0.2.14 handed every
+                                // chunk to the UI, so a pause longer than the UI's 1.2 s flush timer
+                                // turned one answer into several chat bubbles ("দেখে" / "নিচ্ছি।…").
+                                assistantTurn.append(chunk)
+                                searchTurnGuard.onModelSpoke()
+                                injectionLedger.onModelSpoke(System.currentTimeMillis())
+                            }
 
                         val parts = serverContent.optJSONObject("modelTurn")?.optJSONArray("parts")
                         if (parts != null) {
@@ -796,6 +828,8 @@ class GeminiLiveVoice(
                             }
                             if (audioSeen) {
                                 modelGenerating = true
+                                searchTurnGuard.onModelSpoke()
+                                injectionLedger.onModelSpoke(System.currentTimeMillis())
                                 // Task B evidence: did the model speak *before* the result came, or
                                 // only alongside it? This mark is what the phone report needs.
                                 if (!firstAudioAfterToolCallMarked && toolCallCount > 0) {
@@ -810,6 +844,9 @@ class GeminiLiveVoice(
                             }
                         }
                         if (serverContent.optBoolean("turnComplete", false)) {
+                            // Rule 5: the turn really ended — this is the one place the answer is
+                            // handed to the chat.
+                            flushAssistantTurn()
                             onStatus("শুনছি… আপনি কথা বলতে পারেন")
                             searchTimeline.mark("turn boundary (turnComplete)")
                             modelGenerating = false
@@ -918,16 +955,39 @@ class GeminiLiveVoice(
         searchBudget.reset()
         val needsLiveSources = FreshnessClassifier.needsLiveSources(spoken)
         if (needsLiveSources && !groundingForTurn && !noticeSentForTurn) {
-            noticeSentForTurn = true
-            webSocket.send(
-                // 0.2.12 (B1): turnComplete = true, otherwise the server only accumulates this
-                // text and never speaks it (https://ai.google.dev/api/live — "Otherwise, the
-                // server awaits additional messages before starting generation").
-                LiveSessionConfig.turnCompletingClientContentJson(
-                    GroundingPolicy.fallbackNotice(groundingAvailable)
-                )
+            // 0.2.15 (rules 1-4). This block is what produced the phone report: while the search was
+            // still running, every turn end injected "you could not verify" with turnComplete = true,
+            // which *starts a generation* (API reference) — so Jarves apologised, interrupted its own
+            // answer, repeated the apology and fragmented the transcript. Now:
+            //  * nothing is injected while a search is pending or was attempted this turn (rule 3);
+            //  * whatever is injected is SILENT context (turnComplete = false, rule 4), so it informs
+            //    the next turn instead of starting one;
+            //  * a real failure is announced once, from the toolResponse (rule 2).
+            val searchPending = searchRunner != null || pendingResults.isNotEmpty()
+            val searchedThisTurn = toolCallCount > toolCallsAtTurnStart
+            val allowed = NoticePolicy.shouldInject(
+                needsLiveSources = needsLiveSources,
+                groundingForTurn = groundingForTurn,
+                noticeSentForTurn = noticeSentForTurn,
+                searchPending = searchPending,
+                searchedThisTurn = searchedThisTurn,
+                canInjectContext = searchTurnGuard.canInjectContext()
             )
+            if (allowed) {
+                noticeSentForTurn = true
+                injectSilentContext(
+                    webSocket,
+                    kind = "no-sources notice",
+                    text = GroundingPolicy.fallbackNotice(groundingAvailable)
+                )
+            } else {
+                searchTimeline.mark(
+                    NoticePolicy.describe(needsLiveSources, searchPending, searchedThisTurn, false) +
+                        " (rule 3: no \"cannot verify\" text while a search is pending)"
+                )
+            }
         }
+        toolCallsAtTurnStart = toolCallCount
         groundingForTurn = false
         noticeSentForTurn = false
         maybeSyncTimeContext(webSocket)
@@ -947,11 +1007,49 @@ class GeminiLiveVoice(
         if (!dayChanged && !stale) return
         lastTimeSyncMillis = now
         lastTimeSyncDateKey = snapshot.dateKey
-        runCatching {
-            target.send(
-                LiveSessionConfig.turnCompletingClientContentJson(TimeContext.refreshMessage(snapshot))
-            )
-        }
+        // 0.2.15 (rule 4): the time sync used to be sent with turnComplete = true, i.e. it *asked the
+        // model to speak* every TIME_SYNC interval — the "speaks without being asked" report. It is
+        // silent context now: the model sees the fresh date on its next turn.
+        injectSilentContext(target, kind = "time sync", text = TimeContext.refreshMessage(snapshot))
+    }
+
+    /**
+     * 0.2.15 (rules 4 and 7): the single exit for app-injected context.
+     *
+     * It always sends `turnComplete = false` (silent — see
+     * [com.sojibhuiya.jarves.intelligence.LiveSessionConfig.silentContextJson]) and records the
+     * injection in [injectionLedger], so the diagnostics can answer "did this make the model speak?"
+     * with a measurement instead of a theory.
+     */
+    private fun injectSilentContext(target: WebSocket, kind: String, text: String) {
+        if (!setupDone.get()) return
+        val frame = LiveSessionConfig.silentContextJson(text)
+        val sent = runCatching { target.send(frame) }.getOrDefault(false)
+        injectionLedger.onClientContent(
+            now = System.currentTimeMillis(),
+            kind = kind,
+            turnComplete = false,
+            bytes = frame.length
+        )
+        if (sent) searchTurnGuard.onContextInjected()
+        searchTimeline.mark("clientContent $kind (turnComplete=false, ${frame.length}B, sent=$sent)")
+        if (!sent) lastSendFailureEvidence = "silent context '$kind' could not be sent"
+    }
+
+    /**
+     * Rule 5: hands the accumulated text of ONE model turn to the chat, exactly once.
+     *
+     * Called on `turnComplete`, on `interrupted`, when a new user turn starts and when the session
+     * ends — never per transcription chunk.
+     */
+    private fun flushAssistantTurn() {
+        val text = assistantTurn.flush() ?: return
+        assistantTurnFlushes += 1
+        // 0.2.15 (rule 1): a finished turn while the search is pending is the acknowledgement, so the
+        // guard can count them and the diagnostics can prove there was only one.
+        searchTurnGuard.onAssistantTurnEnded()
+        searchTimeline.mark("model turn flushed as one message (${text.length} chars)")
+        runCatching { onTranscript(text, true) }
     }
 
     private fun startTimeSyncLoop() {
@@ -982,6 +1080,7 @@ class GeminiLiveVoice(
             "Send failures: $sendFailureCount (last: $lastSendFailureEvidence) | " +
             "Ping: ${LivePingSetting.describe(pingIntervalSeconds)} | " +
             "Server busy: ${reconnectPlan.serverBusy.describe(System.currentTimeMillis())} | " +
+            "Turn rules: ${searchTurnGuard.describe()}, model messages=$assistantTurnFlushes | " +
             diagnosticsFor(activeMode, searchToolMode, lastCloseCode, lastCloseReason) + " | " +
             "Last query: $lastToolQuery | Last search: $lastSearchOutcome | " +
             "Last search model: $lastSearchModel | ${searchBackend?.describe() ?: "Search models: none"} | " +
@@ -1019,6 +1118,8 @@ class GeminiLiveVoice(
     ) + "\nReconnect: " + lastReconnectNote +
         "\nReconnect timeline: " + reconnectPlan.timelineText() +
         "\n" + interruptions.line(System.currentTimeMillis()) +
+        "\nInjected context (rule 7, t+ from session start): " +
+        injectionLedger.text(interruptions.sessionStartedAtMillis) +
         "\nSystem: " + runCatching { systemLine() }.getOrDefault("unknown (line failed)")
 
     /**
@@ -1132,6 +1233,16 @@ class GeminiLiveVoice(
             LiveToolProtocol.toolResponseJson(item.callId, SearchResultText.toolResponse(item), scheduling)
         )
         val now = System.currentTimeMillis()
+        // 0.2.15 (rules 1-2): a failure is announced once, and only because the toolResponse itself
+        // says so; a success closes the "be quiet" window instead.
+        searchTurnGuard.onToolResponseSent(failed = !item.success)
+        injectionLedger.onToolResponse(
+            now = now,
+            scheduling = scheduling,
+            bytes = LiveToolProtocol.toolResponseJson(
+                item.callId, SearchResultText.toolResponse(item), scheduling
+            ).length
+        )
         lastToolResponseDelivery = if (sent) {
             "toolResponse sent (id=${item.callId.take(24)}, scheduling=$scheduling, " +
                 "askedBeforeResult=${item.askedBeforeResult}, 3.8 session open=true)"
