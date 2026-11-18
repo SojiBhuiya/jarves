@@ -59,6 +59,8 @@ internal class LiveSocketFlight(
 
     fun transportIdle() = pump()
 
+    fun owns(ws: WebSocket): Boolean = slot?.socket === ws
+
     fun terminal(ws: WebSocket) {
         val previous = slot?.takeIf { it.socket === ws } ?: return
         previous.terminal = true

@@ -81,6 +81,28 @@ class GeminiLiveRecoveryTest {
         assertEquals(opens, transport.opens.size)
     }
 
+    @Test fun deadlineStopsMicEvenIfCancelledDnsHasNotDrained() = withHarness {
+        connect()
+        transport.current.fail(EOFException())
+        clock.advance(1_000)
+        val stuck = transport.current
+        clock.advance(10_000)
+        assertTrue(stuck.cancelled)
+        // The resolver found a DNS error after the open deadline, but the dispatcher is busy.
+        stuck.fail(dns(), drain = false)
+        clock.advance(179_999)
+        assertEquals(2, transport.opens.size)
+        assertTrue(mic.recording)
+        clock.advance(1)
+        assertEquals(LiveState.FAILED, states.last())
+        assertTrue(errors.single().contains("নাম সমাধান ব্যর্থ"))
+        assertFalse(mic.recording)
+        assertFalse(wake.held)
+        assertFalse(transport.idle)
+        stuck.drain()
+        assertEquals(2, transport.opens.size)
+    }
+
     @Test fun mobileDataOffForFortySecondsThenValidationWakesNextRetry() = withHarness {
         connect()
         val original = transport.current
@@ -195,6 +217,85 @@ class GeminiLiveRecoveryTest {
         assertEquals(FreshSessionFallback.STATUS_CONTEXT_LOST, status.last())
     }
 
+    @Test fun repeatedFreshRefusalsEndAtTheOriginalNinetySecondDeadline() = withHarness {
+        connectWithHandle()
+        transport.current.reject1008()
+        clock.advance(6_000) // the second handle flight hung; retire it, then enter the fresh phase
+        transport.current.fail(IOException("cancelled"))
+        val delays = listOf(0L, 3_000L, 5_000L, 8_000L, 12_000L, 15_000L, 15_000L, 15_000L)
+        delays.forEach {
+            clock.advance(it)
+            val fresh = transport.current
+            fresh.open()
+            assertFalse(fresh.sent.single().contains("\"handle\""))
+            fresh.reject1008()
+        }
+        clock.advance(10_999) // t+89.999 s from first 1008
+        assertTrue(mic.recording)
+        assertTrue(errors.isEmpty())
+        clock.advance(1)
+        assertEquals(FreshSessionFallback.MESSAGE_GAVE_UP, errors.single())
+        assertFalse(mic.recording)
+        assertFalse(wake.held)
+    }
+
+    @Test fun anOutageDoesNotRestartTheExpiredFreshServerBudget() = withHarness {
+        connectWithHandle()
+        transport.current.reject1008()
+        clock.advance(6_000)
+        transport.current.fail(IOException("cancelled"))
+        transport.current.fail(dns())
+        repeat(30) { i ->
+            clock.advance(if (i == 0) 2_000 else 4_000)
+            transport.current.fail(dns())
+        }
+        clock.advance(2_000)
+        assertTrue(mic.recording) // 120 s into the DNS window, past the 90 s server budget
+        network.signalAvailable()
+        transport.current.open()
+        transport.current.reject1008() // Gemini is reachable but still refuses it
+        assertEquals(FreshSessionFallback.MESSAGE_GAVE_UP, errors.single())
+        assertFalse(mic.recording)
+    }
+
+    @Test fun actualFreshSetupFailureIsTerminalAndRedacted() = withHarness {
+        connectWithHandle()
+        transport.current.reject1008()
+        clock.advance(6_000)
+        transport.current.fail(IOException("cancelled"))
+        transport.current.open()
+        transport.current.message("""{"error":{"code":401,"message":"refused unit-test-placeholder"}}""")
+        assertEquals(LiveState.FAILED, states.last())
+        assertFalse(errors.single().contains("refused"))
+        assertFalse(voice.endDiagnostics().contains("unit-test-placeholder"))
+        assertFalse(mic.recording)
+        val opens = transport.opens.size
+        transport.current.fail(IOException("cancelled"))
+        clock.advance(180_000)
+        assertEquals(opens, transport.opens.size)
+    }
+
+    @Test fun manualRestartWaitsForTheCancelledPreviousEngine() = withHarness {
+        voice.start()
+        val old = transport.current
+        voice.stop()
+        assertTrue(old.cancelled)
+        val restarted = Harness(auto = false, transport = transport)
+        try {
+            restarted.voice.start()
+            old.fail(IOException("cancelled"), drain = false)
+            restarted.clock.advance(9_999)
+            assertEquals(1, transport.opens.size)
+            old.drain()
+            assertEquals(2, transport.opens.size)
+            transport.current.openAndSetup()
+            restarted.clock.advance(1)
+            assertTrue(restarted.errors.isEmpty())
+        } finally {
+            restarted.voice.stop()
+        }
+    }
+
     @Test fun userStopCancelsWaitingRetryAndReleasesMicAndWakeLockWithoutError() = withHarness {
         connect()
         beginDnsOutage()
@@ -239,10 +340,9 @@ class GeminiLiveRecoveryTest {
         try { harness.test() } finally { harness.voice.stop() }
     }
 
-    private class Harness(auto: Boolean) {
+    private class Harness(auto: Boolean, val transport: FakeTransport = FakeTransport()) {
         val clock = FakeClock()
         val network = FakeNetwork()
-        val transport = FakeTransport()
         val mic = FakeMic()
         val wake = FakeWakeLock()
         val errors = mutableListOf<String>()

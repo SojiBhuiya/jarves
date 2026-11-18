@@ -40,10 +40,14 @@ internal interface LiveSocketTransport {
 }
 
 internal class OkHttpVoiceTransport(pingIntervalSeconds: Int) : LiveSocketTransport {
-    // Dedicated to the primary conversation. Auto's separate search session has its own transport.
-    // OkHttp 4.12 Dispatcher counts cancelled calls until AsyncCall finishes, AFTER its callback.
-    // https://github.com/square/okhttp/blob/parent-4.12.0/okhttp/src/main/kotlin/okhttp3/Dispatcher.kt
-    private val dispatcher = Dispatcher()
+    private companion object {
+        // Shared across Stop → Start as cancelled DNS can outlive the previous engine. Auto's
+        // separate search session has its own transport. OkHttp keeps cancelled calls counted
+        // until AsyncCall finishes:
+        // https://github.com/square/okhttp/blob/parent-4.12.0/okhttp/src/main/kotlin/okhttp3/Dispatcher.kt
+        val dispatcher = Dispatcher()
+    }
+
     private val client = OkHttpClient.Builder()
         .dispatcher(dispatcher)
         .connectTimeout(LiveSocketFlight.OPEN_MILLIS, TimeUnit.MILLISECONDS)

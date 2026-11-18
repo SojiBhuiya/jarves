@@ -225,6 +225,11 @@ class ReconnectCoordinator(
             ReconnectAction.WaitForNetwork(deadline, if (first) 2_000L else 4_000L, first)
     }
 
+    /** A timed-out resolver can still return DNS evidence while its cancellation is draining. */
+    fun noteDnsFailure() {
+        if (waitingForNetwork) networkFailure = NetworkDown.DNS
+    }
+
     fun checkNetworkDeadline(now: Long): ReconnectAction =
         if (!gaveUp && networkDeadline?.let { now >= it } == true) {
             giveUp(now, GiveUpReason.NO_NETWORK_TIMEOUT)

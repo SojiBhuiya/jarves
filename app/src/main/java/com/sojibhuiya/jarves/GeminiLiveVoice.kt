@@ -561,12 +561,22 @@ internal class GeminiLiveVoice(
         onState(LiveState.CONNECTING)
         startSessionPower()
         startTimeSyncLoop()
-        flight.request(0L) { connect(attempt = 0, reconnecting = false) }
+        // A manually restarted session shares the transport. Waiting for a previous cancelled
+        // resolver must not open a second socket or leave the new session waiting indefinitely.
+        val drainDeadline = if (!transport.idle) after(LiveSocketFlight.OPEN_MILLIS) {
+            if (flight.hasPending && socket == null) {
+                fail("আগের ভয়েস সংযোগ বন্ধ হতে দেরি হচ্ছে — আবার শুরু করুন।", "previous socket still draining")
+            }
+        } else null
+        flight.request(0L) {
+            drainDeadline?.cancel()
+            connect(attempt = 0, reconnecting = false)
+        }
     }
 
     /** Only [flight] opens a socket. The resume handle is selected once per attempt, not onOpen. */
     private fun connect(attempt: Int, reconnecting: Boolean): WebSocket? {
-        if (!running.get() || checkNetworkDeadline()) return null
+        if (!running.get() || checkNetworkDeadline() || checkFreshDeadline()) return null
         if (freshFallback.handleDeadline != null && (switchToFreshIfDue() || !freshFallback.takeHandleRetry())) return null
         activeNormalAttempt = attempt
         pendingNormalAttempt = 0
@@ -590,7 +600,7 @@ internal class GeminiLiveVoice(
 
         return transport.open(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response): Unit = synchronized(sessionLock) {
-                if (socket !== webSocket || checkNetworkDeadline() || switchToFreshIfDue()) return
+                if (socket !== webSocket || checkNetworkDeadline() || switchToFreshIfDue() || checkFreshDeadline()) return
                 if (!flight.opened(webSocket, response.code)) return
                 onEndpointReachable()
                 websocketOpened = true
@@ -880,10 +890,15 @@ internal class GeminiLiveVoice(
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?): Unit = synchronized(sessionLock) {
                 try {
-                    if (socket !== webSocket || checkNetworkDeadline() || switchToFreshIfDue()) return
-                    closeCallback = "onFailure"
+                    if (!running.get() || !flight.owns(webSocket)) return
                     val http = response?.code
                     val down = if (http == null) NetworkDown.from(t, opening = flight.opening) else null
+                    if (down == NetworkDown.DNS && reconnectPlan.waitingForNetwork) {
+                        reconnectPlan.noteDnsFailure()
+                        if (socket !== webSocket) sessionTimeline.mark(now(), "DNS failure returned while socket was cancelling")
+                    }
+                    if (socket !== webSocket || checkNetworkDeadline() || switchToFreshIfDue()) return
+                    closeCallback = "onFailure"
                     val causes = generateSequence(t) { it.cause }.take(5).joinToString(" <- ") { it.javaClass.simpleName }
                     // No exception messages/requests here: they may contain the credential URL.
                     val reason = when {
@@ -1566,12 +1581,17 @@ internal class GeminiLiveVoice(
         val deadline = freshFallback.freshDeadline ?: return
         freshDeadlineTask = after((deadline - now()).coerceAtLeast(0L)) {
             freshDeadlineTask = null
-            // A genuine DNS/no-route outage gets its own network window. The next 1008 will
-            // still see the original server-busy deadline; it cannot start a new 90 s budget.
-            if (!reconnectPlan.waitingForNetwork) {
-                giveUpAfterReconnects(FreshSessionFallback.MESSAGE_GAVE_UP, "fresh 1008 budget spent")
-            }
+            checkFreshDeadline()
         }
+    }
+
+    private fun checkFreshDeadline(): Boolean {
+        val deadline = freshFallback.freshDeadline ?: return false
+        // A genuine DNS/no-route outage has its own deadline. It may reach setup after 90 s,
+        // but a new 1008 will still see the original, expired server-busy budget.
+        if (now() < deadline || reconnectPlan.waitingForNetwork) return false
+        giveUpAfterReconnects(FreshSessionFallback.MESSAGE_GAVE_UP, "fresh 1008 budget spent")
+        return true
     }
 
     private fun tryAutomaticReconnect(
@@ -1956,11 +1976,11 @@ internal class GeminiLiveVoice(
         netMonitor.removeListeners(networkAvailableListener, networkLostListener)
         clock.shutdown()
         releaseWakeLock("session ended")
+        if (recorder != null) releaseMicrophone("stopped")
         stallTolerance.onSessionEnded(now(), sessionTimeline.sessionStartMillis, "session ended")
         reportMicGaps("final partial minute")
         searchRunner?.shutdown()
         searchRunner = null
-        if (recorder != null) releaseMicrophone("stopped")
         playbackActive.set(false)
         playbackQueue.clear()
         playbackThread?.interrupt()
