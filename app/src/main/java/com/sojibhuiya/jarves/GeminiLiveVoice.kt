@@ -30,6 +30,7 @@ import com.sojibhuiya.jarves.intelligence.FreshSessionFallback
 import com.sojibhuiya.jarves.intelligence.StallTolerance
 import com.sojibhuiya.jarves.intelligence.SessionTimeline
 import com.sojibhuiya.jarves.intelligence.CompactDiagnostics
+import com.sojibhuiya.jarves.intelligence.ServerMessageLog
 import com.sojibhuiya.jarves.intelligence.SearchAnswerRules
 import com.sojibhuiya.jarves.intelligence.NoticePolicy
 import com.sojibhuiya.jarves.intelligence.LivePingSetting
@@ -315,7 +316,7 @@ class GeminiLiveVoice(
     /** Task 6: the diagnostics block must stay under ~6,000 characters. */
     @Volatile private var lastCompactDiagnostics = ""
     /** Task B: audio waiting for the socket, bounded by [StallTolerance.KEEP_BYTES]. */
-    private val audioBuffer = java.util.ArrayDeque<ByteArray>()
+    private val audioBuffer = ArrayDeque<ByteArray>()
     /** Task C: the identity/transport of the default network we already counted. */
     @Volatile private var lastNetworkIdentity: Long = -1L
     @Volatile private var lastNetworkType: String = NetworkSnapshot.TYPE_UNKNOWN
