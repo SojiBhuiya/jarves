@@ -67,11 +67,21 @@ jobs:
           JARVES_KEYSTORE_PASSWORD: ${{ secrets.JARVES_KEYSTORE_PASSWORD }}
           JARVES_KEY_ALIAS: ${{ secrets.JARVES_KEY_ALIAS }}
           JARVES_KEY_PASSWORD: ${{ secrets.JARVES_KEY_PASSWORD }}
-        run: gradle assembleDebug
+        run: |
+          set -o pipefail
+          gradle --console=plain assembleDebug 2>&1 | awk '
+            { print }
+            /^e: file:.*\/app\/src\// { print "::error::" substr($0, index($0,"/app/src/")+1) }
+          '
 
       - name: Run unit tests
         run: |
-          gradle testDebugUnitTest
+          set -o pipefail
+          gradle --console=plain testDebugUnitTest 2>&1 | awk '
+            { print }
+            /^e: file:.*\/app\/src\// { print "::error::" substr($0, index($0,"/app/src/")+1) }
+            / > .* FAILED$/ { print "::error::" $0 }
+          '
           python3 - <<'PYTEST'
           from pathlib import Path
           from xml.etree import ElementTree

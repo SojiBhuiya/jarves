@@ -87,7 +87,8 @@ enum class NetworkDown {
                 causes.any { it is UnknownHostException } || has("EAI_NODATA") || has("EAI_NONAME") -> DNS
                 causes.any { it is NoRouteToHostException } || has("ENETUNREACH") ||
                     has("EHOSTUNREACH") || has("Network is unreachable") || has("No route to host") -> NO_ROUTE
-                has("connect timed out") || has("connect timeout") || has("ETIMEDOUT") && opening ||
+                has("connect timed out") || has("connect timeout") ||
+                    opening && (has("ETIMEDOUT") || has("connection timed out")) ||
                     opening && causes.any { it is SocketTimeoutException ||
                         it is InterruptedIOException && it.message.equals("timeout", ignoreCase = true) } -> CONNECT_TIMEOUT
                 else -> null

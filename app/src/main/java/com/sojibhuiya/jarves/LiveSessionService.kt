@@ -38,8 +38,8 @@ import android.os.IBinder
  * Jarves only calls [start] from the moment the user taps the mic button, i.e. with the activity in
  * front, and [stop] as soon as the session ends.
  *
- * The service owns **no** audio itself: it is only the process-level guarantee. The mic, the socket
- * and the updater all stay in [GeminiLiveVoice], so nothing about pause/stop/reconnect changes.
+ * The service owns no audio. It permits background capture, not uninterrupted CPU/network:
+ * https://developer.android.com/training/monitoring-device-state/doze-standby
  */
 class LiveSessionService : Service() {
 

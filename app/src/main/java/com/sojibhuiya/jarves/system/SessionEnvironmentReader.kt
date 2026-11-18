@@ -63,12 +63,11 @@ class SessionEnvironmentReader(
                 override fun onActivityDestroyed(activity: Activity) {}
             })
         }
-        startNetworkWatch()
+        if (networkMonitor == null) startNetworkWatch()
     }
 
     /**
-     * Records when the default network last changed and what it is now. `registerDefaultNetworkCallback`
-     * needs no permission on any API level the app supports (minSdk 26).
+     * Fallback for callers without the shared monitor; requires ACCESS_NETWORK_STATE.
      */
     private fun startNetworkWatch() {
         val manager = connectivity ?: return

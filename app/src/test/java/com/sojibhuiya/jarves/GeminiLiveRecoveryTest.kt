@@ -353,7 +353,7 @@ class GeminiLiveRecoveryTest {
         fun openAndSetup() { open(); message("""{"setupComplete":{}}""") }
         fun fail(reason: Throwable, drain: Boolean = true) {
             listener.onFailure(this, reason, null)
-            if (drain) drain()
+            if (drain) this.drain()
         }
         fun reject1008() {
             val reason = "BidiGenerateContent session is already connected to an existing client"

@@ -387,7 +387,7 @@ internal class GeminiLiveVoice(
     private val micReports = ArrayDeque<String>()
     private var lastFailureDetail = "none"
     private var hasStarted = false
-    private var wakeCapReached = false
+    @Volatile private var wakeCapReached = false
     /**
      * Injected on Android (see [SessionEnvironmentReader]); "unknown" until [init] runs, which is
      * exactly the right answer for a plain-JVM test.
@@ -567,7 +567,6 @@ internal class GeminiLiveVoice(
     private fun connect(attempt: Int, reconnecting: Boolean): WebSocket? {
         if (!running.get() || checkNetworkDeadline()) return null
         if (freshFallback.handleDeadline != null && (switchToFreshIfDue() || !freshFallback.takeHandleRetry())) return null
-        if (reconnecting) stallTolerance.onSocketReplaced(now(), sessionTimeline.sessionStartMillis)
         activeNormalAttempt = attempt
         pendingNormalAttempt = 0
         closeFlow.reset()
@@ -922,7 +921,9 @@ internal class GeminiLiveVoice(
                     flight.terminal(webSocket)
                 }
             }
-        })
+        }).also {
+            if (reconnecting) stallTolerance.onSocketReplaced(now(), sessionTimeline.sessionStartMillis)
+        }
     }
 
     private fun onCloseFrame(code: Int, reason: String, hadHandle: Boolean, usedHandle: String?) {
@@ -950,12 +951,15 @@ internal class GeminiLiveVoice(
         runCatching { socket?.close(if (code == 1000) code else 1000, "close acknowledged") }
     }
 
-    private fun safeDetail(text: String, usedHandle: String? = null): String {
-        var clean = GroundedSearchClient.scrubSecret(text)
+    private fun redactSecrets(text: String, usedHandle: String? = null): String {
+        var clean = text
         listOfNotNull(apiKey.takeIf { it.isNotBlank() }, usedHandle, resumption.handleForReconnect())
             .filter { it.isNotBlank() }.forEach { clean = clean.replace(it, "[redacted]") }
-        return clean.replace(Regex("\\s+"), " ").take(200)
+        return GroundedSearchClient.scrubSecret(clean)
     }
+
+    private fun safeDetail(text: String, usedHandle: String? = null): String =
+        redactSecrets(text, usedHandle).replace(Regex("\\s+"), " ").take(200)
 
     // Auto mode installs a runner for the whole conversation; its existence is not a tool call.
     private fun liveSearchPending(): Boolean = (searchRunner?.active ?: 0) > 0 || pendingResults.size > 0
@@ -1159,9 +1163,10 @@ internal class GeminiLiveVoice(
 
     /** Hidden Settings → Advanced → Diagnostics only. */
     fun endDiagnostics(): String = synchronized(sessionLock) {
-        diagnosticSummary() + "\n" + endEnvironment() + "\n" + compactDiagnostics() +
+        if (running.get()) checkWakeCap()
+        redactSecrets(diagnosticSummary() + "\n" + endEnvironment() + "\n" + compactDiagnostics() +
             "\nMic minute samples:\n" + micReports.joinToString("\n") +
-            "\nDetailed session events:\n" + sessionTimeline.lines().joinToString("\n")
+            "\nDetailed session events:\n" + sessionTimeline.lines().joinToString("\n"))
     }
 
     private fun endEnvironment(): String = SessionDiagnostics.line(
@@ -1700,15 +1705,22 @@ internal class GeminiLiveVoice(
     private fun startSessionPower() {
         runCatching { wakeLock.acquire(WAKE_CAP_MILLIS) }
         sessionTimeline.mark(now(), "session start: wakeLockHeld=${wakeHeld()}")
-        after(WAKE_CAP_MILLIS) {
+        after(WAKE_CAP_MILLIS) { checkWakeCap() }
+        scheduleMicReport()
+    }
+
+    // Android also has acquire(timeout). If the timer was delayed by suspension, enforce the
+    // elapsed deadline on the first audio callback (or diagnostic read) after it resumes.
+    private fun checkWakeCap() {
+        if (!wakeCapReached && now() - sessionTimeline.sessionStartMillis >= WAKE_CAP_MILLIS) {
             wakeCapReached = true
             releaseWakeLock("60-minute cap")
         }
-        scheduleMicReport()
     }
 
     private fun scheduleMicReport() {
         after(MIC_REPORT_MILLIS) {
+            checkWakeCap()
             reportMicGaps("minute")
             scheduleMicReport()
         }
@@ -1729,7 +1741,7 @@ internal class GeminiLiveVoice(
     }
 
     /** Connection diagnostics must never appear as chat messages or status text. */
-    private fun fail(message: String, detail: String) = synchronized(sessionLock) {
+    private fun fail(message: String, detail: String): Unit = synchronized(sessionLock) {
         if (running.getAndSet(false)) {
             lastFailureDetail = safeDetail(detail)
             sessionTimeline.mark(now(), "terminal failure: $lastFailureDetail")
@@ -1743,7 +1755,7 @@ internal class GeminiLiveVoice(
         }
     }
 
-    private fun liveStatus(line: String) = synchronized(sessionLock) {
+    private fun liveStatus(line: String): Unit = synchronized(sessionLock) {
         if (running.get() && flight.ready && !flight.hasPending && !reconnectPlan.waitingForNetwork) onStatus(line)
     }
 
@@ -1785,7 +1797,11 @@ internal class GeminiLiveVoice(
                 return
             }
             if (count == 0) continue
-            micGaps.onRead(now())
+            val readAt = now()
+            micGaps.onRead(readAt)
+            if (!wakeCapReached && readAt - sessionTimeline.sessionStartMillis >= WAKE_CAP_MILLIS) {
+                synchronized(sessionLock) { if (running.get()) checkWakeCap() }
+            }
             val activeSocket = socket ?: continue
             if (!setupDone.get()) continue
             if (bufferSocket !== activeSocket) {
@@ -1817,9 +1833,14 @@ internal class GeminiLiveVoice(
             // Preserve 0.2.16's bounded buffering and drain at most two chunks per read.
             audioBuffer.addLast(buffer.copyOf(count))
             var sent = true
-            repeat(minOf(2, audioBuffer.size)) {
-                if (activeSocket !== socket || !setupDone.get()) return@repeat
-                if (sent) sent = activeSocket.send(frameFor(audioBuffer.removeFirst()))
+            for (index in 0 until minOf(2, audioBuffer.size)) {
+                if (activeSocket !== socket || !setupDone.get()) break
+                val chunk = audioBuffer.removeFirst()
+                if (!activeSocket.send(frameFor(chunk))) {
+                    audioBuffer.addFirst(chunk)
+                    sent = false
+                    break
+                }
             }
             synchronized(sessionLock) {
                 if (activeSocket !== socket || !running.get()) return@synchronized
