@@ -42,12 +42,20 @@ interface NetworkMonitor {
     /** Called when the default network is lost. */
     fun onLost(listener: (NetworkSnapshot) -> Unit)
 
+    /**
+     * 0.2.16 (task C): identity of the current default network object, `-1` when unknown. A change is
+     * counted only when this value changes, when the transport type changes, or on `onLost` —
+     * capability/link-property updates are counted separately by the implementation.
+     */
+    fun networkIdentity(): Long = -1L
+
     companion object {
         /** Used by plain-JVM tests and as the safe default. */
         val NONE: NetworkMonitor = object : NetworkMonitor {
             override fun snapshot(): NetworkSnapshot = NetworkSnapshot.UNKNOWN
             override fun onAvailable(listener: (NetworkSnapshot) -> Unit) = Unit
             override fun onLost(listener: (NetworkSnapshot) -> Unit) = Unit
+            override fun networkIdentity(): Long = -1L
         }
     }
 }

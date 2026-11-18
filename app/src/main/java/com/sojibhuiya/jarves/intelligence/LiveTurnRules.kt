@@ -122,6 +122,24 @@ class SearchTurnGuard {
     /** Rule 1: more than one acknowledgement inside one search = the reported bug. */
     fun acknowledgedMoreThanOnce(): Boolean = acknowledgements > 1
 
+    /**
+     * 0.2.16 (task 5): the counter bug. `acks`/`speechWhilePending` are **per search**, so five
+     * searches with one acknowledgement each must report zero violations; 0.2.15 compared the
+     * cumulative acknowledgement count with a per-call limit and printed
+     * "acknowledged 2 times while search pending … 5 times".
+     *
+     * Called by the engine on every new `toolCall`, before [onToolCall].
+     */
+    fun startSearch(callId: String) {
+        lastCallId = callId
+        acknowledgements = 0
+        speechWhilePending = 0
+    }
+
+    /** The call id of the search these counters belong to (diagnostics only, never printed in full). */
+    var lastCallId: String = ""
+        private set
+
     /** Rule 3/4: may the app add "I could not verify" context right now? */
     fun canInjectContext(): Boolean = !searchPending && failuresAnnounced == 0
 
@@ -139,7 +157,7 @@ class SearchTurnGuard {
     fun describe(): String = buildString {
         append("pending=").append(searchPending)
         append(", toolCalls=").append(toolCalls)
-        append(", acks=").append(acknowledgements)
+        append(", acks(this search)=").append(acknowledgements)
         append(", speechWhilePending=").append(speechWhilePending)
         append(", failures=").append(failuresAnnounced)
         append(", injections=").append(contextInjections)
@@ -285,10 +303,42 @@ class ServerMessageLog(private val capacity: Int = TurnRules.SEARCH_MESSAGE_LOG_
     var dropped: Int = 0
         private set
 
+    /** 0.2.16 (task 6): counted, never listed. */
+    var modelTurnCount: Int = 0
+        private set
+    var transcriptionCount: Int = 0
+        private set
+    var firstTranscriptionAtMillis: Long = 0L
+        private set
+    var lastTranscriptionAtMillis: Long = 0L
+        private set
+    var lastModelTurnAtMillis: Long = 0L
+        private set
+
+    /**
+     * 0.2.16 (task 6): `modelTurn` and `outputTranscription` frames are the two that arrive dozens of
+     * times per answer; they are counted in [modelTurnCount] / [transcriptionCount] instead of being
+     * listed. Everything else (setup, completion flags, tool calls, errors) is logged as before —
+     * that is what the "why did it wait?" question needs.
+     */
     fun record(atMillis: Long, raw: String) {
+        val type = classify(raw)
+        if (type.contains("modelTurn")) {
+            modelTurnCount += 1
+            lastAtMillis = atMillis
+            lastModelTurnAtMillis = atMillis
+            return
+        }
+        if (type.contains("outputTranscription")) {
+            transcriptionCount += 1
+            if (firstTranscriptionAtMillis == 0L) firstTranscriptionAtMillis = atMillis
+            lastAtMillis = atMillis
+            lastTranscriptionAtMillis = atMillis
+            return
+        }
         val gap = if (lastAtMillis == 0L) 0L else atMillis - lastAtMillis
         lastAtMillis = atMillis
-        entries.addLast(Entry(atMillis, classify(raw), raw.length, gap))
+        entries.addLast(Entry(atMillis, type, raw.length, gap))
         while (entries.size > capacity) {
             entries.removeFirst()
             dropped += 1
@@ -302,8 +352,11 @@ class ServerMessageLog(private val capacity: Int = TurnRules.SEARCH_MESSAGE_LOG_
         "t+${InjectionLedger.seconds(entry.atMillis - startedAt)}$gap ${entry.type} ${entry.bytes}B"
     }
 
-    fun text(startedAt: Long): String =
-        lines(startedAt).joinToString(" | ").ifEmpty { "none" }
+    fun text(startedAt: Long): String {
+        val counts = "modelTurn x$modelTurnCount, transcr x$transcriptionCount"
+        val listed = lines(startedAt).joinToString(" | ").ifEmpty { "none" }
+        return "$counts | $listed"
+    }
 
     companion object {
         /** Only the shape is needed in the log: the type names come from the Live API reference. */

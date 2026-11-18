@@ -142,7 +142,7 @@ class LiveTurnRulesTest {
         assertEquals(1, guard.acknowledgements)
         assertEquals(2, guard.speechWhilePending)
         assertTrue(guard.violations().isEmpty())
-        assertTrue(guard.describe(), guard.describe().startsWith("pending=true, toolCalls=1, acks=1"))
+        assertTrue(guard.describe(), guard.describe().startsWith("pending=true, toolCalls=1, acks(this search)=1"))
     }
 
     @Test(timeout = 20_000)
@@ -340,10 +340,17 @@ class LiveTurnRulesTest {
         log.record(start + 4_300L, """{"usageMetadata":{"totalTokenCount":12}}""")
         repeat(120) { log.record(start + 5_000L + it, """{"serverContent":{"modelTurn":{}}}""") }
 
-        assertEquals("capacity", 100, log.size)
-        assertEquals(24, log.dropped)
+        // 0.2.16 (task 6): modelTurn frames are COUNTED, not listed — that is what keeps the block
+        // under 6,000 characters. The non-chatty frames are still listed, oldest dropped first.
+        assertEquals("modelTurn frames are counted", 120, log.modelTurnCount)
+        assertEquals("transcription frames are counted", 1, log.transcriptionCount)
+        // one setupComplete + one turnComplete are listed; the transcription and the modelTurn
+        // frames are counted. (usageMetadata is counted as "other" but classified as usage — it is
+        // in the list, which is why the number is 3.)
+        assertEquals("only the other frames are listed", 3, log.size)
+        assertEquals(0, log.dropped)
         val tail = log.lines(start)
-        assertTrue(tail[0].startsWith("t+5.0s"))
+        assertTrue("the three listed lines carry their own t+", tail[0].startsWith("t+0.0s setupComplete"))
         assertTrue(
             ServerMessageLog.classify("""{"serverContent":{"generationComplete":true}}""") ==
                 "serverContent.generationComplete"
@@ -369,9 +376,13 @@ class LiveTurnRulesTest {
 
         val text = log.text(start)
         assertTrue(text, text.contains("t+3.2s"))
-        assertTrue("rule 9: the missing turnComplete must be visible", text.contains("outputTranscription"))
+        // 0.2.16 (task 6): the transcription frames are summarised as a count, the completion flags
+        // are still listed one by one — the missing turnComplete is therefore still visible.
+        assertTrue("rule 9 + task 6: transcriptions are counted", text.contains("transcr x2"))
         assertFalse("no completion flag arrived in the measured run", text.contains("turnComplete"))
-        assertTrue(text, text.contains("(+0.2s)")) // the gap between the two chunks is logged too
+        // the gap between the two transcription chunks (both counted) is still measurable
+        assertEquals(2, log.transcriptionCount)
+        assertEquals(0L, log.firstTranscriptionAtMillis - 6_749L)
     }
 
     // ---------------------------------------------- rules 10/11: how a search is allowed to end --

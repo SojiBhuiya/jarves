@@ -36,8 +36,31 @@ class AndroidNetworkMonitor(context: Context) : NetworkMonitor {
     @Volatile private var availableState: Boolean = false
     @Volatile private var lastLostAt: Long? = null
     @Volatile private var changedAt: Long? = null
+    @Volatile private var changes: Int = 0
     @Volatile private var failure: String = ""
     @Volatile private var registered = false
+
+    // ---- 0.2.16 (task C): only a REAL change is a change -------------------------------------
+    /**
+     * Identity of the default network object and its transport type, so a change can be told apart
+     * from noise. Android's own contract (quoted in [com.sojibhuiya.jarves.intelligence.SessionTimeline]):
+     * `onAvailable` = "the framework connects and has declared a new network ready for use",
+     * `onLost` = "a network disconnects", `onCapabilitiesChanged` = "changes capabilities but still
+     * satisfies the requested criteria", `onLinkPropertiesChanged` = "changes LinkProperties"
+     * (https://developer.android.com/reference/android/net/ConnectivityManager.NetworkCallback).
+     * Only the first two may therefore count as a change.
+     */
+    @Volatile private var lastNetworkId: Long = -1L
+    @Volatile private var lastTransport: String = NetworkSnapshot.TYPE_UNKNOWN
+    @Volatile private var capabilityUpdates: Int = 0
+
+    /** Real changes counted this process: a new default network, a transport switch, an onLost. */
+    fun networkChangeCount(): Int = changes
+
+    /** Capability / link-property callbacks: counted, never treated as a change. */
+    fun capabilityUpdateCount(): Int = capabilityUpdates
+
+    private val changeListeners = CopyOnWriteArrayList<(NetworkSnapshot, String) -> Unit>()
 
     init {
         register()
@@ -54,25 +77,63 @@ class AndroidNetworkMonitor(context: Context) : NetworkMonitor {
             cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     val snapshot = readCurrent(cm)
-                    changedAt = System.currentTimeMillis()
-                    availableState = true
+                    val id = identityOf(network)
+                    val transport = typeOf(cm.getNetworkCapabilities(network))
+                    // A new default network, or the same network object on a different transport:
+                    // a real change. `onAvailable` always fires once at startup, which is fine — it is
+                    // the first value, not a change of a value we already had.
+                    if (lastNetworkId == -1L || id != lastNetworkId || transport != lastTransport) {
+                        val wasKnown = lastNetworkId != -1L
+                        lastNetworkId = id
+                        lastTransport = transport
+                        changedAt = System.currentTimeMillis()
+                        availableState = true
+                        if (wasKnown) {
+                            changes += 1
+                            changeListeners.forEach { runCatching { it(snapshot, "onAvailable($transport)") } }
+                        }
+                    } else {
+                        capabilityUpdates += 1
+                    }
                     availableListeners.forEach { runCatching { it(snapshot) } }
                 }
 
                 override fun onLost(network: Network) {
                     lastLostAt = System.currentTimeMillis()
-                    readCurrent(cm)
-                    val snapshot = snapshot()
-                    lostListeners.forEach { runCatching { it(snapshot) } }
+                    if (lastNetworkId == -1L || identityOf(network) == lastNetworkId) {
+                        changes += 1
+                        lastNetworkId = -1L
+                        lastTransport = NetworkSnapshot.TYPE_NONE
+                        readCurrent(cm)
+                        val snapshot = snapshot()
+                        changeListeners.forEach { runCatching { it(snapshot, "onLost") } }
+                        lostListeners.forEach { runCatching { it(snapshot) } }
+                    }
                 }
 
                 override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+                    // 0.2.16 (task C): signal strength / bandwidth estimates land here. Count them,
+                    // never treat them as a network change (the 0.2.15 log said "CHANGED" while the
+                    // user stood still on a working connection).
                     val next = typeOf(capabilities)
-                    if (next != type) {
+                    if (next != type && next != NetworkSnapshot.TYPE_UNKNOWN) {
+                        // The transport genuinely changed underneath the same network object.
                         type = next
+                        lastTransport = next
                         changedAt = System.currentTimeMillis()
+                        changes += 1
+                        val snapshot = snapshot()
+                        changeListeners.forEach { runCatching { it(snapshot, "transport($next)") } }
+                    } else {
+                        capabilityUpdates += 1
                     }
                     availableState = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                }
+
+                override fun onLinkPropertiesChanged(network: Network, linkProperties: android.net.LinkProperties) {
+                    // New IPs/DNS/routes: reported, but NOT a change on its own (the same network
+                    // object keeps serving the same session).
+                    capabilityUpdates += 1
                 }
             })
             registered = true
@@ -96,6 +157,20 @@ class AndroidNetworkMonitor(context: Context) : NetworkMonitor {
             type = NetworkSnapshot.TYPE_UNKNOWN
             snapshot()
         }
+    }
+
+    /** A stable identity for a `Network` object: its hash, which the platform keeps per network. */
+    private fun identityOf(network: Network): Long = network.hashCode().toLong()
+
+    /** 0.2.16 (task C): the identity the engine compares against; -1 while unknown. */
+    override fun networkIdentity(): Long = lastNetworkId
+
+    /**
+     * 0.2.16 (task C): a listener for REAL changes only — a new default network object, a transport
+     * switch, or `onLost` for the default network. The second argument says which.
+     */
+    fun onChange(listener: (NetworkSnapshot, String) -> Unit) {
+        changeListeners += listener
     }
 
     private fun typeOf(capabilities: NetworkCapabilities?): String = when {

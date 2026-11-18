@@ -38,7 +38,18 @@ data class SearchResultItem(
  */
 object SearchResultText {
 
+    /**
+     * 0.2.16 (task 4): the chat bubble keeps the whole answer; only the spoken copy is bounded. The
+     * value is unchanged on purpose — 0.2.15's phone run showed the chat side working.
+     */
     const val MAX_ANSWER_SENTENCES = 3
+
+    /** 0.2.16 (task 4): spoken copy = at most 2 sentences / ~35 words, cut at a sentence boundary. */
+    fun spokenText(item: SearchResultItem): String =
+        if (!item.success) "" else SearchAnswerRules.truncateForToolResponse(item.answer)
+
+    /** Words in the spoken copy (diagnostics, task 4: "log word counts"). */
+    fun spokenWords(item: SearchResultItem): Int = SearchAnswerRules.wordCount(spokenText(item))
 
     /**
      * The `toolResponse` payload. Keep it short and factual: the model turns it into speech.
@@ -55,16 +66,18 @@ object SearchResultText {
             return@buildString
         }
         append("The user's question was: \"").append(item.question.take(160)).append("\".\n")
-        append("Answer: ").append(limitSentences(item.answer)).append('\n')
+        // 0.2.16 (task 4): only this copy is bounded — it is what the voice model speaks. The chat
+        // line below keeps the full text and the source names.
+        append("Answer: ").append(spokenText(item)).append('\n')
         if (item.sourceName.isNotBlank()) append("Source: ").append(item.sourceName).append('\n')
         if (item.askedBeforeResult) {
             append("The user has asked other things since this question, so BEGIN by naming the ")
             append("question, for example: \"আপনি ")
             append(item.question.take(60))
-            append(" জানতে চেয়েছিলেন, তার উত্তর: …\", then answer in a few short sentences. ")
+            append(" জানতে চেয়েছিলেন, তার উত্তর: …\", then answer in one short sentence. ")
             append("Never cut off or replace an answer that is already being given.")
         } else {
-            append("Answer naturally in a few short sentences and name the source.")
+            append("Answer in one short sentence and name the source.")
         }
         append(" Never invent facts or links.")
     }
@@ -76,7 +89,8 @@ object SearchResultText {
     fun chatLine(item: SearchResultItem, kindLabel: String = "সার্চ"): String = buildString {
         append("🔎 ").append(kindLabel).append(" — প্রশ্ন: ").append(item.question.take(200)).append('\n')
         if (item.success) {
-            append("উত্তর: ").append(limitSentences(item.answer))
+            // 0.2.16 (task 4): the chat keeps the FULL text; [spokenText] is what the voice says.
+            append("উত্তর: ").append(item.answer.trim())
             if (item.sourceName.isNotBlank()) append('\n').append("সূত্র: ").append(item.sourceName)
         } else {
             append("সার্চ করা যায়নি, তাই এই প্রশ্নের নির্ভরযোগ্য উত্তর দেওয়া যাচ্ছে না।")

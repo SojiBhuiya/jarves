@@ -17,13 +17,18 @@ class SearchAnswerRulesTest {
     // ------------------------------------------------- (A) the instruction text -------------
 
     @Test
-    fun `the search session is told to answer in two short sentences of about 25 words`() {
+    fun `the search session is told to answer in ONE sentence of at most 20 words`() {
+        // 0.2.16 (task 4): the phone showed 30 / 40 / 51-word answers although the rule said ~25.
         val instruction = SearchAnswerRules.instruction()
         assertTrue(SearchAnswerRules.isShortAnswerInstruction(instruction))
-        assertTrue(instruction, instruction.contains("at most 2 short plain sentences"))
-        assertTrue(instruction, instruction.contains("about 25 words"))
+        assertTrue(instruction, instruction.contains("ONE sentence of at most 20 words"))
+        assertTrue("no advice", instruction.contains("No advice"))
+        assertTrue("numbers carry their units", instruction.contains("each number with its unit"))
         assertTrue("the answer must be in the language of the question",
             instruction.contains("language of the question"))
+        // Task 4 also asked for exactly one short example question/answer inside the instruction.
+        assertTrue(instruction, instruction.contains("Example — question:"))
+        assertEquals(1, Regex("Example").findAll(instruction).count())
     }
 
     @Test
@@ -34,9 +39,9 @@ class SearchAnswerRulesTest {
         assertFalse(instruction, instruction.contains("three short sentences"))
         assertFalse(instruction, instruction.contains("state the source name"))
         assertFalse(instruction, instruction.contains("state the source"))
-        assertTrue(instruction, instruction.contains("Do not write a greeting"))
-        assertTrue(instruction, instruction.contains("Do not repeat the question"))
-        assertTrue(instruction, instruction.contains("No markdown"))
+        assertTrue(instruction, instruction.contains("no greeting"))
+        assertTrue(instruction, instruction.contains("no repeat of the question"))
+        assertTrue(instruction, instruction.contains("no markdown"))
         assertTrue("sources come from groundingMetadata, not from the words",
             instruction.contains("no source line"))
         // An instruction that is longer than the answer would defeat the purpose.
@@ -50,7 +55,7 @@ class SearchAnswerRulesTest {
     fun `the setup frame carries the short-answer instruction and still asks for transcription`() {
         val frame = LiveSessionConfig.searchSessionSetupJson(model = LiveModels.SEARCH_NATIVE_AUDIO, voiceName = "Aoede")
         assertTrue(frame, frame.contains(SearchAnswerRules.MARK))
-        assertTrue(frame, frame.contains("about 25 words"))
+        assertTrue(frame, frame.contains("at most 20 words"))
         // Unchanged on purpose: native-audio models only support AUDIO, so text comes from the
         // output transcription (live-guide → Limitations → Response modalities).
         assertTrue(frame, frame.contains("\"outputAudioTranscription\""))
