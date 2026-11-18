@@ -45,6 +45,7 @@ import com.sojibhuiya.jarves.intelligence.LivePingSetting
 import com.sojibhuiya.jarves.intelligence.SearchTurnGuard
 import com.sojibhuiya.jarves.intelligence.TurnRules
 import com.sojibhuiya.jarves.intelligence.TurnTranscript
+import com.sojibhuiya.jarves.intelligence.formatRelativeMillis
 import com.sojibhuiya.jarves.intelligence.formatSeconds
 import com.sojibhuiya.jarves.intelligence.LiveSearchTool
 import com.sojibhuiya.jarves.intelligence.LiveModels
