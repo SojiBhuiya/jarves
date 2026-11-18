@@ -150,87 +150,64 @@ class StallAndReconnectTest {
 
     // --------------------------------------------------- task 2: fresh-session fallback ------
 
-    @Test(timeout = 10_000)
-    fun `1008 for twelve seconds then a fresh session succeeds`() {
+    @Test
+    fun `1008 handle policy waits for the six second cutoff after two refusals`() {
         val fallback = FreshSessionFallback()
-        var now = 0L
-        // Handle-based refusals inside the 12 s window: one at 0 s, one at 3 s, one at 8 s.
-        var next = fallback.onAlreadyConnected(now, hadHandle = true, sessionStart = 0L)
-        assertEquals(FreshSessionFallback.Step.RETRY_FRESH, next.step)
-        assertTrue("still with the handle", next.hadHandle)
-        now += 3_000L
-        next = fallback.onAlreadyConnected(now, hadHandle = true, sessionStart = 0L)
-        now += 5_000L
-        next = fallback.onAlreadyConnected(now, hadHandle = true, sessionStart = 0L)
-        now += 4_000L // t+12 s: the window is spent
-        next = fallback.onAlreadyConnected(now, hadHandle = true, sessionStart = 0L)
-        // 0.2.15's log would have called t+12 s another handle attempt; 0.2.16 switches to a fresh
-        // session on this very refusal.
-        assertEquals("the next connection is FRESH", false, next.hadHandle)
-        assertTrue(
-            "the switch must be recorded: " + fallback.timeline().joinToString(" | "),
-            fallback.timeline().any { it.contains("handle phase spent") }
-        )
-        assertEquals("four refusals inside the 12 s window (the last one switches)", 4, fallback.handleAttempts)
-        assertTrue(fallback.inFreshPhase)
+        val retry = fallback.onAlreadyConnected(0L, hadHandle = true, sessionStart = 0L)
+        assertTrue(retry.hadHandle)
+        assertEquals(3_000L, retry.delayMillis)
+        assertTrue(fallback.takeHandleRetry())
+        assertFalse(fallback.takeHandleRetry())
+        val next = fallback.onAlreadyConnected(3_100L, hadHandle = true, sessionStart = 0L)
+        assertEquals(FreshSessionFallback.Step.WAIT_FOR_HANDLE_DEADLINE, next.step)
+        assertEquals(2_900L, next.delayMillis)
+        assertEquals(6_000L, fallback.handleDeadline)
+        assertEquals(2, fallback.handleAttempts)
+        assertTrue(fallback.beginFresh(6_000L, 0L))
+        assertFalse(fallback.beginFresh(6_000L, 0L))
         assertEquals(1, fallback.freshSessionsOpened)
-        assertTrue("the calm line is due", fallback.contextLostAnnounced)
-        assertEquals("সংযোগ ফিরেছে, তবে আগের কথার প্রসঙ্গ হারিয়েছি", FreshSessionFallback.STATUS_CONTEXT_LOST)
-        // The fresh session connects: the state machine resets and the user was told once.
-        fallback.onFreshSessionConnected(now, 0L)
-        assertFalse(fallback.active)
-        fallback.reset()
-        assertEquals(FreshSessionFallback.Phase.HANDLE, fallback.phase)
     }
 
-    @Test(timeout = 10_000)
-    fun `a fresh session rejected for ninety seconds ends with one clear message`() {
+    @Test
+    fun `repeated refusals keep the ninety second budget anchored to the first 1008`() {
         val fallback = FreshSessionFallback()
-        var now = 0L
-        // Burn the handle phase.
-        fallback.onAlreadyConnected(now, hadHandle = true, sessionStart = 0L)
-        now = 3_000L
-        fallback.onAlreadyConnected(now, hadHandle = true, sessionStart = 0L)
-        now = 8_000L
-        fallback.onAlreadyConnected(now, hadHandle = true, sessionStart = 0L)
-        now = 12_000L
-        var next = fallback.onAlreadyConnected(now, hadHandle = true, sessionStart = 0L)
-        assertFalse("fresh from here on: " + fallback.timeline().joinToString(" | "), next.hadHandle)
-
-        var step = FreshSessionFallback.Step.RETRY_FRESH
-        var guard = 0
-        while (step == FreshSessionFallback.Step.RETRY_FRESH && guard < 100) {
-            guard += 1
-            next = fallback.onAlreadyConnected(now, hadHandle = false, sessionStart = 0L)
-            step = next.step
+        fallback.onAlreadyConnected(0L, hadHandle = true, sessionStart = 0L)
+        fallback.beginFresh(6_000L, 0L)
+        var now = 6_000L
+        repeat(20) {
+            val next = fallback.onAlreadyConnected(now, hadHandle = false, sessionStart = 0L)
+            assertFalse(next.hadHandle)
+            if (next.step == FreshSessionFallback.Step.GIVE_UP) {
+                assertEquals(90_000L, now + next.delayMillis)
+                return
+            }
             now += next.delayMillis
         }
-        assertEquals("giving up is the only end", FreshSessionFallback.Step.GIVE_UP, step)
-        assertEquals(FreshSessionFallback.Phase.GIVEN_UP, fallback.phase)
-        assertTrue("the budget is 90 s of waiting, measured from the first 1008: $now", now >= 84_000L)
-        assertTrue("and not much more: $now", now <= 100_000L)
-        assertTrue(fallback.freshAttempts >= 4)
-        assertTrue(
-            "one clear Bengali message",
-            FreshSessionFallback.MESSAGE_GAVE_UP.contains("৯০ সেকেন্ড") &&
-                FreshSessionFallback.MESSAGE_GAVE_UP.contains("মাইক বন্ধ")
-        )
-        assertEquals(90_000L, FreshSessionFallback.FRESH_PHASE_BUDGET_MILLIS)
-        assertEquals(12_000L, FreshSessionFallback.HANDLE_PHASE_MILLIS)
+        error("must give up")
     }
 
-    @Test(timeout = 10_000)
-    fun `the fallback never opens a second fresh session in one episode`() {
-        val fallback = FreshSessionFallback()
-        var now = 0L
-        repeat(4) {
-            fallback.onAlreadyConnected(now, hadHandle = true, sessionStart = 0L)
-            now += 4_000L
-        }
-        assertEquals(1, fallback.freshSessionsOpened)
-        // Every later refusal is a fresh retry, never another handle attempt.
-        val next = fallback.onAlreadyConnected(now, hadHandle = false, sessionStart = 0L)
-        assertFalse(next.hadHandle)
+    @Test
+    fun `a replacement socket is never recorded as a recovered stall`() {
+        val stall = StallTolerance()
+        stall.onSample(1_000, 65_000, 1_000, 500)
+        stall.onSocketReplaced(10_000, 500)
+        stall.onSample(10_100, 0, 0, 500)
+        assertEquals(0, stall.recovered)
+        assertTrue(stall.lastEndRule.contains("ended because a NEW socket replaced the old one"))
+    }
+
+    @Test
+    fun `the largest mic callback gap persists across a minute boundary`() {
+        val gaps = MicCallbackGaps()
+        gaps.onRead(59_000)
+        gaps.onRead(59_020)
+        assertEquals(MicCallbackGaps.Sample(2, 20L), gaps.take())
+        gaps.onRead(63_020)
+        gaps.onRead(63_040)
+        assertEquals(MicCallbackGaps.Sample(2, 4_000L), gaps.take())
+        gaps.onRecorderEnded()
+        gaps.onRead(90_000)
+        assertEquals(MicCallbackGaps.Sample(1, null), gaps.take())
     }
 
     // ------------------------------------------------ task C: what counts as a change ---------

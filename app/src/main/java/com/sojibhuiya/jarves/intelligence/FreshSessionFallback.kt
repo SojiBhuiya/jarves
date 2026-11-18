@@ -1,52 +1,9 @@
 package com.sojibhuiya.jarves.intelligence
 
 /**
- * 0.2.16 (task 2) — the two-stage recovery after `1008 … already connected to an existing client`.
- *
- * ### What happened on the phone (0.2.15)
- *
- * `Reconnects: 1/3 (SERVER_BUSY) | gave up after 1 attempts (last close=1008, reason=
- * BidiGenerateContent session is already connected to an existing client)` after ~30 s. The server
- * kept the old session attached, so every handle-based attempt was refused and the app gave up.
- *
- * ### What the docs say (quoted, because the difference decides the design)
- *
- *  * `SessionResumptionConfig.handle` — "The handle of a previous session. **If not present then a
- *    new session is created.**"
- *    (https://ai.google.dev/api-reference/live → SessionResumptionConfig)
- *  * `SessionResumptionUpdate` — "Only sent if `BidiGenerateContentSetup.sessionResumption` was set.
- *    … `newHandle`: New handle that represents a state that can be resumed. Empty if
- *    `resumable`=false. … Resumption is not possible at some points in the session. For example,
- *    when the model is executing function calls or generating."
- *    (https://ai.google.dev/api-reference/live → SessionResumptionUpdate)
- *  * `sessionResumption` in the setup — "Optional. Configures session resumption mechanism. If
- *    included, the server will send `SessionResumptionUpdate` messages."
- *    (https://ai.google.dev/api-reference/live → BidiGenerateContentSetup)
- *  * the management guide: "Passing this configuration causes the server to send
- *    `SessionResumptionUpdate` messages, which can be used to resume the session by passing the last
- *    resumption token as the `SessionResumptionConfig.handle` of the subsequent connection."
- *    (https://ai.google.dev/gemini-api/docs/live-session → Session resumption)
- *
- * **What the docs do NOT say** (honest gap): nowhere in the Live API reference or the session
- * management guide does it say that one session may have only one connection, that the old
- * connection is held for X seconds after the client disappears, or that a *fresh* session (no
- * handle) can connect while the old one is still held. The 1008 text we saw is the server's own
- * wording. So the fresh-session fallback below is a **client-side policy that the docs make
- * plausible** (`handle` absent ⇒ new session), not a documented guarantee. Proof label:
- * READ-FROM-DOCS-ONLY (partly) / NOT-RUN for the real server.
- *
- * ### The policy
- *
- * 1. keep the existing handle-based attempts exactly as they are;
- * 2. if the 1008 refusal is still happening after [HANDLE_PHASE_MILLIS] (12 s), switch once to a
- *    **fresh session without a handle** — and tell the user, calmly, that the earlier context is
- *    gone;
- * 3. if the fresh session is refused with 1008 as well, keep retrying **without a handle** with
- *    backoff for up to [FRESH_PHASE_BUDGET_MILLIS] (90 s in total from the first 1008), then give up
- *    with one clear message and stop the microphone.
- *
- * Terminal rules are untouched: a user stop or an intentional close never reconnects, and a setup
- * failure of the fresh session ends the session (it is not another 1008 episode).
+ * Client-side policy for the reported 1008 "already connected". Gemini documents that omitting
+ * SessionResumptionConfig.handle creates a new session, not how quickly a server releases a handle.
+ * https://ai.google.dev/api/live#SessionResumptionConfig
  */
 class FreshSessionFallback(
     private val handlePhaseMillis: Long = HANDLE_PHASE_MILLIS,
@@ -65,7 +22,7 @@ class FreshSessionFallback(
     }
 
     /** Backoff for the fresh phase: 3 s, 5 s, 8 s, 12 s, 15 s, then 15 s until the budget is gone. */
-    enum class Step { RETRY_FRESH, GIVE_UP }
+    enum class Step { RETRY_FRESH, WAIT_FOR_HANDLE_DEADLINE, GIVE_UP }
 
     var phase: Phase = Phase.HANDLE
         private set
@@ -79,15 +36,13 @@ class FreshSessionFallback(
     var handleAttempts: Int = 0
         private set
 
+    private var startedHandleRetries = 0
+
     var freshAttempts: Int = 0
         private set
 
     /** How many times the switch to a fresh session happened (must be 0 or 1). */
     var freshSessionsOpened: Int = 0
-        private set
-
-    /** True once the "context lost" line was shown, so it is shown exactly once. */
-    var contextLostAnnounced: Boolean = false
         private set
 
     private val events = mutableListOf<String>()
@@ -98,62 +53,58 @@ class FreshSessionFallback(
     fun elapsedMillis(now: Long): Long =
         if (!started) 0L else (now - first1008AtMillis).coerceAtLeast(0L)
 
-    /**
-     * The server refused a connection with `1008 already connected`.
-     *
-     * @param hadHandle whether the refused attempt carried a resumption handle.
-     * @return the next wait, and whether it must be a fresh session.
-     */
-    fun onAlreadyConnected(
-        now: Long,
-        hadHandle: Boolean,
-        sessionStart: Long
-    ): NextAttempt {
+    val handleDeadline: Long? get() =
+        if (started && phase == Phase.HANDLE) first1008AtMillis + handlePhaseMillis else null
+    val freshDeadline: Long? get() =
+        if (started && phase == Phase.FRESH) first1008AtMillis + freshBudgetMillis else null
+
+    fun takeHandleRetry(): Boolean {
+        if (startedHandleRetries >= MAX_HANDLE_ATTEMPTS - 1) return false
+        startedHandleRetries++
+        return true
+    }
+
+    fun onAlreadyConnected(now: Long, hadHandle: Boolean, sessionStart: Long): NextAttempt {
         if (!started) {
             started = true
             first1008AtMillis = now
-            events += "${stamp(now, sessionStart)} first 1008 (handle=$hadHandle, policy v0.2.16)"
+            events += "${stamp(now, sessionStart)} first 1008 (handle=$hadHandle)"
         }
-        if (phase == Phase.GIVEN_UP) return NextAttempt(Step.GIVE_UP, 0L, hadHandle)
-
-        if (hadHandle) {
-            handleAttempts += 1
-            val elapsed = elapsedMillis(now)
-            if (elapsed < handlePhaseMillis && phase == Phase.HANDLE) {
-                val wait = handleDelays.getOrElse(handleAttempts - 1) { handleDelays.last() }
-                events += "${stamp(now, sessionStart)} keep the handle: attempt #$handleAttempts in ${wait}ms " +
-                    "(handle phase ${elapsed}ms/${handlePhaseMillis}ms)"
-                return NextAttempt(Step.RETRY_FRESH, wait, hadHandle = true)
+        if (phase == Phase.GIVEN_UP) return NextAttempt(Step.GIVE_UP, 0L, false)
+        if (hadHandle && phase == Phase.HANDLE) {
+            handleAttempts++
+            val remaining = checkNotNull(handleDeadline) - now
+            return if (handleAttempts < MAX_HANDLE_ATTEMPTS && HANDLE_RETRY_MILLIS < remaining) {
+                events += "${stamp(now, sessionStart)} retry with handle in ${HANDLE_RETRY_MILLIS}ms"
+                NextAttempt(Step.RETRY_FRESH, HANDLE_RETRY_MILLIS, true)
+            } else {
+                NextAttempt(Step.WAIT_FOR_HANDLE_DEADLINE, remaining.coerceAtLeast(0L), false)
             }
-            // The handle phase is spent: switch to a fresh session, once.
-            phase = Phase.FRESH
-            freshSessionsOpened += 1
-            contextLostAnnounced = true
-            events += "${stamp(now, sessionStart)} handle phase spent after ${elapsed}ms -> " +
-                "fresh session WITHOUT handle (#$freshSessionsOpened)"
-            return NextAttempt(Step.RETRY_FRESH, 0L, hadHandle = false)
         }
-
-        // Already in the fresh phase and refused again: back off, then retry fresh until the budget.
+        if (phase == Phase.HANDLE) beginFresh(now, sessionStart)
         freshAttempts += 1
         val elapsed = elapsedMillis(now)
+        val wait = freshDelays.getOrElse(freshAttempts - 1) { freshDelays.last() }
         if (elapsed >= freshBudgetMillis) {
             phase = Phase.GIVEN_UP
             events += "${stamp(now, sessionStart)} fresh phase spent after ${elapsed}ms -> give up"
             return NextAttempt(Step.GIVE_UP, 0L, hadHandle = false)
         }
-        val wait = freshDelays.getOrElse(freshAttempts - 1) { freshDelays.last() }
-        // The next attempt starts after `wait`; it must still start inside the 90 s budget. A small
-        // slack keeps a 3 s retry planned at t+87 s from being discarded.
-        if (elapsed + wait > freshBudgetMillis + 3_000L) {
-            phase = Phase.GIVEN_UP
-            events += "${stamp(now, sessionStart)} no time left for another fresh attempt " +
-                "(${elapsed}ms + ${wait}ms > ${freshBudgetMillis}ms) -> give up"
-            return NextAttempt(Step.GIVE_UP, 0L, hadHandle = false)
+        if (elapsed + wait >= freshBudgetMillis) {
+            return NextAttempt(Step.GIVE_UP, freshBudgetMillis - elapsed, hadHandle = false)
         }
         events += "${stamp(now, sessionStart)} fresh session refused (#$freshAttempts) -> retry in ${wait}ms " +
             "(fresh phase ${elapsed}ms/${freshBudgetMillis}ms)"
         return NextAttempt(Step.RETRY_FRESH, wait, hadHandle = false)
+    }
+
+    /** Also called by the deadline timer when the second handle attempt is still handshaking. */
+    fun beginFresh(now: Long, sessionStart: Long): Boolean {
+        if (phase != Phase.HANDLE) return false
+        phase = Phase.FRESH
+        freshSessionsOpened++
+        events += "${stamp(now, sessionStart)} switching to fresh session WITHOUT handle"
+        return true
     }
 
     /** The fresh session connected: the user is told once that the old context is gone. */
@@ -169,9 +120,9 @@ class FreshSessionFallback(
         started = false
         first1008AtMillis = 0L
         handleAttempts = 0
+        startedHandleRetries = 0
         freshAttempts = 0
         freshSessionsOpened = 0
-        contextLostAnnounced = false
     }
 
     fun timeline(): List<String> = events.toList()
@@ -183,7 +134,7 @@ class FreshSessionFallback(
         append(", freshAttempts=").append(freshAttempts)
         append(", freshSessions=").append(freshSessionsOpened)
         append(", budget=").append(freshBudgetMillis).append("ms")
-        if (events.isNotEmpty()) append(" | ").append(events.joinToString(" -> "))
+        if (events.isNotEmpty()) append(" | ").append(events.takeLast(3).joinToString(" -> "))
     }
 
     private fun stamp(now: Long, sessionStart: Long): String =
@@ -193,14 +144,12 @@ class FreshSessionFallback(
     data class NextAttempt(val step: Step, val delayMillis: Long, val hadHandle: Boolean)
 
     companion object {
-        /** "if 1008 persists for about 12 s, open a FRESH session" — the task's own number. */
-        const val HANDLE_PHASE_MILLIS = 12_000L
+        const val HANDLE_PHASE_MILLIS = 6_000L
+        const val MAX_HANDLE_ATTEMPTS = 2 // including the first refusal
+        const val HANDLE_RETRY_MILLIS = 3_000L
 
         /** "keep retrying it with backoff for up to 90 s in total" — measured from the first 1008. */
         const val FRESH_PHASE_BUDGET_MILLIS = 90_000L
-
-        /** The handle phase keeps its old schedule, only compressed into the 12 s window. */
-        val handleDelays = listOf(3_000L, 5_000L, 4_000L)
 
         /** Backoff for the fresh phase; the last value repeats. */
         val freshDelays = listOf(3_000L, 5_000L, 8_000L, 12_000L, 15_000L)
@@ -210,7 +159,6 @@ class FreshSessionFallback(
 
         /** One clear message when even the fresh session never gets in. */
         const val MESSAGE_GAVE_UP =
-            "সার্ভারের পুরোনো সংযোগ এখনো ছাড়া হয়নি, তাই প্রায় ৯০ সেকেন্ড চেষ্টার পর বন্ধ করছি। " +
-                "মাইক বন্ধ করেছি — একটু পরে আবার শুরু করুন, সাধারণত তখনই যুক্ত হয়ে যায়।"
+            "৯০ সেকেন্ডেও সংযোগ ফেরেনি — মাইক বন্ধ করেছি।"
     }
 }

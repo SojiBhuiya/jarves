@@ -1,5 +1,10 @@
 package com.sojibhuiya.jarves.intelligence
 
+import java.io.InterruptedIOException
+import java.net.NoRouteToHostException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+
 /**
  * What the phone's default network looks like right now.
  *
@@ -15,8 +20,16 @@ data class NetworkSnapshot(
     /** System-clock time of the last transport change (`onAvailable` / capabilities change). */
     val changedAtMillis: Long? = null,
     /** Why [type] is [TYPE_UNKNOWN] — e.g. the permission is missing. Empty when known. */
-    val unknownReason: String = ""
+    val unknownReason: String = "",
+    val internet: Boolean? = null,
+    val validated: Boolean? = null
 ) {
+    val indicatesNoUsableNetwork: Boolean get() = (!available && unknownReason.isBlank()) ||
+        internet == false || validated == false
+
+    fun capabilitiesLine(): String =
+        "NET_CAPABILITY_INTERNET=${internet ?: "unknown"}, NET_CAPABILITY_VALIDATED=${validated ?: "unknown"}"
+
     companion object {
         const val TYPE_NONE = "none"
         const val TYPE_UNKNOWN = "unknown"
@@ -36,11 +49,13 @@ data class NetworkSnapshot(
 interface NetworkMonitor {
     fun snapshot(): NetworkSnapshot
 
-    /** Called when a default network becomes available (including a switch wifi <-> mobile). */
+    /** Called on a new default network, a transport change, or a transition to validated. */
     fun onAvailable(listener: (NetworkSnapshot) -> Unit)
 
     /** Called when the default network is lost. */
     fun onLost(listener: (NetworkSnapshot) -> Unit)
+
+    fun removeListeners(available: (NetworkSnapshot) -> Unit, lost: (NetworkSnapshot) -> Unit) = Unit
 
     /**
      * 0.2.16 (task C): identity of the current default network object, `-1` when unknown. A change is
@@ -60,12 +75,33 @@ interface NetworkMonitor {
     }
 }
 
+enum class NetworkDown {
+    DNS, NO_ROUTE, CONNECT_TIMEOUT, NO_DEFAULT_OR_UNVALIDATED;
+
+    companion object {
+        /** Only transport errors qualify; a setup timeout or a server status is not a DNS error. */
+        fun from(error: Throwable, opening: Boolean): NetworkDown? {
+            val causes = generateSequence(error) { it.cause }.take(12).toList()
+            fun has(text: String) = causes.any { it.message?.contains(text, ignoreCase = true) == true }
+            return when {
+                causes.any { it is UnknownHostException } || has("EAI_NODATA") || has("EAI_NONAME") -> DNS
+                causes.any { it is NoRouteToHostException } || has("ENETUNREACH") ||
+                    has("EHOSTUNREACH") || has("Network is unreachable") || has("No route to host") -> NO_ROUTE
+                has("connect timed out") || has("connect timeout") || has("ETIMEDOUT") && opening ||
+                    opening && causes.any { it is SocketTimeoutException ||
+                        it is InterruptedIOException && it.message.equals("timeout", ignoreCase = true) } -> CONNECT_TIMEOUT
+                else -> null
+            }
+        }
+    }
+}
+
 /** What the reconnect machinery should do next. */
 sealed interface ReconnectAction {
     /**
-     * There is no usable network: spend **no** attempt, wait for `onAvailable` until [deadline].
+     * No usable transport: spend **no** normal attempt, and retry until the fixed episode deadline.
      */
-    data class WaitForNetwork(val deadlineMillis: Long) : ReconnectAction
+    data class WaitForNetwork(val deadlineMillis: Long, val delayMillis: Long, val first: Boolean) : ReconnectAction
 
     /** Open a new socket after [delayMillis], using the stored resume handle. */
     data class Attempt(val attempt: Int, val delayMillis: Long) : ReconnectAction
@@ -98,24 +134,10 @@ enum class GiveUpReason {
     SERVER_BUSY_TIMEOUT
 }
 
-/**
- * The network-aware reconnect state machine.
- *
- * Rules (each one is a unit test):
- *  * while the network is down, **no attempt is spent** — the app waits for `onAvailable`;
- *  * when the network comes back, the first attempt runs after ~1 s, then 1 s / 2 s / 4 s of
- *    backoff on repeated failures, at most [maxAttempts] attempts on a working network;
- *  * give up after [networkWaitMillis] (2 min) without network, or after [maxAttempts] failed
- *    attempts on a working network;
- *  * a new default network during a healthy session triggers one proactive reconnect.
- *
- * Pure Kotlin: no Android, no clock of its own (every call takes `now`), so the whole behaviour —
- * including "airplane mode for 10 s" — is provable in a unit test.
- */
+/** Retry budget based on host failures, not just a default-network callback. Caller supplies time. */
 class ReconnectCoordinator(
     private val maxAttempts: Int = 3,
-    private val networkWaitMillis: Long = 120_000L,
-    private val firstAttemptDelayMillis: Long = 1_000L,
+    private val networkWaitMillis: Long = 180_000L,
     private val backoffMillis: List<Long> = listOf(1_000L, 2_000L, 4_000L),
     /** A proactive reconnect is not repeated within this window (avoids churn on flapping links). */
     private val proactiveCooldownMillis: Long = 10_000L
@@ -135,8 +157,9 @@ class ReconnectCoordinator(
     var attemptsUsed: Int = 0
         private set
 
-    var waitingForNetwork: Boolean = false
-        private set
+    private var networkDeadline: Long? = null
+    private var networkFailure: NetworkDown? = null
+    val waitingForNetwork: Boolean get() = networkDeadline != null
 
     var gaveUp: Boolean = false
         private set
@@ -165,7 +188,8 @@ class ReconnectCoordinator(
     /** Resets everything for a brand-new session (the user started talking again). */
     fun reset() {
         attemptsUsed = 0
-        waitingForNetwork = false
+        networkDeadline = null
+        networkFailure = null
         gaveUp = false
         giveUpReason = null
         lastAttemptAtMillis = 0L
@@ -173,48 +197,52 @@ class ReconnectCoordinator(
         events.clear()
     }
 
-    /**
-     * An unexpected socket failure (or an audio-send failure, which is the same thing one step
-     * earlier). Decides between waiting for the network, an immediate attempt and giving up.
-     */
-    fun onUnexpectedFailure(now: Long, network: NetworkSnapshot, reason: String): ReconnectAction {
-        events += "${event(now)} failure (${reason.take(40)})"
-        if (!network.available) {
-            if (!waitingForNetwork) {
-                waitingForNetwork = true
-                events += "${event(now)} waiting for network (no attempt spent)"
-            }
-            // No attempt is spent while the network is down; the caller re-checks the deadline with
-            // checkNetworkDeadline(...) so a phone that stays offline ends cleanly after 2 minutes.
-            return ReconnectAction.WaitForNetwork(now + networkWaitMillis)
+    /** [failedAttempt] is refunded if its failure is evidence of a network outage. */
+    fun onUnexpectedFailure(
+        now: Long,
+        network: NetworkSnapshot,
+        reason: String,
+        down: NetworkDown? = null,
+        failedAttempt: Int = 0
+    ): ReconnectAction {
+        if (gaveUp) return ReconnectAction.None
+        events += "${event(now)} failure (${reason.take(70)}; ${network.capabilitiesLine()})"
+        if (down == null && !network.indicatesNoUsableNetwork && !waitingForNetwork) return attempt(now)
+        if (failedAttempt > 0 && failedAttempt == attemptsUsed) attemptsUsed--
+        val first = !waitingForNetwork
+        if (first) {
+            networkDeadline = now + networkWaitMillis
+            events += "${event(now)} waiting for network (no attempt spent)"
         }
-        return attempt(now, network)
+        // Do not lose the DNS explanation if the default network disappears during the same outage.
+        if (down == NetworkDown.DNS || networkFailure == null ||
+            networkFailure != NetworkDown.DNS && down != null) {
+            networkFailure = down ?: NetworkDown.NO_DEFAULT_OR_UNVALIDATED
+        }
+        val deadline = checkNotNull(networkDeadline)
+        return if (now >= deadline) checkNetworkDeadline(now) else
+            ReconnectAction.WaitForNetwork(deadline, if (first) 2_000L else 4_000L, first)
     }
 
-    /**
-     * Called on a timer while waiting, so a phone that stays offline for two minutes ends cleanly
-     * instead of waiting forever.
-     */
-    fun checkNetworkDeadline(now: Long, waitingSince: Long): ReconnectAction =
-        if (waitingForNetwork && now - waitingSince >= networkWaitMillis) {
+    fun checkNetworkDeadline(now: Long): ReconnectAction =
+        if (!gaveUp && networkDeadline?.let { now >= it } == true) {
             giveUp(now, GiveUpReason.NO_NETWORK_TIMEOUT)
         } else {
             ReconnectAction.None
         }
 
-    /** A default network appeared. If we were waiting, this is the first attempt (~1 s later). */
+    /** Android availability is only a signal to try now, not proof that Gemini can be reached. */
     fun onNetworkAvailable(now: Long, network: NetworkSnapshot): ReconnectAction {
-        if (gaveUp) return ReconnectAction.None
-        if (!waitingForNetwork && attemptsUsed == 0 && lastAttemptAtMillis == 0L) {
-            // A brand-new network during a healthy session: proactive reconnect.
-            return proactive(now, network)
-        }
-        waitingForNetwork = false
-        events += "${event(now)} network available (${network.type})"
-        // The network returning is not a failed attempt: the budget starts counting now.
-        attemptsUsed = 0
-        events += "${event(now)} waiting ${firstAttemptDelayMillis}ms before first attempt"
-        return ReconnectAction.Attempt(attempt = 1, delayMillis = firstAttemptDelayMillis)
+        if (gaveUp || !waitingForNetwork) return ReconnectAction.None
+        events += "${event(now)} network available (${network.type}) -> probe now (${network.capabilitiesLine()})"
+        return ReconnectAction.Attempt(attempt = 0, delayMillis = 0L)
+    }
+
+    /** A successful WebSocket upgrade (or HTTP response) proved the route to the endpoint. */
+    fun onNetworkReachable(now: Long) {
+        if (waitingForNetwork) events += "${event(now)} endpoint reached"
+        networkDeadline = null
+        networkFailure = null
     }
 
     /** A new default network while the session is healthy: reconnect once, without a failure. */
@@ -243,7 +271,7 @@ class ReconnectCoordinator(
     /** The reconnect worked: the session continues. */
     fun onAttemptSucceeded(now: Long) {
         attemptsUsed = 0
-        waitingForNetwork = false
+        onNetworkReachable(now)
         // The session runs again: a later 1008 episode starts its schedule from 3 s again.
         if (serverBusy.active) events += "${event(now)} server-busy cleared (${serverBusy.describe(now)})"
         serverBusy.reset()
@@ -266,23 +294,15 @@ class ReconnectCoordinator(
         return ReconnectAction.RetryServerBusy(attempt = serverBusy.attemptsUsed, delayMillis = delay)
     }
 
-    /** The socket that the reconnect opened failed too. */
-    fun onAttemptFailed(now: Long, network: NetworkSnapshot): ReconnectAction {
-        events += "${event(now)} attempt failed"
-        if (!network.available) {
-            waitingForNetwork = true
-            events += "${event(now)} waiting for network"
-            return ReconnectAction.WaitForNetwork(now + networkWaitMillis)
-        }
-        return attempt(now, network)
-    }
+    /** The socket that the reconnect opened failed too (legacy caller/test helper). */
+    fun onAttemptFailed(now: Long, network: NetworkSnapshot): ReconnectAction =
+        onUnexpectedFailure(now, network, "attempt failed", failedAttempt = attemptsUsed)
 
     fun onNetworkLost(now: Long) {
-        waitingForNetwork = true
         events += "${event(now)} network lost"
     }
 
-    private fun attempt(now: Long, network: NetworkSnapshot): ReconnectAction {
+    private fun attempt(now: Long): ReconnectAction {
         if (attemptsUsed >= maxAttempts) return giveUp(now, GiveUpReason.ATTEMPTS_EXHAUSTED)
         val next = attemptsUsed + 1
         val delay = backoffMillis.getOrElse(next - 1) { backoffMillis.lastOrNull() ?: 1_000L }
@@ -296,7 +316,10 @@ class ReconnectCoordinator(
         gaveUp = true
         giveUpReason = reason
         events += "${event(now)} gave up ($reason)"
-        return ReconnectAction.GiveUp(reason, messageFor(reason))
+        val message = if (reason == GiveUpReason.NO_NETWORK_TIMEOUT && networkFailure == NetworkDown.DNS) {
+            "ইন্টারনেটে পৌঁছানো যায়নি (নাম সমাধান ব্যর্থ) — আর চেষ্টা করা হবে না।"
+        } else messageFor(reason)
+        return ReconnectAction.GiveUp(reason, message)
     }
 
     /** 0.2.13 (task 4): `t+12.8s` instead of an epoch value like `1.7E7s`. */
@@ -304,22 +327,16 @@ class ReconnectCoordinator(
 
     companion object {
 
-        /** How long the app waits for the network before giving up (task: "about 2 minutes"). */
-        const val NETWORK_WAIT_SECONDS = 120L
-
-        /** Shown as "/3" in the status line. */
-        const val MAX_ATTEMPTS_DISPLAY = 3
-
-        const val STATUS_WAITING_FOR_NETWORK = "ইন্টারনেটের অপেক্ষা করছি…"
+        const val STATUS_WAITING_FOR_NETWORK = "ইন্টারনেট পাওয়া যাচ্ছে না, আবার চেষ্টা করছি…"
         const val STATUS_RECONNECTED = "পুনরায় সংযুক্ত"
         const val STATUS_CONTEXT_MAY_BE_LOST =
             "আগের কথোপকথনটা হয়তো মনে রাখতে পারব না — নতুন করে শুরু করছি।"
 
         fun messageFor(reason: GiveUpReason): String = when (reason) {
             GiveUpReason.NO_NETWORK_TIMEOUT ->
-                "প্রায় ২ মিনিট ধরে ইন্টারনেট নেই, তাই সংযোগ বন্ধ করছি। ইন্টারনেট চালু করে আবার শুরু করুন।"
+                "ইন্টারনেটে পৌঁছানো যায়নি — আর চেষ্টা করা হবে না।"
             GiveUpReason.ATTEMPTS_EXHAUSTED ->
-                "ইন্টারনেট ঠিক আছে, কিন্তু ৩ বার চেষ্টা করেও সংযোগ হয়নি। একটু পরে আবার শুরু করুন।"
+                "৩ বার চেষ্টা করেও সংযোগ হয়নি।"
             GiveUpReason.SERVER_BUSY_TIMEOUT ->
                 "সার্ভার এখনো পুরোনো সংযোগটা ছাড়েনি, তাই প্রায় ৩০ সেকেন্ড চেষ্টার পর বন্ধ করছি। " +
                     "আবার শুরু করুন — সাধারণত সাথে সাথে যুক্ত হয়ে যায়।"
@@ -344,7 +361,7 @@ class ReconnectCoordinator(
                 null -> " | last onLost: never"
                 else -> " | last onLost: ${((now - lostAt) / 1000.0)}s ago"
             }
-            return head + change + lost
+            return head + change + lost + " | " + snapshot.capabilitiesLine()
         }
     }
 }

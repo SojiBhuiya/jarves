@@ -1,6 +1,7 @@
 package com.sojibhuiya.jarves.system
 
 import android.app.Activity
+import android.app.usage.UsageStatsManager
 import android.app.Application
 import android.content.Context
 import android.net.ConnectivityManager
@@ -131,7 +132,13 @@ class SessionEnvironmentReader(
             networkChangedAgoMillis = fromMonitor?.changedAtMillis?.let { now - it } ?: changedAgo,
             networkLostAgoMillis = fromMonitor?.lastLostAtMillis?.let { now - it },
             networkUnknownReason = fromMonitor?.unknownReason.orEmpty(),
-            powerSaveMode = runCatching { power?.isPowerSaveMode }.getOrNull()
+            powerSaveMode = runCatching { power?.isPowerSaveMode }.getOrNull(),
+            deviceIdleMode = runCatching { power?.isDeviceIdleMode }.getOrNull(),
+            // Own app only: no PACKAGE_USAGE_STATS permission required.
+            // https://developer.android.com/reference/android/app/usage/UsageStatsManager#getAppStandbyBucket()
+            standbyBucket = if (Build.VERSION.SDK_INT >= 28) runCatching {
+                app.getSystemService(UsageStatsManager::class.java)?.appStandbyBucket
+            }.getOrNull() else null
         )
     }
 

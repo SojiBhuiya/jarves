@@ -53,9 +53,9 @@ class NetworkReconnectTest {
         val back = plan.onNetworkAvailable(15_000, wifi)
         assertTrue("must reconnect once the network is back", back is ReconnectAction.Attempt)
         val attempt = back as ReconnectAction.Attempt
-        assertEquals("the first attempt runs ~1 s after the network returns", 1_000L, attempt.delayMillis)
-        assertEquals(1, attempt.attempt)
-        assertFalse(plan.waitingForNetwork)
+        assertEquals("validation requests an immediate, uncharged probe", 0L, attempt.delayMillis)
+        assertEquals(0, attempt.attempt)
+        assertTrue("only a successful route proof clears the outage", plan.waitingForNetwork)
 
         // The reconnect succeeds: the session continues.
         plan.onAttemptSucceeded(16_500)
@@ -81,12 +81,12 @@ class NetworkReconnectTest {
     // ---- (b) the network never comes back --------------------------------------------
 
     @Test
-    fun twoMinutesWithoutNetworkGivesUpCleanly() {
+    fun threeMinutesWithoutNetworkGivesUpCleanly() {
         val plan = coordinator()
         plan.onUnexpectedFailure(0, offline, "audio send failed")
-        assertTrue(plan.checkNetworkDeadline(60_000, waitingSince = 0) is ReconnectAction.None)
+        assertTrue(plan.checkNetworkDeadline(179_999) is ReconnectAction.None)
 
-        val late = plan.checkNetworkDeadline(120_000, waitingSince = 0)
+        val late = plan.checkNetworkDeadline(180_000)
         assertTrue(late is ReconnectAction.GiveUp)
         val giveUp = late as ReconnectAction.GiveUp
         assertEquals(GiveUpReason.NO_NETWORK_TIMEOUT, giveUp.reason)
@@ -101,9 +101,9 @@ class NetworkReconnectTest {
     fun afterGivingUpALateNetworkDoesNotRestartTheSessionByItself() {
         val plan = coordinator()
         plan.onUnexpectedFailure(0, offline, "audio send failed")
-        plan.checkNetworkDeadline(120_000, 0)
+        plan.checkNetworkDeadline(180_000)
         assertTrue(plan.gaveUp)
-        assertEquals(ReconnectAction.None, plan.onNetworkAvailable(130_000, wifi))
+        assertEquals(ReconnectAction.None, plan.onNetworkAvailable(190_000, wifi))
     }
 
     // ---- (c) a failure on a working network ------------------------------------------
@@ -135,7 +135,25 @@ class NetworkReconnectTest {
         plan.onUnexpectedFailure(0, wifi, "Socket closed")
         val action = plan.onAttemptFailed(2_000, offline)
         assertTrue(action is ReconnectAction.WaitForNetwork)
-        assertEquals("no extra attempt spent", 1, plan.attemptsUsed)
+        assertEquals("refund the attempt that had no usable network", 0, plan.attemptsUsed)
+    }
+
+    @Test
+    fun classifiesTransportFailuresWithoutTrustingConnectivityManager() {
+        assertEquals(NetworkDown.DNS, NetworkDown.from(java.io.IOException("EAI_NODATA"), true))
+        assertEquals(NetworkDown.DNS, NetworkDown.from(java.net.UnknownHostException(), false))
+        assertEquals(NetworkDown.NO_ROUTE, NetworkDown.from(java.io.IOException("ENETUNREACH"), false))
+        assertEquals(NetworkDown.NO_ROUTE, NetworkDown.from(java.io.IOException("outer", java.io.IOException("Network is unreachable")), true))
+        assertEquals(NetworkDown.CONNECT_TIMEOUT, NetworkDown.from(java.net.SocketTimeoutException(), true))
+        assertNull("a read timeout after open is not a connect timeout", NetworkDown.from(java.net.SocketTimeoutException(), false))
+        val plan = coordinator()
+        val validated = mobile.copy(internet = true, validated = true)
+        val first = plan.onUnexpectedFailure(100, validated, "DNS", NetworkDown.DNS) as ReconnectAction.WaitForNetwork
+        val second = plan.onUnexpectedFailure(2_100, validated, "DNS", NetworkDown.DNS) as ReconnectAction.WaitForNetwork
+        assertEquals(2_000L, first.delayMillis)
+        assertEquals(4_000L, second.delayMillis)
+        assertEquals(first.deadlineMillis, second.deadlineMillis)
+        assertEquals(0, plan.attemptsUsed)
     }
 
     // ---- (d) user stop ----------------------------------------------------------------

@@ -12,8 +12,8 @@ android {
         applicationId = "com.sojibhuiya.jarves"
         minSdk = 26
         targetSdk = 35
-        versionCode = 18
-        versionName = "0.2.16"
+        versionCode = 19
+        versionName = "0.2.17"
     }
 
     // ---- 0.2.7: ONE fixed signing key for every installed APK.
@@ -54,6 +54,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     compileOptions {
@@ -83,6 +84,8 @@ dependencies {
     // runtime must not be left to a transitive version.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     testImplementation("junit:junit:4.13.2")
+    // Host-JVM implementation for exercising the real Android org.json frame-handling path.
+    testImplementation("org.json:json:20240303")
     // Exercises the REAL OkHttp transport (incl. gzip/chunked decoding) instead of a fake —
     // the gap that let the 0.2.2 "no internet connection" bug through.
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")

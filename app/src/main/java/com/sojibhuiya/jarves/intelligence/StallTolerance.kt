@@ -120,6 +120,7 @@ class StallTolerance(
     ): Verdict {
         val backedUp = queueSize >= softLimitBytes
         if (!backedUp) {
+            if (queueSize < 0L && stallingNow) return Verdict.STALLED // no measurement, no recovery
             if (stallingNow) endStall(now, sessionStart, "queue drained (${queueSize}B)")
             return Verdict.HEALTHY
         }
@@ -202,6 +203,16 @@ class StallTolerance(
         recovered += 1
         lastEndRule = "recovered by itself after ${length}ms ($why)"
         events += "${stamp(now, sessionStart)} stall ended after ${length}ms ($why) — no reconnect"
+    }
+
+    /** Call before sampling a replacement socket; its empty send queue is not a recovery. */
+    fun onSocketReplaced(now: Long, sessionStart: Long) {
+        if (!stallingNow) return
+        val elapsed = now - stallStartMillis
+        stallingNow = false
+        stallStartMillis = 0L
+        lastEndRule = "ended because a NEW socket replaced the old one after ${elapsed}ms"
+        events += "${stamp(now, sessionStart)} stall $lastEndRule"
     }
 
     /** Whatever ended the session: make the open stall visible with its full length. */

@@ -1,6 +1,10 @@
 package com.sojibhuiya.jarves
 
 import android.Manifest
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings
 import android.content.pm.PackageManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -97,6 +101,7 @@ import com.sojibhuiya.jarves.storage.AndroidMicSensitivityStore
 import com.sojibhuiya.jarves.storage.AndroidLivePingStore
 import com.sojibhuiya.jarves.intelligence.LivePingSetting
 import com.sojibhuiya.jarves.intelligence.LivePingSettings
+import com.sojibhuiya.jarves.system.AndroidLiveWakeLock
 import com.sojibhuiya.jarves.system.AndroidNetworkMonitor
 import com.sojibhuiya.jarves.system.SessionEnvironmentReader
 import com.sojibhuiya.jarves.system.SystemChecks
@@ -283,15 +288,23 @@ private fun AgiApp() {
         }
     }
 
+    fun stopLive(initiator: CloseInitiator) {
+        val live = engine ?: return
+        live.stop(initiator)
+        if (engine === live) lastEndDiagnostics = live.endDiagnostics()
+        status = "ভয়েস সেশন বন্ধ হয়েছে।"
+        engine = null
+        connected = false
+        connecting = false
+        LiveSessionService.stop(context.applicationContext)
+    }
+
     /**
      * New Chat: a brand new conversation with its own id, plus a stopped voice session so the next
      * Gemini Live connection starts without the previous conversation's context.
      */
     fun startNewChat() {
-        engine?.stop(CloseInitiator.NEW_CHAT)
-        engine = null
-        connected = false
-        connecting = false
+        stopLive(CloseInitiator.NEW_CHAT)
         userBuffer.setLength(0)
         assistantBuffer.setLength(0)
         scope.launch {
@@ -337,10 +350,7 @@ private fun AgiApp() {
             context.jarvesDataStore.edit { it[PrefKeys.GEMINI_ENABLED] = record.enabled }
         }
         if (!record.enabled && engine != null) {
-            engine?.stop(CloseInitiator.PROVIDER_DISABLED)
-            engine = null
-            connected = false
-            connecting = false
+            stopLive(CloseInitiator.PROVIDER_DISABLED)
         }
     }
     val hasKey = geminiRecord?.hasCredential == true || legacyEncryptedKey.isNotBlank()
@@ -405,24 +415,20 @@ private fun AgiApp() {
                 },
                 // 0.2.13 (task 3): off by default; only the hidden Advanced row changes it.
                 pingIntervalSeconds = pingSeconds,
-                onSessionEnd = { report ->
-                    scope.launch {
-                        status = report.message()
-                        lastEndDiagnostics = created?.endDiagnostics() ?: lastEndDiagnostics
-                        appendSearchReport(report.message())
-                    }
-                },
-                // Status text is for the user to read only. State is never inferred from it.
-                onStatus = { value -> scope.launch { status = value } },
+                wakeLock = AndroidLiveWakeLock(context.applicationContext),
+                onStatus = { value -> scope.launch { if (engine === created) status = value } },
                 // Explicit state: the single source of truth for these booleans and for releasing
                 // the engine. No Bengali substring matching anywhere.
                 onState = { state ->
                     scope.launch {
+                        if (engine !== created) return@launch
                         val next = LiveStateRouting.route(state)
                         connected = next.connected
                         connecting = next.connecting
                         if (next.releaseEngine) {
-                            // The conversation is over: drop the foreground service too.
+                            // The engine owns audio and wake lock teardown; keep its diagnostics
+                            // in Settings only and remove the foreground notification.
+                            lastEndDiagnostics = created?.endDiagnostics() ?: lastEndDiagnostics
                             LiveSessionService.stop(context.applicationContext)
                             engine = null
                             if (state == LiveState.ENDED) {
@@ -440,20 +446,7 @@ private fun AgiApp() {
                     pendingSources = sources.map { ChatSource(title = it.label, url = it.url) }
                 },
                 onSearchReport = { report -> scope.launch { appendSearchReport(report) } },
-                onError = { message ->
-                    scope.launch {
-                        status = message
-                        lastEndDiagnostics = created?.endDiagnostics() ?: lastEndDiagnostics
-                        connected = false
-                        connecting = false
-                        engine = null
-                        // 0.2.12 (A2): a terminal error means the engine has already stopped itself
-                        // (fail() closes the socket and the audio). The foreground service must not
-                        // outlive it, otherwise a notification keeps promising a session that no
-                        // longer exists. stop() on a service that is not running is a no-op.
-                        LiveSessionService.stop(context.applicationContext)
-                    }
-                }
+                onError = { message -> scope.launch { if (engine === created) status = message } }
             )
             created = live
             engine = live
@@ -492,6 +485,7 @@ private fun AgiApp() {
             // make sure neither the socket nor the foreground service outlives the UI.
             latestEngine.value?.stop(CloseInitiator.LIFECYCLE)
             LiveSessionService.stop(context.applicationContext)
+            networkMonitor.close()
         }
     }
 
@@ -653,11 +647,7 @@ private fun AgiApp() {
                                 if (engine != null) {
                                     flushTranscript(fromUser = true)
                                     flushTranscript(fromUser = false)
-                                    engine?.stop(CloseInitiator.USER_STOP)
-                                    engine = null
-                                    connected = false
-                                    connecting = false
-                                    LiveSessionService.stop(context.applicationContext)
+                                    stopLive(CloseInitiator.USER_STOP)
                                 } else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                                     startLive()
                                 } else micPermission.launch(Manifest.permission.RECORD_AUDIO)
@@ -989,6 +979,8 @@ private fun SettingsScreen(
             }
         }
 
+        BatteryOptimizationOption()
+
         // ---------------- 5. Advanced / Diagnostics (collapsed) -----------------------
         Spacer(Modifier.height(JarvesDimens.SectionGap))
         SectionLabel("Advanced")
@@ -1058,6 +1050,48 @@ private fun SettingsScreen(
         }
 
         Spacer(Modifier.height(24.dp))
+    }
+}
+
+/** Never launched automatically. This is for the core, user-started screen-off voice feature. */
+@Composable
+private fun BatteryOptimizationOption() {
+    val context = LocalContext.current
+    val prefs = remember(context) {
+        context.getSharedPreferences("battery_optimization_prompt", Context.MODE_PRIVATE)
+    }
+    var asked by remember(prefs) { mutableStateOf(prefs.getBoolean("asked", false)) }
+    var exempt by remember(context) { mutableStateOf(SystemChecks.isIgnoringBatteryOptimizations(context) == true) }
+    var unavailable by remember { mutableStateOf(false) }
+    val request = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        exempt = SystemChecks.isIgnoringBatteryOptimizations(context) == true
+    }
+    if (exempt || asked && !unavailable) return
+
+    Spacer(Modifier.height(JarvesDimens.SectionGap))
+    SectionLabel("ব্যাটারি অপ্টিমাইজেশন")
+    Spacer(Modifier.height(8.dp))
+    JarvesCard {
+        Column(Modifier.padding(JarvesDimens.CardPadding)) {
+            Text(
+                "ছাড় দিলে স্ক্রিন বন্ধেও ভয়েস সংযোগ সচল থাকতে পারে, তবে ব্যাটারি বেশি খরচ হতে পারে।",
+                color = JarvesColors.TextSecondary,
+                fontSize = 12.sp
+            )
+            if (unavailable) {
+                Text("ছাড় দিতে ফোনের ব্যাটারি সেটিংস খুলুন।", color = JarvesColors.TextMuted, fontSize = 12.sp)
+            } else {
+                JarvesTextAction(text = "ছাড় চাই (ঐচ্ছিক)", onClick = {
+                    // https://developer.android.com/reference/android/provider/Settings#ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+                    runCatching {
+                        request.launch(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            Uri.fromParts("package", context.packageName, null)))
+                        prefs.edit().putBoolean("asked", true).apply()
+                        asked = true
+                    }.onFailure { unavailable = true }
+                })
+            }
+        }
     }
 }
 
