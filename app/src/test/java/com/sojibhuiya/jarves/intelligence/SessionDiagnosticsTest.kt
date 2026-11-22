@@ -88,6 +88,8 @@ class SessionDiagnosticsTest {
         assertTrue(text.contains("Screen: unknown"))
         assertTrue(text.contains("Locked: unknown"))
         assertTrue(text.contains("Battery saver: unknown"))
+        assertTrue(text.contains("isDeviceIdleMode=unknown"))
+        assertTrue(text.contains("appStandbyBucket=unavailable"))
         assertFalse(text.contains("CHANGED"))
     }
 
@@ -110,8 +112,8 @@ class SessionDiagnosticsTest {
     @Test
     fun theLineIsNeverEmptyEvenWithEverythingUnknown() {
         assertEquals(
-            4,
-            line().lines().size // Closed by / App / Network / resume handle
+            5,
+            line().lines().size // Closed by / App / Network / power / resume handle
         )
     }
 }

@@ -20,8 +20,14 @@ data class SessionEnvironment(
     /** 0.2.10: why the type is unknown (e.g. the permission is missing). Empty when known. */
     val networkUnknownReason: String = "",
     /** `PowerManager.isPowerSaveMode`. */
-    val powerSaveMode: Boolean? = null
+    val powerSaveMode: Boolean? = null,
+    val deviceIdleMode: Boolean? = null,
+    val standbyBucket: Int? = null
 ) {
+    fun powerLine(): String = "isInteractive=${screenInteractive ?: "unknown"} | " +
+        "isDeviceIdleMode=${deviceIdleMode ?: "unknown"} | isPowerSaveMode=${powerSaveMode ?: "unknown"} | " +
+        "appStandbyBucket=${standbyBucket ?: "unavailable"}"
+
     companion object {
         val UNKNOWN = SessionEnvironment(networkType = "unknown")
     }
@@ -33,8 +39,7 @@ fun interface SessionEnvironmentProvider {
 }
 
 /**
- * The diagnostic line for "the session ended". Printed in the chat bubble's technical block and in
- * Settings → Advanced → Diagnostics, and it is designed to answer the 0.2.8 phone report directly:
+ * The diagnostic line for "the session ended". Shown only in Settings → Advanced → Diagnostics, and it is designed to answer the 0.2.8 phone report directly:
  * *who* closed the socket, how long the session had been up, and what the phone was doing.
  *
  * Nothing here is secret: no key, no query, no handle (only its length).
@@ -70,6 +75,7 @@ object SessionDiagnostics {
         append(networkChangeWord(environment.networkChangedAgoMillis))
         append(lostWord(environment.networkLostAgoMillis))
         append(" | Battery saver: ").append(batteryWord(environment.powerSaveMode))
+        append('\n').append(environment.powerLine())
         append('\n').append(resumption.describe())
     }
 

@@ -11,6 +11,11 @@ on:
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
+    inputs:
+      publish_0217:
+        description: Publish the verified Jarves 0.2.17 APK and SHA-256
+        type: boolean
+        default: false
 
 permissions:
   contents: write      # needed to create/update the GitHub Release, with GITHUB_TOKEN only
@@ -62,10 +67,30 @@ jobs:
           JARVES_KEYSTORE_PASSWORD: ${{ secrets.JARVES_KEYSTORE_PASSWORD }}
           JARVES_KEY_ALIAS: ${{ secrets.JARVES_KEY_ALIAS }}
           JARVES_KEY_PASSWORD: ${{ secrets.JARVES_KEY_PASSWORD }}
-        run: gradle assembleDebug
+        run: |
+          set -o pipefail
+          gradle --console=plain assembleDebug 2>&1 | awk '
+            { print }
+            /^e: file:.*\/app\/src\// { print "::error::" substr($0, index($0,"/app/src/")+1) }
+          '
 
       - name: Run unit tests
-        run: gradle testDebugUnitTest
+        run: |
+          set -o pipefail
+          gradle --console=plain testDebugUnitTest 2>&1 | awk '
+            { print }
+            /^e: file:.*\/app\/src\// { print "::error::" substr($0, index($0,"/app/src/")+1) }
+            / > .* FAILED$/ { print "::error::" $0 }
+          '
+          python3 - <<'PYTEST'
+          from pathlib import Path
+          from xml.etree import ElementTree
+          suites = [ElementTree.parse(path).getroot() for path in Path("app/build/test-results/testDebugUnitTest").glob("TEST-*.xml")]
+          total, failed, errors, skipped = (sum(int(suite.get(field, "0")) for suite in suites)
+              for field in ("tests", "failures", "errors", "skipped"))
+          assert total > 0 and failed == errors == 0
+          print(f"::notice::JUnit: {total} tests, {failed} failures, {errors} errors, {skipped} skipped")
+          PYTEST
 
       - name: Build signed release APK
         if: steps.signing.outputs.available == 'true'
@@ -154,3 +179,27 @@ jobs:
             button inside the app.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Explicit dispatch lets the working branch release without pushing to jarves-wip-backup.
+      # Verify the finished artifact against v0.2.16's public signer, not just against this job's
+      # debug signer. No signing settings are changed.
+      - name: Verify and publish v0.2.17 from the dispatched commit
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_0217
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/release/app-release.apk
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          AAPT=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -1)
+          CERT=$("$APKSIGNER" verify --print-certs "$APK" | awk '/certificate SHA-256 digest:/ {print tolower($NF)}' | sort -u)
+          BADGING=$("$AAPT" dump badging "$APK" | sed -n '/^package: /p')
+          [[ "$CERT" == '39e9bd28c03d47870c247eb6056ad82df5b1a642b10fe268b45243ef381d0f6c' ]]
+          [[ "$BADGING" == *"name='com.sojibhuiya.jarves'"* && "$BADGING" == *"versionCode='19'"* && "$BADGING" == *"versionName='0.2.17'"* ]]
+          mkdir -p dist
+          cp "$APK" dist/jarves-0.2.17.apk
+          (cd dist && sha256sum jarves-0.2.17.apk > jarves-0.2.17.apk.sha256 && sha256sum -c jarves-0.2.17.apk.sha256)
+          echo "::notice::Verified release APK: $BADGING | certificate SHA-256=$CERT | APK SHA-256=$(cut -d' ' -f1 dist/jarves-0.2.17.apk.sha256)"
+          gh release create v0.2.17 dist/jarves-0.2.17.apk dist/jarves-0.2.17.apk.sha256 \
+            --target "$GITHUB_SHA" --title 'Jarves 0.2.17' --latest \
+            --notes "Jarves 0.2.17 (versionCode 19). Built from $GITHUB_SHA by workflow run $GITHUB_RUN_ID. Includes network-aware voice recovery, serialized reconnects, a shorter 1008 handle window, session-only wake lock, and hidden diagnostics. The model, updater, and signing key are unchanged."
