@@ -80,6 +80,11 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // 0.2.20: YouTube player — ad-free playback through our own player (ExoPlayer).
+    implementation("androidx.media3:media3-exoplayer:1.11.1")
+    implementation("androidx.media3:media3-session:1.11.1")
+    // NewPipe Extractor via JitPack (see settings.gradle.kts). GPL-3.0; personal use only.
+    implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.27.1")
     // Design 4 uses runInterruptible() and withTimeoutOrNull() directly, so the coroutines
     // runtime must not be left to a transitive version.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
