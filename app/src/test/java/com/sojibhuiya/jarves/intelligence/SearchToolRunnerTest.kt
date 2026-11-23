@@ -117,6 +117,42 @@ class SearchToolRunnerTest {
         runner.shutdown()
     }
 
+    // ---- 0.2.19: a re-verification runs fresh --------------------------------------------
+
+    @Test
+    fun aForceRefreshCallRunsFreshInsteadOfTheCachedSearch() {
+        // Records which backend method the runner chose — the cache itself is covered by
+        // CachedSearchTest; this test pins the routing.
+        val backend = object : SearchBackend {
+            val normal = Collections.synchronizedList(mutableListOf<String>())
+            val fresh = Collections.synchronizedList(mutableListOf<String>())
+            override fun describe(): String = "recording"
+            override suspend fun search(query: String): GroundedAnswer {
+                normal += query
+                return GroundedAnswer(query = query, text = "cached answer")
+            }
+
+            override suspend fun searchFresh(query: String): GroundedAnswer {
+                fresh += query
+                return GroundedAnswer(query = query, text = "fresh answer")
+            }
+        }
+        val results = Collections.synchronizedList(mutableListOf<Pair<String, GroundedAnswer>>())
+        val runner = SearchToolRunner(
+            backend = backend,
+            scope = scope(),
+            onResult = { call, answer, _ -> results += call.callId to answer }
+        )
+
+        runner.handle(SearchFunctionCall("c1", "দাম কত?", forceRefresh = true))
+
+        assertTrue("the fresh answer must arrive", awaitTrue { results.size == 1 })
+        assertEquals(listOf("দাম কত?"), backend.fresh)
+        assertTrue("the ordinary search must not run for a re-verification", backend.normal.isEmpty())
+        assertEquals("fresh answer", results.single().second.text)
+        runner.shutdown()
+    }
+
     @Test
     fun aDuplicateCallIdIsAnsweredOnceOnly() {
         // The duplicate guard covers the window in which a callId is actually reserved, so the
@@ -285,3 +321,4 @@ class SearchToolRunnerTest {
         runner.shutdown()
     }
 }
+

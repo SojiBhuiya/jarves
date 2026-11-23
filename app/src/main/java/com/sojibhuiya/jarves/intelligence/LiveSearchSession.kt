@@ -26,6 +26,13 @@ import java.util.concurrent.TimeUnit
 interface SearchBackend {
     suspend fun search(query: String): GroundedAnswer
 
+    /**
+     * 0.2.19: a re-verification search — the same question, run fresh. The default is an ordinary
+     * search (backends without a cache have nothing to bypass); [CachedSearchBackend] skips its
+     * cache read so a "শিওর?" re-check is never answered from the 120 s cache.
+     */
+    suspend fun searchFresh(query: String): GroundedAnswer = search(query)
+
     /** One secret-free line for the on-device diagnostic block. */
     fun describe(): String
 }
@@ -602,9 +609,26 @@ class CachedSearchBackend(
         return answer
     }
 
+    /**
+     * 0.2.19: a re-verification never reads the cache — the whole point of asking again is a
+     * fresh number. The new answer is still stored, so the next ordinary search benefits.
+     */
+    override suspend fun searchFresh(query: String): GroundedAnswer {
+        val key = normalize(query)
+        val now = clock()
+        entries.entries.removeAll { now - it.value.at >= ttlMillis }
+        val answer = inner.search(query)
+        if (answer.isSuccess) {
+            if (entries.size >= MAX_ENTRIES) entries.remove(entries.keys.first())
+            entries[key] = Entry(answer, now)
+        }
+        return answer
+    }
+
     private fun normalize(query: String): String = query.lowercase().replace(Regex("\\s+"), " ").trim()
 
     private companion object {
         const val MAX_ENTRIES = 8
     }
 }
+

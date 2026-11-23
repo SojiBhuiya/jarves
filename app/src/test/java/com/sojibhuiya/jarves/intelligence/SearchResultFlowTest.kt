@@ -317,6 +317,57 @@ class SearchResultFlowTest {
     }
 
     @Test
+    fun theChatLineShowsWhenTheAnswerWasChecked() {
+        // 0.2.19: the 0.2.18 phone report showed a bare "১২৪.৩১ টাকা" with no way to tell
+        // whether it was checked just now or an hour ago.
+        val checked = SearchResultItem(
+            callId = "c2",
+            question = "এক ডলারের দাম কত?",
+            answer = "এক ডলার ১২৪ টাকা ৪০ পয়সা।",
+            sourceName = "Example News",
+            receivedAtMillis = java.time.Instant.parse("2026-11-23T06:42:00Z").toEpochMilli()
+        )
+        val chat = SearchResultText.chatLine(checked)
+        assertTrue("the check time must be shown", chat.contains("যাচাই:"))
+        assertTrue(
+            "HH:MM in the device zone",
+            Regex("যাচাই: \\d{2}:\\d{2}").containsMatchIn(chat)
+        )
+
+        val unchecked = SearchResultItem(
+            callId = "c3",
+            question = "এক ডলারের দাম কত?",
+            answer = "এক ডলার ১২৪ টাকা ৪০ পয়সা।",
+            sourceName = "Example News"
+        )
+        assertFalse(
+            "no invented time when nothing was recorded",
+            SearchResultText.chatLine(unchecked).contains("যাচাই:")
+        )
+    }
+
+    @Test
+    fun theToolResponseCarriesTheCheckTimeForTimeSensitiveFacts() {
+        val checked = SearchResultItem(
+            callId = "c4",
+            question = "এক ডলারের দাম কত?",
+            answer = "এক ডলার ১২৪ টাকা ৪০ পয়সা।",
+            sourceName = "Example News",
+            receivedAtMillis = java.time.Instant.parse("2026-11-23T06:42:00Z").toEpochMilli()
+        )
+        val payload = SearchResultText.toolResponse(checked)
+        assertTrue(Regex("Checked at \\d{2}:\\d{2}").containsMatchIn(payload))
+
+        val unchecked = SearchResultItem(
+            callId = "c5",
+            question = "এক ডলারের দাম কত?",
+            answer = "এক ডলার ১২৪ টাকা ৪০ পয়সা।",
+            sourceName = "Example News"
+        )
+        assertFalse(SearchResultText.toolResponse(unchecked).contains("Checked at"))
+    }
+
+    @Test
     fun theAnswerIsLimitedToThreePlainSentences() {
         val long = (1..8).joinToString(" ") { "বাক্য $it।" }
         val limited = SearchResultText.limitSentences(long)
@@ -437,3 +488,4 @@ class SearchResultFlowTest {
         assertEquals(6, timeline.events().size)
     }
 }
+

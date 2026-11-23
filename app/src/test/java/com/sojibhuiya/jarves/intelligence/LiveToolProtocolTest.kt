@@ -77,6 +77,24 @@ class LiveToolProtocolTest {
     }
 
     @Test
+    fun readsTheForceRefreshFlagFromAToolCall() {
+        val fresh = """{"toolCall":{"functionCalls":[{"id":"f","name":"search_web","args":{"query":"দাম কত?","forceRefresh":true}}]}}"""
+        assertTrue(LiveToolProtocol.parseSearchCalls(fresh).single().forceRefresh)
+
+        val normal = """{"toolCall":{"functionCalls":[{"id":"n","name":"search_web","args":{"query":"দাম কত?","forceRefresh":false}}]}}"""
+        assertFalse(LiveToolProtocol.parseSearchCalls(normal).single().forceRefresh)
+
+        // Absent means an ordinary search — older frames carry no flag at all.
+        assertFalse(LiveToolProtocol.parseSearchCalls(toolCallFrame()).single().forceRefresh)
+    }
+
+    @Test
+    fun readsTheForceRefreshFlagFromStringEncodedArgs() {
+        val frame = """{"toolCall":{"functionCalls":[{"id":"s","name":"search_web","args":"{\"query\":\"দাম কত?\",\"forceRefresh\":true}"}]}}"""
+        assertTrue(LiveToolProtocol.parseSearchCalls(frame).single().forceRefresh)
+    }
+
+    @Test
     fun readsCancellationIds() {
         val frame = """{"toolCallCancellation":{"ids":["call-1","call-9"]}}"""
         assertEquals(listOf("call-1", "call-9"), LiveToolProtocol.parseCancellations(frame))
@@ -180,3 +198,4 @@ class LiveToolProtocolTest {
         assertTrue(LiveToolProtocol.toolResponseJson("i", "r").contains("\"name\":\"search_web\""))
     }
 }
+

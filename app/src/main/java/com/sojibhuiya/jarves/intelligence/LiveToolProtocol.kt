@@ -6,7 +6,12 @@ import com.sojibhuiya.jarves.apiproviders.MiniJson
 data class SearchFunctionCall(
     /** Correlation id supplied by the server; echoed back verbatim in the `toolResponse`. */
     val callId: String,
-    val query: String
+    val query: String,
+    /**
+     * 0.2.19: true when the model re-runs a question the user asked it to verify ("শিওর?").
+     * The app then runs a genuinely fresh search instead of returning the cached answer.
+     */
+    val forceRefresh: Boolean = false
 )
 
 /**
@@ -62,7 +67,9 @@ object LiveToolProtocol {
             }
             val query = (args?.get("query") as? String)?.trim().orEmpty()
             if (query.isEmpty()) return@mapNotNull null
-            SearchFunctionCall(callId = id, query = query.take(MAX_QUERY_CHARS))
+            // 0.2.19: the re-verify flag. Absent or anything but `true` means a normal search.
+            val forceRefresh = args?.get("forceRefresh") == true
+            SearchFunctionCall(callId = id, query = query.take(MAX_QUERY_CHARS), forceRefresh = forceRefresh)
         }
     }
 
@@ -148,3 +155,4 @@ object LiveToolProtocol {
     /** Results longer than this are announced when the model goes idle instead of interrupting. */
     const val LONG_RESULT_CHARS = 700
 }
+

@@ -54,9 +54,11 @@ class SearchToolRunner(
         // and produced two searches and two toolResponses for one id (caught by the unit test).
         val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
-                onEvent("সার্চ চলছে: ${call.query}")
+                // 0.2.19: a re-verification says so on screen — the user asked to check again.
+                onEvent(if (call.forceRefresh) "আবার যাচাই করা হচ্ছে: ${call.query}" else "সার্চ চলছে: ${call.query}")
                 val answer = withTimeoutOrNull(timeoutMillis) {
-                    backend.search(call.query)
+                    // 0.2.19: a re-verification runs fresh — never the cached answer.
+                    if (call.forceRefresh) backend.searchFresh(call.query) else backend.search(call.query)
                 } ?: GroundedAnswer(
                     query = call.query,
                     text = "",
@@ -135,3 +137,4 @@ class SearchToolRunner(
         scope.cancel()
     }
 }
+
