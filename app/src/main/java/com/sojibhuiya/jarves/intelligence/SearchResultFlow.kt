@@ -70,6 +70,11 @@ object SearchResultText {
         // line below keeps the full text and the source names.
         append("Answer: ").append(spokenText(item)).append('\n')
         if (item.sourceName.isNotBlank()) append("Source: ").append(item.sourceName).append('\n')
+        // 0.2.19: the time the answer was checked, so the model can say it for time-sensitive
+        // facts ("এখন ১২৪ টাকা ৪০ পয়সা, দুপুর ১২:৪২-এ যাচাই করা") instead of a bare number.
+        if (item.receivedAtMillis > 0L) {
+            append("Checked at ").append(TimeContext.shortTime(item.receivedAtMillis)).append(".\n")
+        }
         if (item.askedBeforeResult) {
             append("The user has asked other things since this question, so BEGIN by naming the ")
             append("question, for example: \"আপনি ")
@@ -92,6 +97,11 @@ object SearchResultText {
             // 0.2.16 (task 4): the chat keeps the FULL text; [spokenText] is what the voice says.
             append("উত্তর: ").append(item.answer.trim())
             if (item.sourceName.isNotBlank()) append('\n').append("সূত্র: ").append(item.sourceName)
+            // 0.2.19: the time the answer was checked — a rate from an hour ago must not look
+            // like a rate from just now.
+            if (item.receivedAtMillis > 0L) {
+                append('\n').append("যাচাই: ").append(TimeContext.shortTime(item.receivedAtMillis))
+            }
         } else {
             append("সার্চ করা যায়নি, তাই এই প্রশ্নের নির্ভরযোগ্য উত্তর দেওয়া যাচ্ছে না।")
         }
@@ -235,3 +245,4 @@ class SearchTimeline(private val capacity: Int = 40) {
         const val CAPACITY_DEFAULT = 40
     }
 }
+

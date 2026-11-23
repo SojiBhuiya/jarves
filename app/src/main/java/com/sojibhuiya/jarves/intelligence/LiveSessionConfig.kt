@@ -69,6 +69,12 @@ object LiveSessionConfig {
     /** Marker that tells the instruction builder (and the tests) a search tool is available. */
     private const val MARK_SEARCH = "You can search the live web"
 
+    /**
+     * 0.2.19: marker for the re-verify rule — a challenge ("শিওর?", "are you sure?") must trigger
+     * a fresh search, never an answer from memory and never a vague "technical problem".
+     */
+    const val MARK_VERIFY_RULE = "VERIFY RULE"
+
     fun searchEnabled(systemInstruction: String): Boolean = systemInstruction.contains(MARK_SEARCH)
 
     /** Marker the tests use to prove the rule is present in every mode's instruction. */
@@ -104,9 +110,9 @@ object LiveSessionConfig {
     ): String = buildString {
         appendLine(
             "You are $assistantName, a warm and capable personal voice assistant. " +
-                "Speak naturally and conversationally. Understand Bengali, English and Banglish, " +
+                "Speak naturally. Understand Bengali, English and Banglish, " +
                 "but the strict LANGUAGE RULE below decides which language you speak in. " +
-                "Keep responses clear, useful and concise. This is a live voice conversation. " +
+                "Keep responses clear and concise. " +
                 "Do not say you are reading a transcript."
         )
         appendLine()
@@ -131,13 +137,14 @@ object LiveSessionConfig {
             appendLine(
                 "Answer in one go, in the user's language, and name the source you used when the " +
                     "search returned one. If the search returns nothing usable, say plainly that " +
-                    "you could not verify it and do not invent facts or links."
+                    "you could not verify it and do not invent facts or links. If the user asks " +
+                    "you to verify your previous answer, search again instead of answering from memory."
             )
         } else if (searchTool.declaresFunction) {
             // Short on purpose (0.2.7): a long instruction was making the model chatty.
             appendLine(
-                "You can search the live web by calling `$FUNCTION_SEARCH_WEB` only for current or " +
-                    "time-sensitive facts: weather, news, prices, exchange rates, sports scores, " +
+                "Call `$FUNCTION_SEARCH_WEB` only for current or time-sensitive facts: " +
+                    "weather, news, prices, exchange rates, sports scores, " +
                     "today's date, or \"who is the current …\". Never call it for small talk, " +
                     "arithmetic or definitions."
             )
@@ -152,19 +159,18 @@ object LiveSessionConfig {
             // apology while a search that eventually SUCCEEDED was still running. The rules below
             // say one ack and then silence, and they make "could not verify" depend on the result.
             appendLine(
-                "STEP 1 — the moment you decide to search, and BEFORE calling `$FUNCTION_SEARCH_WEB`, " +
-                    "say exactly one short line aloud in the user's language, varying it: " +
-                    "\"দেখছি\", \"দেখে নিচ্ছি\", \"একটু সময় দিন\". Call the tool only after you " +
-                    "have said it. One line, once: never repeat or rephrase it."
+                "STEP 1 — BEFORE calling `$FUNCTION_SEARCH_WEB`, " +
+                    "say exactly one short line aloud: " +
+                    "\"দেখছি\", \"দেখে নিচ্ছি\" or \"একটু সময় দিন\". Call the tool only after you " +
+                    "have said it. One line, once — never repeat it."
             )
             appendLine(
-                "WHILE THE SEARCH RUNS — nothing more: no apology, no second ack; wait for the result."
+                "WHILE IT RUNS — nothing more: no apology, no second ack."
             )
             appendLine(
-                "STEP 2 — when the result arrives: if nothing has happened since you asked, answer " +
-                    "naturally. If the user asked something else in the meantime, FIRST name their " +
-                    "earlier question — \"আপনি … জানতে চেয়েছিলেন, তার উত্তর: …\" — and then answer. " +
-                    "Never cut off or replace an answer that is already being spoken."
+                "STEP 2 — when the result arrives: if the user asked something else meanwhile, " +
+                    "FIRST name their earlier question — \"আপনি … জানতে চেয়েছিলেন, তার উত্তর: …\" — " +
+                    "then answer. Never cut off an answer already being spoken."
             )
             // 0.2.15 (rule 3): silence is only allowed to break for a REAL failure, and the failure
             // text that the app reserves for that case is the one in GroundingPolicy.
@@ -172,6 +178,20 @@ object LiveSessionConfig {
                 "WHEN THE RESULT ARRIVES — say you could not verify it ONLY if the result reports a " +
                     "failure, once, in one sentence. Do not guess before the result arrives; name the " +
                     "source you used."
+            )
+            // 0.2.19: the 0.2.18 phone report — the user asked "শিওর?" about a dollar rate and
+            // Jarves answered from memory ("আমি এই তথ্যটি এখন যাচাই করতে পারছি না") and then
+            // blamed a vague "technical problem" instead of checking again. A verification
+            // challenge is a new search, not a new opinion: the model re-runs the ORIGINAL
+            // question with forceRefresh so the answer is fresh, not the 120 s cache.
+            appendLine(
+                MARK_VERIFY_RULE + ": when the user asks you to confirm or check your previous " +
+                    "answer (\"শিওর?\", \"সত্যি?\", \"are you sure?\", \"আবার দেখো\"): call " +
+                    "`$FUNCTION_SEARCH_WEB` again with the ORIGINAL question and " +
+                    "`forceRefresh: true`. Say \"আবার দেখে নিচ্ছি\", then answer from the fresh " +
+                    "result. Never answer from memory, and " +
+                    "never blame a vague \"technical problem\" — if the search fails, say exactly " +
+                    "what failed."
             )
         } else {
             appendLine(
@@ -185,15 +205,13 @@ object LiveSessionConfig {
         // 3,000-character ceiling the test enforces instead of raising the ceiling.
         appendLine(
             "Prefer the most recent sources. For a disputed fact report the disagreement instead of " +
-                "choosing one side silently, and separate confirmed from uncertain. Name the sources " +
-                "briefly, in the spoken answer."
+                "choosing one side silently. Name the sources briefly."
         )
         appendLine(
-            "Stable knowledge (history, definitions, fixed past events, mathematics) does not need a " +
-                "search; answer it directly and accurately."
+            "Stable knowledge needs no search; answer directly."
         )
         appendLine(
-            "Never state a date, time or 'current' fact that you have not been given or verified in " +
+            "Never state a date, time or 'current' fact you have not been given or verified in " +
                 "this session. If you are unsure, say so."
         )
         appendLine()
@@ -216,6 +234,14 @@ object LiveSessionConfig {
                 "query" to linkedMapOf<String, Any?>(
                     "type" to "STRING",
                     "description" to "The search query, in the language of the user's question."
+                ),
+                // 0.2.19: the re-verify flag. True only when the user asked to confirm or check a
+                // previous answer — the app then runs a genuinely fresh search instead of
+                // returning the 120 s cached answer for the same question.
+                "forceRefresh" to linkedMapOf<String, Any?>(
+                    "type" to "BOOLEAN",
+                    "description" to "Set to true when the user asked you to verify or confirm a " +
+                        "previous answer, so the search is run fresh instead of reusing a recent result."
                 )
             ),
             "required" to listOf("query")
@@ -407,3 +433,4 @@ object LiveSessionConfig {
             )
         )
 }
+

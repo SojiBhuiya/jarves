@@ -20,6 +20,16 @@ object TimeContext {
 
     private val HUMAN = DateTimeFormatter.ofPattern("EEEE, d MMMM yyyy, HH:mm", Locale.ENGLISH)
 
+    /** Short clock time ("14:32") for the "checked at" line under a search answer. */
+    private val SHORT_TIME = DateTimeFormatter.ofPattern("HH:mm", Locale.ENGLISH)
+
+    /**
+     * 0.2.19: the clock time a search answer was checked, in the device timezone — so the user
+     * can tell a fresh rate from a stale one at a glance. Pure and unit-tested.
+     */
+    fun shortTime(millis: Long, zone: ZoneId = ZoneId.systemDefault()): String =
+        Instant.ofEpochMilli(millis).atZone(zone).format(SHORT_TIME)
+
     /** Words that mean "answer in Bangladesh time". Bangla + English, lowercase. */
     private val BANGLADESH_HINTS = listOf(
         "bangladesh", "dhaka", "bangladeshi", "bd time", "bangladesh time",
@@ -75,3 +85,4 @@ object TimeContext {
             "${snapshot.describeDhaka()} in Bangladesh (Asia/Dhaka). " +
             "Use these values, not any earlier ones."
 }
+

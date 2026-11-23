@@ -12,8 +12,8 @@ android {
         applicationId = "com.sojibhuiya.jarves"
         minSdk = 26
         targetSdk = 35
-        versionCode = 20
-        versionName = "0.2.18"
+        versionCode = 21
+        versionName = "0.2.19"
     }
 
     // ---- 0.2.7: ONE fixed signing key for every installed APK.
@@ -91,4 +91,5 @@ dependencies {
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
+
 

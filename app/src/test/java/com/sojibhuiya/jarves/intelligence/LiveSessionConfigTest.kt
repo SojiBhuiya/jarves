@@ -178,6 +178,42 @@ class LiveSessionConfigTest {
         assertNull(fallback["tools"])
     }
 
+    // ---- 0.2.19: the re-verify rule ------------------------------------------------------
+
+    @Test
+    fun verifyRuleRequiresAFreshSearchInsteadOfAnAnswerFromMemory() {
+        // The 0.2.18 phone report: "শিওর?" about a dollar rate got "আমি এই তথ্যটি এখন যাচাই
+        // করতে পারছি না" and then a vague "technical problem" — both from memory, no re-check.
+        val text = LiveSessionConfig.systemInstruction("Jarves", snapshot, LiveSearchTool.FUNCTION_NON_BLOCKING)
+        assertTrue(text.contains(LiveSessionConfig.MARK_VERIFY_RULE))
+        assertTrue("the Bengali challenge must be named", text.contains("শিওর?"))
+        assertTrue("the English challenge must be named", text.contains("are you sure?"))
+        assertTrue("the re-check must name the original question", text.contains("ORIGINAL question"))
+        assertTrue("the re-check must be a fresh search", text.contains("forceRefresh: true"))
+        assertTrue("the user must hear a re-check is happening", text.contains("আবার দেখে নিচ্ছি"))
+        assertTrue("no answer from memory", text.contains("Never answer from memory"))
+        assertTrue("no vague technical excuse", text.contains("technical problem"))
+    }
+
+    @Test
+    fun searchWebDeclaresTheForceRefreshFlagButDoesNotRequireIt() {
+        val declaration = LiveSessionConfig.searchFunctionDeclaration(nonBlocking = true)
+        val parameters = declaration["parameters"] as Map<*, *>
+        // Only the query is required: a normal search must not have to say anything about refresh.
+        assertEquals(listOf("query"), parameters["required"])
+        val properties = parameters["properties"] as Map<*, *>
+        val forceRefresh = properties["forceRefresh"] as Map<*, *>
+        assertEquals("BOOLEAN", forceRefresh["type"])
+        assertTrue((forceRefresh["description"] as String).contains("verify", ignoreCase = true))
+    }
+
+    @Test
+    fun builtInSearchModeAlsoReVerifiesInsteadOfAnsweringFromMemory() {
+        val text = LiveSessionConfig.systemInstruction("Jarves", snapshot, LiveSearchTool.GOOGLE_SEARCH_BUILT_IN)
+        assertTrue(text.contains("verify your previous answer", ignoreCase = true))
+        assertTrue(text.contains("search again instead of answering from memory", ignoreCase = true))
+    }
+
     // ---- 0.2.12 (B1): injected text must finish the turn ---------------------------------
 
     @Test
@@ -292,3 +328,4 @@ class LiveSessionConfigTest {
         assertNotNull(turn["parts"])
     }
 }
+

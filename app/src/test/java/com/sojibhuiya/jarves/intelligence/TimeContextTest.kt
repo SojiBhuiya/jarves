@@ -79,4 +79,16 @@ class TimeContextTest {
         assertEquals("Asia/Dhaka", TimeContext.DHAKA.id)
         assertEquals(6 * 60 * 60, TimeContext.DHAKA.rules.getOffset(Instant.parse("2026-11-09T00:00:00Z")).totalSeconds)
     }
+
+    // ---- 0.2.19: the "checked at" clock time ---------------------------------------------
+
+    @Test
+    fun shortTimeFormatsTheClockTimeInTheGivenZone() {
+        // 10:15 UTC is 11:15 in Paris and 16:15 in Dhaka.
+        val millis = Instant.parse("2026-11-09T10:15:00Z").toEpochMilli()
+        assertEquals("11:15", TimeContext.shortTime(millis, paris))
+        assertEquals("10:15", TimeContext.shortTime(millis, ZoneId.of("UTC")))
+        assertEquals("16:15", TimeContext.shortTime(millis, TimeContext.DHAKA))
+    }
 }
+
