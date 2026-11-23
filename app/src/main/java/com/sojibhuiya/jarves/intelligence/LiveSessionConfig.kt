@@ -143,8 +143,8 @@ object LiveSessionConfig {
         } else if (searchTool.declaresFunction) {
             // Short on purpose (0.2.7): a long instruction was making the model chatty.
             appendLine(
-                "Call `$FUNCTION_SEARCH_WEB` only for current or time-sensitive facts: " +
-                    "weather, news, prices, exchange rates, sports scores, " +
+                "You can search the live web by calling `$FUNCTION_SEARCH_WEB` only for current or " +
+                    "time-sensitive facts: weather, news, prices, exchange rates, sports scores, " +
                     "today's date, or \"who is the current …\". Never call it for small talk, " +
                     "arithmetic or definitions."
             )
