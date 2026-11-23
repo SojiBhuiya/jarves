@@ -1,0 +1,62 @@
+# ===========================================================================
+#  Aladin backend — Python dependencies
+# ---------------------------------------------------------------------------
+#  Requires Python 3.10 – 3.14 (livekit-agents constraint: >=3.10,<3.15).
+#
+#      python -m venv .venv
+#      .venv/bin/pip install -r backend/requirements.txt
+#
+#  Versions are pinned with ~= to the minor series verified during development
+#  (livekit-agents 1.8.x, livekit-api 1.2.x). Pinning to the minor keeps
+#  security patches flowing while protecting against the breaking API changes
+#  that the LiveKit Agents SDK has historically shipped between minors.
+# ===========================================================================
+
+# --- Realtime voice agent ---------------------------------------------------
+# [google]  -> Gemini Live  (the default provider)
+# [openai]  -> OpenAI Realtime (the optional provider)
+# [cartesia] -> Cartesia, the PRIMARY voice of the modular pipeline
+#              (STT -> LLM -> Cartesia TTS). The extra keeps the plugin on the
+#              same minor as the SDK (livekit-plugins-cartesia).
+#              No Cartesia key is configured here: a key reaches the agent only
+#              through the app-managed provider path (a session credential
+#              fetched over the internal-token API), never from source and never
+#              from a GitHub secret. Gemini Live remains available as the
+#              realtime mode and as the pipeline's fallback.
+livekit-agents[google,openai,cartesia]~=1.8
+
+# --- Voice activity detection (modular pipeline only) ----------------------
+# Turn detection for STT -> LLM -> TTS: the realtime model does its own, but an
+# explicit pipeline needs an end-of-speech signal. The Silero model ships inside
+# this wheel, so the image needs no download step at build or boot time, and it
+# keeps the pipeline working without depending on LiveKit Inference being
+# reachable. If it is ever absent the pipeline degrades to the transcriber's own
+# endpointing rather than failing (see aladin/voice_pipeline.load_vad).
+livekit-plugins-silero~=1.8
+
+# --- Server-side token minting ---------------------------------------------
+# Used by the token API to sign LiveKit room tokens. Never used on the client.
+livekit-api~=1.2
+
+# --- Token API --------------------------------------------------------------
+fastapi~=0.141
+uvicorn[standard]~=0.54
+
+# --- Configuration ----------------------------------------------------------
+python-dotenv~=1.2
+
+# --- Transitive but load-bearing -------------------------------------------
+# aiohttp is used directly by the web-search tool and ships with livekit.
+aiohttp>=3.9
+
+# ===========================================================================
+#  Optional
+# ===========================================================================
+# LiveKit Cloud BVC noise cancellation. Cloud-only, and the wheel is built per
+# platform — Aladin runs fine without it (`ALADIN_NOISE_CANCELLATION=false`,
+# or just leave it installed-absent: the agent logs a warning and continues).
+#
+#   livekit-plugins-noise-cancellation~=0.3
+#
+# For development:
+#   pip install -r backend/requirements-dev.txt

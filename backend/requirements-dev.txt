@@ -1,0 +1,21 @@
+# ===========================================================================
+#  Aladin backend — development dependencies
+#
+#      .venv/bin/pip install -r backend/requirements.txt \
+#                            -r backend/requirements-dev.txt
+#      .venv/bin/python -m pytest backend/tests -v
+# ===========================================================================
+
+-r requirements.txt
+
+pytest~=9.1
+pytest-asyncio~=1.4
+
+# Required by fastapi.testclient for the token API tests.
+httpx~=0.28
+
+# Used to verify that minted LiveKit tokens carry the expected claims.
+PyJWT~=2.15
+
+# Optional but recommended while developing the agent:
+#   python -m aladin.agent_worker dev

@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aladin-backend"
+version = "0.1.0"
+description = "Aladin — Android-first personal AI voice assistant (backend: LiveKit agent + token API)"
+requires-python = ">=3.10,<3.15"
+license = { text = "MIT" }
+
+# Mirrors requirements.txt. Either works:
+#     pip install -r backend/requirements.txt
+#     pip install -e backend/
+dependencies = [
+    # [cartesia] mirrors requirements.txt: Cartesia is the modular pipeline's
+    # primary voice. Keys are not configured here — they arrive per session
+    # through the internal-token provider path, or from CARTESIA_API_KEY on a
+    # self-hosted server.
+    "livekit-agents[google,openai,cartesia]~=1.8",
+    # Turn detection for the modular pipeline; its model ships in the wheel.
+    "livekit-plugins-silero~=1.8",
+    "livekit-api~=1.2",
+    "fastapi~=0.141",
+    "uvicorn[standard]~=0.54",
+    "python-dotenv~=1.2",
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest~=9.1",
+    "pytest-asyncio~=1.4",
+    "httpx~=0.28",
+    "PyJWT~=2.15",
+]
+# LiveKit Cloud only, and the wheel is platform-specific, so it is opt-in.
+noise-cancellation = ["livekit-plugins-noise-cancellation~=0.3"]
+
+[project.scripts]
+aladin-agent = "aladin.agent_worker:main"
+aladin-token-api = "aladin.token_server:main"
+
+[tool.setuptools]
+packages = ["aladin"]
