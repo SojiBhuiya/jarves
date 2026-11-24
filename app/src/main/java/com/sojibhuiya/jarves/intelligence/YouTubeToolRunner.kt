@@ -48,7 +48,9 @@ class YouTubeToolRunner(
     /** A playback control was requested: pause, resume, next, previous or stop. */
     private val onControl: (String) -> Unit = {},
     /** A search succeeded: the video list, so the UI can show tappable version cards. */
-    private val onSearchResults: (List<YouTubeVideo>) -> Unit = {}
+    private val onSearchResults: (List<YouTubeVideo>) -> Unit = {},
+    /** A play failed: the short technical cause, e.g. "INTERNAL (ExtractionException)". */
+    private val onPlayFailure: (String) -> Unit = {}
 ) {
 
     private val lock = Any()
@@ -86,6 +88,11 @@ class YouTubeToolRunner(
         val streams = withTimeoutOrNull(timeoutMillis) { resolver.resolve(call.videoId) }
             ?: YouTubeStreams(videoId = call.videoId, failure = YouTubeFailure.NETWORK, detail = "timeout")
         if (streams.failure != null || (streams.videoUrl == null && streams.audioUrl == null)) {
+            // 0.2.23: the spoken reason gets paraphrased away by the model, so the exact
+            // cause is also reported here, for the diagnostics.
+            val cause = streams.failure?.let { "$it (${streams.detail})" }
+                ?: "EMPTY (no playable streams)"
+            runCatching { onPlayFailure(cause) }
             deliver(call.callId, LiveSessionConfig.FUNCTION_PLAY_VIDEO, playFailureText(streams))
             return@enqueue
         }

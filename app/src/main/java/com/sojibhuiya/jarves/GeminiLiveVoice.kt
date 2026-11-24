@@ -263,6 +263,9 @@ internal class GeminiLiveVoice(
     @Volatile private var lastServerMessageKeys = "none"
     /** Design 4 telemetry: answers "did the model ever ask us to search?" on the device. */
     @Volatile private var toolCallCount = 0
+    /** 0.2.23: the last video play failure, e.g. "INTERNAL (ExtractionException)". The
+     * model paraphrases the spoken reason away, so the exact cause lives here instead. */
+    @Volatile private var lastVideoFailure = "none"
     @Volatile private var lastToolQuery = "none"
     @Volatile private var lastSearchOutcome = "none"
     /** Which search model produced (or last tried for) the most recent search. */
@@ -1137,6 +1140,7 @@ internal class GeminiLiveVoice(
             "Echo: $closeEchoed | Search: ${if (groundingAvailable) "on" else "off"} " +
             "(tool=$searchToolMode, legacyFallback=$groundingFallbackUsed) | " +
             "Setup tools: $setupDeclaredTool | toolCalls: $toolCallCount | " +
+            "Last video failure: $lastVideoFailure | " +
             "Skipped frames: ${failureRouter.skippedFrames} (last: $lastSkippedFrame) | " +
             failureRouter.describe() + " | " +
             "Send failures: $sendFailureCount (last: $lastSendFailureEvidence) | " +
@@ -1370,7 +1374,8 @@ internal class GeminiLiveVoice(
             onEvent = { line -> liveStatus(line.substringBefore(':')) },
             onPlayVideo = { video, streams -> onYouTubePlay?.invoke(video, streams) },
             onControl = { action -> onYouTubeControl?.invoke(action) },
-            onSearchResults = { videos -> onYouTubeSearchResults?.invoke(videos) }
+            onSearchResults = { videos -> onYouTubeSearchResults?.invoke(videos) },
+            onPlayFailure = { cause -> lastVideoFailure = cause }
         )
     }
 

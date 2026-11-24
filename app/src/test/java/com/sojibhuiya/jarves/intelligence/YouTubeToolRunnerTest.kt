@@ -30,6 +30,7 @@ class YouTubeToolRunnerTest {
     private val played = LinkedBlockingQueue<Pair<YouTubeVideo, YouTubeStreams>>()
     private val controlled = LinkedBlockingQueue<String>()
     private val searched = LinkedBlockingQueue<List<YouTubeVideo>>()
+    private val failedPlays = LinkedBlockingQueue<String>()
 
     private class FakeResolver(var streams: YouTubeStreams? = null) : YouTubeStreamResolver {
         val resolvedIds = mutableListOf<String>()
@@ -56,7 +57,8 @@ class YouTubeToolRunnerTest {
             },
             onPlayVideo = { video, streams -> played.add(video to streams) },
             onControl = { action -> controlled.add(action) },
-            onSearchResults = { videos -> searched.add(videos) }
+            onSearchResults = { videos -> searched.add(videos) },
+            onPlayFailure = { cause -> failedPlays.add(cause) }
         ).also { runner = it }
     }
 
@@ -154,6 +156,17 @@ class YouTubeToolRunnerTest {
         val (_, _, result) = awaitResult()
         assertTrue(result.contains("ExtractionException"))
         assertNull(played.poll(200, TimeUnit.MILLISECONDS))
+    }
+
+    @Test
+    fun playFailureReportsTheCauseToTheCallback() {
+        // 0.2.23: the spoken reason gets paraphrased away, so the exact cause is also
+        // reported here, for the diagnostics.
+        val resolver = FakeResolver(
+            YouTubeStreams(videoId = "bad123", failure = YouTubeFailure.INTERNAL, detail = "ExtractionException")
+        )
+        runner(resolver = resolver).handlePlay(YouTubePlayCall("c1", "bad123", "Bad Song"))
+        assertEquals("INTERNAL (ExtractionException)", failedPlays.poll(5, TimeUnit.SECONDS))
     }
 
     @Test

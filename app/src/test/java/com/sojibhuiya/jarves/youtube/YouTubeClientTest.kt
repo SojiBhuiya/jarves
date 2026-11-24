@@ -257,4 +257,21 @@ class OkHttpNewPipeDownloaderTest {
         assertEquals("1", response.getHeader("X-Test"))
         assertEquals(url, response.latestUrl())
     }
+
+    @Test
+    fun `post with a json content type header sends json, not form-urlencoded`() {
+        // 0.2.23: the extractor sends JSON with "Content-Type: application/json" — the old
+        // hardcoded form-urlencoded body made YouTube answer HTTP 400, so no video loaded.
+        server.enqueue(MockResponse().setBody("{}"))
+        val downloader = OkHttpNewPipeDownloader()
+        val url = server.url("/youtubei/v1/player").toString()
+        val request = org.schabi.newpipe.extractor.downloader.Request.newBuilder()
+            .post(url, "{}".toByteArray())
+            .setHeader("Content-Type", "application/json")
+            .build()
+        val response = downloader.execute(request)
+        assertEquals(200, response.responseCode())
+        val recorded = server.takeRequest(5, java.util.concurrent.TimeUnit.SECONDS)
+        assertEquals("application/json", recorded?.getHeader("Content-Type"))
+    }
 }
