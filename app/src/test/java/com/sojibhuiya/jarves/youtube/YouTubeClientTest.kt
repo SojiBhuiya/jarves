@@ -248,13 +248,13 @@ class OkHttpNewPipeDownloaderTest {
         )
         val downloader = OkHttpNewPipeDownloader()
         val url = server.url("/watch?v=abc123").toString()
-        val request = org.schabi.newpipe.extractor.downloader.Request(
-            "GET", url, emptyMap(), null, null
-        )
+        val request = org.schabi.newpipe.extractor.downloader.Request.newBuilder()
+            .get(url)
+            .build()
         val response = downloader.execute(request)
-        assertEquals(200, response.responseCode)
-        assertEquals("hello", response.responseBody)
+        assertEquals(200, response.responseCode())
+        assertEquals("hello", response.responseBody())
         assertEquals(listOf("1"), response.getHeader("X-Test"))
-        assertEquals(url, response.latestUrl)
+        assertEquals(url, response.latestUrl())
     }
 }
