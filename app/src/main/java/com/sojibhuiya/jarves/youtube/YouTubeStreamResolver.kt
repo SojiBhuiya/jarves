@@ -83,7 +83,12 @@ open class NewPipeStreamResolver(
         if (retried.failure == null) return retried.copy(source = "visionOS-retry")
         val android = androidFallback(videoId)
         if (android.failure == null) return android
-        return first
+        // 0.2.25: both ways failed — keep the first cause, but name what the Android
+        // fallback hit too, or the next phone test cannot tell them apart (0.2.24 showed
+        // only the first failure, so the Android result was invisible).
+        return first.copy(
+            detail = "${first.detail}; android ${android.failure} (${android.detail})"
+        )
     }
 
     private fun androidFallback(videoId: String): YouTubeStreams =

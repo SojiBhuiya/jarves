@@ -70,6 +70,7 @@ import com.sojibhuiya.jarves.ui.icons.JarvesIcons
 import com.sojibhuiya.jarves.ui.theme.JarvesColors
 import com.sojibhuiya.jarves.ui.theme.JarvesDimens
 import com.sojibhuiya.jarves.youtube.YouTubeApiKeyStore
+import com.sojibhuiya.jarves.youtube.YouTubeCookieStore
 import kotlinx.coroutines.launch
 
 /**
@@ -85,7 +86,11 @@ fun ApiProvidersScreen(
     onBack: () -> Unit,
     onRecordsChanged: (List<ApiProviderRecord>) -> Unit = {},
     /** 0.2.20: the YouTube Data API key lives in the same encrypted store as the providers. */
-    youTubeKeyStore: YouTubeApiKeyStore? = null
+    youTubeKeyStore: YouTubeApiKeyStore? = null,
+    /** 0.2.25: the signed-in YouTube session, for the video player. */
+    youTubeCookieStore: YouTubeCookieStore? = null,
+    /** The session changed (signed in with cookies, or signed out with null). */
+    onYouTubeAuthChanged: (String?) -> Unit = {}
 ) {
     val scope = rememberCoroutineScope()
     var records by remember { mutableStateOf<List<ApiProviderRecord>?>(null) }
@@ -262,6 +267,15 @@ fun ApiProvidersScreen(
             if (youTubeKeyStore != null) {
                 Spacer(Modifier.height(12.dp))
                 YouTubeKeyCard(store = youTubeKeyStore)
+            }
+            // 0.2.25: the YouTube sign-in, right under the key card — the player needs
+            // the session when the mobile connection is bot-checked.
+            if (youTubeCookieStore != null) {
+                Spacer(Modifier.height(12.dp))
+                YouTubeSignInCard(
+                    store = youTubeCookieStore,
+                    onAuthChanged = onYouTubeAuthChanged
+                )
             }
         }
     }
@@ -879,5 +893,99 @@ private fun YouTubeKeyCard(store: YouTubeApiKeyStore) {
                 Text(it, color = JarvesColors.TextMuted, fontSize = 12.sp)
             }
         }
+    }
+}
+
+/**
+ * 0.2.25: the signed-in YouTube session, for the video player. The cookies are never
+ * shown back — only whether a session is saved. Signing in opens a WebView where the
+ * user signs in with Google; the session is captured and saved encrypted.
+ */
+@Composable
+private fun YouTubeSignInCard(
+    store: YouTubeCookieStore,
+    onAuthChanged: (String?) -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    var signedIn by remember { mutableStateOf<Boolean?>(null) }
+    var showSignIn by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(Unit) { signedIn = store.hasCookies() }
+
+    JarvesCard {
+        Column(Modifier.padding(16.dp)) {
+            Text(
+                "YouTube সাইন ইন",
+                color = Color.White,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "ভিডিও চালাতে YouTube-এ সাইন ইন লাগে। মোবাইল লাইন থেকে রোবট ভেবে আটকাচ্ছে — সাইন ইন করলে YouTube তোমাকে চিনবে।",
+                color = JarvesColors.TextMuted,
+                fontSize = 12.sp,
+                lineHeight = 17.sp
+            )
+            if (signedIn == true) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "সাইন ইন করা আছে",
+                    color = JarvesColors.Accent,
+                    fontSize = 12.sp
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+            if (signedIn == true) {
+                JarvesSecondaryButton(
+                    text = if (busy) "সাইন আউট হচ্ছে…" else "সাইন আউট",
+                    onClick = {
+                        if (busy) return@JarvesSecondaryButton
+                        scope.launch {
+                            busy = true
+                            runCatching { store.clear() }.onSuccess {
+                                android.webkit.CookieManager.getInstance()
+                                    .removeAllCookies(null)
+                                onAuthChanged(null)
+                                signedIn = false
+                                message = "সাইন আউট হয়েছে"
+                            }.onFailure {
+                                message = "সাইন আউট করা যায়নি"
+                            }
+                            busy = false
+                        }
+                    }
+                )
+            } else {
+                JarvesPrimaryButton(
+                    text = "YouTube-এ সাইন ইন করুন",
+                    onClick = { showSignIn = true }
+                )
+            }
+            message?.let {
+                Spacer(Modifier.height(8.dp))
+                Text(it, color = JarvesColors.TextMuted, fontSize = 12.sp)
+            }
+        }
+    }
+
+    if (showSignIn) {
+        YouTubeSignInDialog(
+            onSignedIn = { cookies ->
+                scope.launch {
+                    runCatching { store.save(cookies) }.onSuccess {
+                        onAuthChanged(cookies)
+                        signedIn = true
+                        message = "YouTube-এ সাইন ইন হয়েছে"
+                    }.onFailure {
+                        message = "সাইন ইন সংরক্ষণ করা যায়নি"
+                    }
+                    showSignIn = false
+                }
+            },
+            onClose = { showSignIn = false }
+        )
     }
 }

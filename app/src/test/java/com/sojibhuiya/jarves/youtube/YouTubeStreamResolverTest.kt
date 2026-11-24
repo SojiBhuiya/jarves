@@ -79,7 +79,9 @@ class YouTubeStreamResolverTest {
     }
 
     @Test
-    fun `bot check twice and android fails returns first failure`() = runBlocking {
+    fun `bot check twice and android fails returns combined failure`() = runBlocking {
+        // 0.2.25: the combined detail names what the Android fallback hit too, or the
+        // next phone test cannot tell the two failures apart.
         val android = FakeAndroid(botFailure())
         val resolver = ScriptedResolver(
             ArrayDeque(listOf(botFailure(), botFailure())),
@@ -87,7 +89,10 @@ class YouTubeStreamResolverTest {
         )
         val streams = resolver.resolve("abc123")
         assertEquals(YouTubeFailure.INTERNAL, streams.failure)
-        assertEquals("SignInConfirmNotBotException", streams.detail)
+        assertEquals(
+            "SignInConfirmNotBotException; android INTERNAL (SignInConfirmNotBotException)",
+            streams.detail
+        )
         assertEquals(2, resolver.calls)
         assertEquals(1, android.calls)
     }

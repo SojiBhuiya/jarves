@@ -14,9 +14,16 @@ import org.schabi.newpipe.extractor.downloader.Response
  * The extractor only ever calls [execute]; the `get(...)` helpers on the base class
  * funnel into it. Runs on the extractor's own IO threads, so the call is blocking by
  * design — callers wrap it in Dispatchers.IO (see [NewPipeStreamResolver]).
+ *
+ * 0.2.25: when a signed-in YouTube session exists, [authCookiesProvider] supplies its
+ * cookies and [execute] attaches the signed-in headers ([YouTubeAuth.authHeaders]) to
+ * every request — Cookie + SAPISIDHASH + Origin + X-Origin. A bare Cookie alone is
+ * ignored by InnerTube, so the hash is what makes the session count. Requests made
+ * without a session are unchanged.
  */
 class OkHttpNewPipeDownloader(
-    private val client: OkHttpClient = defaultClient()
+    private val client: OkHttpClient = defaultClient(),
+    private val authCookiesProvider: () -> String? = { null }
 ) : Downloader() {
 
     companion object {
@@ -33,8 +40,29 @@ class OkHttpNewPipeDownloader(
 
     override fun execute(request: Request): Response {
         val builder = okhttp3.Request.Builder().url(request.url())
+        var existingCookie: String? = null
         request.headers().forEach { (name, values) ->
             values.forEach { builder.addHeader(name, it) }
+            if (name.equals("Cookie", ignoreCase = true)) {
+                existingCookie = values.firstOrNull()
+            }
+        }
+        // 0.2.25: attach the signed-in session, if any. A Cookie the extractor already
+        // set (e.g. the WEB consent cookie) is kept and the session cookies are
+        // appended to it, never replaced.
+        val authCookies = runCatching { authCookiesProvider() }.getOrNull()
+            ?.takeIf { it.isNotBlank() }
+        if (authCookies != null) {
+            val headers = YouTubeAuth.authHeaders(authCookies)
+            val mergedCookie = if (existingCookie.isNullOrBlank()) {
+                headers["Cookie"]
+            } else {
+                "$existingCookie; ${headers["Cookie"]}"
+            }
+            mergedCookie?.let { builder.header("Cookie", it) }
+            headers.forEach { (name, value) ->
+                if (!name.equals("Cookie", ignoreCase = true)) builder.header(name, value)
+            }
         }
         val method = request.httpMethod()
         val data = request.dataToSend()

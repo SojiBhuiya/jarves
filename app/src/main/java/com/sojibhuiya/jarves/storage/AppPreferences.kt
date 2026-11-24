@@ -24,6 +24,9 @@ object PrefKeys {
     /** YouTube Data API key, AES-GCM ciphertext — never stored or logged in plain text. */
     val YOUTUBE_API_KEY_ENCRYPTED = stringPreferencesKey("youtube_key_encrypted")
 
+    /** Signed-in YouTube session cookies, AES-GCM ciphertext — account access, never plain. */
+    val YOUTUBE_COOKIES_ENCRYPTED = stringPreferencesKey("youtube_cookies_encrypted")
+
     /** Serialized, encrypted API provider records. */
     val API_PROVIDERS_JSON = stringPreferencesKey("api_providers_json")
 

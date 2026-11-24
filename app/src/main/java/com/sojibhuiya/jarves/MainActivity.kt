@@ -99,6 +99,8 @@ import com.sojibhuiya.jarves.storage.ConversationModule
 import com.sojibhuiya.jarves.youtube.NewPipeStreamResolver
 import com.sojibhuiya.jarves.youtube.OkHttpNewPipeDownloader
 import com.sojibhuiya.jarves.youtube.YouTubeApiKeyStore
+import com.sojibhuiya.jarves.youtube.YouTubeAuthHolder
+import com.sojibhuiya.jarves.youtube.YouTubeCookieStore
 import com.sojibhuiya.jarves.youtube.YouTubePlayerController
 import com.sojibhuiya.jarves.youtube.YouTubePlayerHolder
 import com.sojibhuiya.jarves.youtube.YouTubePlayerOverlay
@@ -228,7 +230,28 @@ private fun AgiApp() {
             cipher = ApiProvidersModule.credentialCipher()
         )
     }
-    val youTubeResolver = remember { NewPipeStreamResolver(OkHttpNewPipeDownloader()) }
+    // ---- 0.2.25: the signed-in YouTube session. The holder is what the downloader
+    // reads on every player request; the store is the encrypted copy on disk. The
+    // holder is filled once at startup (below) and whenever sign-in/out changes it.
+    val youTubeAuthHolder = remember { YouTubeAuthHolder() }
+    val youTubeCookieStore = remember {
+        YouTubeCookieStore(
+            readEncrypted = { context.jarvesDataStore.data.first()[PrefKeys.YOUTUBE_COOKIES_ENCRYPTED] },
+            writeEncrypted = { value ->
+                context.jarvesDataStore.edit { prefs ->
+                    if (value == null) prefs.remove(PrefKeys.YOUTUBE_COOKIES_ENCRYPTED)
+                    else prefs[PrefKeys.YOUTUBE_COOKIES_ENCRYPTED] = value
+                }
+            },
+            cipher = ApiProvidersModule.credentialCipher()
+        )
+    }
+    LaunchedEffect(Unit) { youTubeAuthHolder.cookies = youTubeCookieStore.load() }
+    val youTubeResolver = remember {
+        NewPipeStreamResolver(
+            OkHttpNewPipeDownloader(authCookiesProvider = { youTubeAuthHolder.cookies })
+        )
+    }
     val youTubeController = remember { YouTubePlayerController(context.applicationContext) }
     val youTubePlayerState by youTubeController.state.collectAsState()
     var youTubeUiState by remember { mutableStateOf<YouTubePlayerUiState>(YouTubePlayerUiState.Hidden) }
@@ -610,6 +633,10 @@ private fun AgiApp() {
                             repository = repository,
                             onBack = { screen = JarvesNavigation.SETTINGS },
                             youTubeKeyStore = youTubeKeyStore,
+                            youTubeCookieStore = youTubeCookieStore,
+                            onYouTubeAuthChanged = { cookies ->
+                                youTubeAuthHolder.cookies = cookies
+                            },
                             onRecordsChanged = { updated ->
                                 providers = updated
                                 providersLoaded = true
