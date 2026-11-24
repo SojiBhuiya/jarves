@@ -120,7 +120,7 @@ internal class GeminiLiveVoice(
      * the key, the resolver and the playback callbacks.
      */
     private val youtubeSearchClient: YouTubeSearchClient? = null,
-    private val youtubeKeyProvider: (() -> String?)? = null,
+    private val youtubeKeyProvider: (suspend () -> String?)? = null,
     private val youtubeResolver: YouTubeStreamResolver? = null,
     private val onYouTubePlay: ((YouTubeVideo, YouTubeStreams) -> Unit)? = null,
     private val onYouTubeControl: ((String) -> Unit)? = null,

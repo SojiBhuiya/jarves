@@ -46,7 +46,7 @@ data class YouTubeSearchResult(
 /** Resolved playback URLs for one video. */
 data class YouTubeStreams(
     val videoId: String,
-    val title: String,
+    val title: String = "",
     val durationSeconds: Long? = null,
     /** Best video stream that carries audio: plays as-is in ExoPlayer. Null when none found. */
     val videoUrl: String? = null,

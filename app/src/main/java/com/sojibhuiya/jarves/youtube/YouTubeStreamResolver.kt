@@ -5,7 +5,7 @@ import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.schabi.newpipe.extractor.NewPipe
-import org.schabi.newpipe.extractor.StreamInfo
+import org.schabi.newpipe.extractor.stream.StreamInfo
 import java.io.IOException
 
 /** Resolves a videoId into direct playback URLs (no YouTube player, no ads). */
