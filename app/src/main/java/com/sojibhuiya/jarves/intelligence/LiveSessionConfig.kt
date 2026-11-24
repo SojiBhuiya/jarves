@@ -205,12 +205,20 @@ object LiveSessionConfig {
             // 0.2.20: video playback. The model must ask when several versions exist — the
             // user picks, the app plays. The rule lives here (not in the declarations) so the
             // choice behaviour is explicit in every function-mode session.
+            // 0.2.21: the phone report showed the model chatting and asking instead of calling
+            // — the user named a song ("জেমসের মিরাবাই") and Jarves asked "which song?" and
+            // "is this the one?" without ever calling search_videos. And after the search DID
+            // run and the popup showed the versions, the user picked the lyrics version and
+            // Jarves asked "is this the one?" AGAIN instead of calling play_video. So the
+            // rule now says AT ONCE twice: search at once, and play at once when they pick.
             appendLine(
-                MARK_VIDEO_RULE + " to play a song, drama, movie or story, call " +
-                    "`$FUNCTION_SEARCH_VIDEOS`. If several versions are listed, ask the user " +
-                    "which one — never play the first result by itself. Then call " +
-                    "`$FUNCTION_PLAY_VIDEO` with the videoId they pick. For pause, resume, " +
-                    "next or previous, call `$FUNCTION_CONTROL_PLAYBACK`."
+                MARK_VIDEO_RULE + " when the user asks to play or hear a song, drama, movie or " +
+                    "story, call `$FUNCTION_SEARCH_VIDEOS` AT ONCE — never ask which one first, " +
+                    "never chat about it first. Only AFTER the results, ask which version — " +
+                    "never play the first result by itself. When they pick one, call " +
+                    "`$FUNCTION_PLAY_VIDEO` AT ONCE with its videoId — never ask 'is this " +
+                    "the one?' again. For pause, resume, next or previous, call " +
+                    "`$FUNCTION_CONTROL_PLAYBACK`."
             )
         } else {
             appendLine(
@@ -273,8 +281,9 @@ object LiveSessionConfig {
     fun searchVideosDeclaration(nonBlocking: Boolean): Map<String, Any?> = linkedMapOf<String, Any?>(
         "name" to FUNCTION_SEARCH_VIDEOS,
         "description" to (
-            "Search YouTube for videos. Use when the user asks to play a song, drama, movie " +
-                "or story. Returns a numbered list of matches with their videoIds — present " +
+            "Search YouTube for videos. Call this IMMEDIATELY when the user asks to play a song, " +
+                "drama, movie or story — do not ask which one first and do not answer in text " +
+                "alone. Returns a numbered list of matches with their videoIds — present " +
                 "the list and ask which one they want; never play the first result by itself."
             ),
         "parameters" to linkedMapOf<String, Any?>(

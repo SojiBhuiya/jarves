@@ -335,8 +335,10 @@ class LiveSessionConfigTest {
         // The duplicate paragraph was ~230 characters of the instruction; the one-rule version must
         // stay below a ceiling so it cannot grow back by accident. 0.2.20 raised the ceiling
         // from 3,000 to 3,300: the VIDEOS rule adds ~280 characters and the instruction is
-        // ~3,220. The guard still catches accidental growth.
-        assertTrue("instruction length ${text.length}", text.length < 3_300)
+        // ~3,220. 0.2.21 raised it from 3,300 to 3,400: the strengthened VIDEOS rule adds
+        // ~120 more characters (search AT ONCE, play AT ONCE when they pick) and the
+        // instruction is ~3,340. The guard still catches accidental growth.
+        assertTrue("instruction length ${text.length}", text.length < 3_400)
     }
 
     @Test
@@ -347,6 +349,8 @@ class LiveSessionConfigTest {
                 assertTrue("$mode must carry the video rule", text.contains(LiveSessionConfig.MARK_VIDEO_RULE))
                 assertTrue("$mode must name search_videos", text.contains(LiveSessionConfig.FUNCTION_SEARCH_VIDEOS))
                 assertTrue("$mode must name play_video", text.contains(LiveSessionConfig.FUNCTION_PLAY_VIDEO))
+                // 0.2.21: the model must search at once, not ask first.
+                assertTrue("$mode must say to search at once", text.contains("AT ONCE"))
             } else {
                 assertFalse("$mode must not name an undeclared video function", text.contains(LiveSessionConfig.FUNCTION_SEARCH_VIDEOS))
             }
