@@ -31,6 +31,7 @@ class YouTubeToolRunnerTest {
     private val controlled = LinkedBlockingQueue<String>()
     private val searched = LinkedBlockingQueue<List<YouTubeVideo>>()
     private val failedPlays = LinkedBlockingQueue<String>()
+    private val playedSources = LinkedBlockingQueue<String>()
 
     private class FakeResolver(var streams: YouTubeStreams? = null) : YouTubeStreamResolver {
         val resolvedIds = mutableListOf<String>()
@@ -58,7 +59,8 @@ class YouTubeToolRunnerTest {
             onPlayVideo = { video, streams -> played.add(video to streams) },
             onControl = { action -> controlled.add(action) },
             onSearchResults = { videos -> searched.add(videos) },
-            onPlayFailure = { cause -> failedPlays.add(cause) }
+            onPlayFailure = { cause -> failedPlays.add(cause) },
+            onPlaySource = { source -> playedSources.add(source) }
         ).also { runner = it }
     }
 
@@ -167,6 +169,20 @@ class YouTubeToolRunnerTest {
         )
         runner(resolver = resolver).handlePlay(YouTubePlayCall("c1", "bad123", "Bad Song"))
         assertEquals("INTERNAL (ExtractionException)", failedPlays.poll(5, TimeUnit.SECONDS))
+    }
+
+    @Test
+    fun successfulPlayReportsItsSource() {
+        // 0.2.24: the diagnostics need to say which client resolved the video, so a
+        // phone test shows whether visionOS recovered or the Android fallback saved it.
+        val streams = YouTubeStreams(
+            videoId = "abc123", title = "Old Song",
+            videoUrl = "https://example.test/v.mp4", audioUrl = "https://example.test/a.m4a",
+            source = "android"
+        )
+        runner(resolver = FakeResolver(streams))
+            .handlePlay(YouTubePlayCall("c1", "abc123", "Old Song"))
+        assertEquals("android", playedSources.poll(5, TimeUnit.SECONDS))
     }
 
     @Test
