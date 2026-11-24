@@ -205,7 +205,8 @@ class YouTubeToolRunner(
             }
             return "Found ${result.videos.size} videos for \"$query\":\n" +
                 lines.joinToString("\n") +
-                "\nAsk the user which one they want. Do not play the first one by itself."
+                "\nAsk the user which one they want. Do not play the first one by itself. " +
+                "When they pick one, call play_video with its videoId at once — do not ask again."
         }
 
         internal fun playFailureText(streams: YouTubeStreams): String = when (streams.failure) {
