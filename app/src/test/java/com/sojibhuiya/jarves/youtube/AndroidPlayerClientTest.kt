@@ -33,7 +33,7 @@ class AndroidPlayerClientTest {
                "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"", "bitrate": 128000}
             ]
           },
-          "videoDetails": {"title": "Test Song", "lengthSeconds": "346"}
+          "videoDetails": {"videoId": "abc123", "title": "Test Song", "lengthSeconds": "346"}
         }
     """.trimIndent()
 
@@ -60,6 +60,31 @@ class AndroidPlayerClientTest {
         val streams = AndroidPlayerClient.parsePlayerResponse("abc123", json)
         assertEquals(YouTubeFailure.INTERNAL, streams.failure)
         assertEquals("SignInConfirmNotBotException", streams.detail)
+        assertEquals("android", streams.source)
+    }
+
+    @Test
+    fun `player response for a different video fails instead of playing the wrong video`() {
+        // 0.2.26: YouTube sometimes substitutes another video's response (NewPipe
+        // documents this for third-party clients) — the phone's signed-in 0.2.25
+        // test hit it on visionOS. The Android client must reject it too.
+        val json = """
+            {
+              "playabilityStatus": {"status": "OK"},
+              "streamingData": {
+                "formats": [
+                  {"itag": 18, "url": "https://example.test/v18.mp4",
+                   "mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"",
+                   "qualityLabel": "360p", "bitrate": 500000}
+                ],
+                "adaptiveFormats": []
+              },
+              "videoDetails": {"videoId": "other999", "title": "Not available", "lengthSeconds": "30"}
+            }
+        """.trimIndent()
+        val streams = AndroidPlayerClient.parsePlayerResponse("abc123", json)
+        assertEquals(YouTubeFailure.INTERNAL, streams.failure)
+        assertEquals("response videoId mismatch", streams.detail)
         assertEquals("android", streams.source)
     }
 
@@ -118,7 +143,7 @@ class AndroidPlayerClientFetchTest {
             ],
             "adaptiveFormats": []
           },
-          "videoDetails": {"title": "Test Song", "lengthSeconds": "346"}
+          "videoDetails": {"videoId": "abc123", "title": "Test Song", "lengthSeconds": "346"}
         }
     """.trimIndent()
 
