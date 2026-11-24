@@ -274,4 +274,67 @@ class OkHttpNewPipeDownloaderTest {
         val recorded = server.takeRequest(5, java.util.concurrent.TimeUnit.SECONDS)
         assertEquals("application/json", recorded?.getHeader("Content-Type"))
     }
+
+    @Test
+    fun `signed-in session attaches cookie and sapisidhash`() {
+        // 0.2.25: a bare Cookie is ignored by InnerTube — the SAPISIDHASH is what makes
+        // the session count, so the downloader must send the whole set.
+        server.enqueue(MockResponse().setBody("{}"))
+        val cookies = "SID=aaa; SAPISID=AbC123xYz; LOGIN_INFO=xyz"
+        val downloader = OkHttpNewPipeDownloader(authCookiesProvider = { cookies })
+        val url = server.url("/youtubei/v1/player").toString()
+        val request = org.schabi.newpipe.extractor.downloader.Request.newBuilder()
+            .post(url, "{}".toByteArray())
+            .setHeader("Content-Type", "application/json")
+            .build()
+        val response = downloader.execute(request)
+        assertEquals(200, response.responseCode())
+        val recorded = server.takeRequest(5, java.util.concurrent.TimeUnit.SECONDS)
+        assertTrue(recorded?.getHeader("Cookie")!!.contains("SAPISID=AbC123xYz"))
+        val auth = recorded.getHeader("Authorization")
+        assertTrue(auth!!.startsWith("SAPISIDHASH "))
+        // The hash must match the function for the timestamp the request actually used.
+        val timestamp = auth.removePrefix("SAPISIDHASH ").substringBefore("_").toLong()
+        assertEquals(
+            YouTubeAuth.sapisidHash("AbC123xYz", timestampSeconds = timestamp),
+            auth
+        )
+        assertEquals("https://www.youtube.com", recorded.getHeader("Origin"))
+    }
+
+    @Test
+    fun `existing cookie header is kept and session cookies appended`() {
+        server.enqueue(MockResponse().setBody("{}"))
+        val cookies = "SID=aaa; SAPISID=AbC123xYz"
+        val downloader = OkHttpNewPipeDownloader(authCookiesProvider = { cookies })
+        val url = server.url("/youtubei/v1/player").toString()
+        val request = org.schabi.newpipe.extractor.downloader.Request.newBuilder()
+            .post(url, "{}".toByteArray())
+            .setHeader("Content-Type", "application/json")
+            .setHeader("Cookie", "SOCS=CAE=")
+            .build()
+        val response = downloader.execute(request)
+        assertEquals(200, response.responseCode())
+        val recorded = server.takeRequest(5, java.util.concurrent.TimeUnit.SECONDS)
+        assertEquals(
+            "SOCS=CAE=; SID=aaa; SAPISID=AbC123xYz",
+            recorded?.getHeader("Cookie")
+        )
+    }
+
+    @Test
+    fun `no session sends no auth headers`() {
+        server.enqueue(MockResponse().setBody("{}"))
+        val downloader = OkHttpNewPipeDownloader()
+        val url = server.url("/youtubei/v1/player").toString()
+        val request = org.schabi.newpipe.extractor.downloader.Request.newBuilder()
+            .post(url, "{}".toByteArray())
+            .setHeader("Content-Type", "application/json")
+            .build()
+        val response = downloader.execute(request)
+        assertEquals(200, response.responseCode())
+        val recorded = server.takeRequest(5, java.util.concurrent.TimeUnit.SECONDS)
+        assertNull(recorded?.getHeader("Cookie"))
+        assertNull(recorded?.getHeader("Authorization"))
+    }
 }
