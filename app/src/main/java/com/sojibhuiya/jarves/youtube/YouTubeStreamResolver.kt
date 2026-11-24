@@ -37,12 +37,21 @@ internal fun pickPlaybackStreams(
  *
  * The extractor is synchronous and blocking, so every call runs on Dispatchers.IO inside
  * a timeout. `NewPipe.init` runs once per process.
+ *
+ * 0.2.24: when YouTube bot-checks the visionOS client ("Sign in to confirm you're not
+ * a bot" — what the phone hit on mobile data in 0.2.23), the visionOS attempt is
+ * retried once after a short pause (the block is often transient), and then the
+ * [AndroidPlayerClient] is tried: its requests look like the official YouTube app's.
  */
-class NewPipeStreamResolver(
+open class NewPipeStreamResolver(
     private val downloader: OkHttpNewPipeDownloader,
     // 0.2.22: raised from 30 s to match the runner's cap (see YouTubeToolRunner) — the
     // phone's connection is slow even on Wi-Fi, and the YouTube page is large.
-    private val timeoutMillis: Long = 60_000L
+    private val timeoutMillis: Long = 60_000L,
+    /** Injectable for tests: the Android fallback (a fake can stand in for the network). */
+    private val androidClient: AndroidPlayerClient? = null,
+    /** Injectable for tests, so the retry pause costs nothing there. */
+    private val retryDelayMillis: Long = 3_000L
 ) : YouTubeStreamResolver {
 
     override suspend fun resolve(videoId: String): YouTubeStreams {
@@ -61,6 +70,27 @@ class NewPipeStreamResolver(
     }
 
     private fun fetch(videoId: String): YouTubeStreams {
+        val first = tryVisionOs(videoId)
+        if (first.failure == null) return first
+        if (first.detail != BOT_CHECK) return first
+        try {
+            Thread.sleep(retryDelayMillis)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return first
+        }
+        val retried = tryVisionOs(videoId)
+        if (retried.failure == null) return retried.copy(source = "visionOS-retry")
+        val android = androidFallback(videoId)
+        if (android.failure == null) return android
+        return first
+    }
+
+    private fun androidFallback(videoId: String): YouTubeStreams =
+        (androidClient ?: AndroidPlayerClient(downloader)).fetch(videoId)
+
+    /** One visionOS attempt (the extractor's `StreamInfo` path). Overridden in tests. */
+    protected open fun tryVisionOs(videoId: String): YouTubeStreams {
         ensureInit()
         return try {
             val info = StreamInfo.getInfo(
@@ -127,6 +157,9 @@ class NewPipeStreamResolver(
     private companion object {
         private val initLock = Any()
         private var initialized = false
+        /** The extractor's detail when YouTube answers the player request with the
+         * "confirm you're not a bot" challenge (see `SignInConfirmNotBotException`). */
+        private const val BOT_CHECK = "SignInConfirmNotBotException"
     }
 }
 

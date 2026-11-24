@@ -50,7 +50,9 @@ class YouTubeToolRunner(
     /** A search succeeded: the video list, so the UI can show tappable version cards. */
     private val onSearchResults: (List<YouTubeVideo>) -> Unit = {},
     /** A play failed: the short technical cause, e.g. "INTERNAL (ExtractionException)". */
-    private val onPlayFailure: (String) -> Unit = {}
+    private val onPlayFailure: (String) -> Unit = {},
+    /** A play succeeded: which client resolved it ("visionOS", "visionOS-retry", "android"). */
+    private val onPlaySource: (String) -> Unit = {}
 ) {
 
     private val lock = Any()
@@ -101,6 +103,7 @@ class YouTubeToolRunner(
             title = call.title.ifBlank { streams.title },
             channelTitle = ""
         )
+        runCatching { onPlaySource(streams.source) }
         runCatching { onPlayVideo(video, streams) }
         deliver(call.callId, LiveSessionConfig.FUNCTION_PLAY_VIDEO, "Playing ${video.title}.")
     }

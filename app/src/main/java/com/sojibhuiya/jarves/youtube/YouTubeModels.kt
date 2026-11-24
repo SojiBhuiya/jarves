@@ -55,7 +55,9 @@ data class YouTubeStreams(
     /** Every muxed (audio included) video option, best first — used for quality stepping. */
     val videoOptions: List<StreamCandidate> = emptyList(),
     val failure: YouTubeFailure? = null,
-    val detail: String = ""
+    val detail: String = "",
+    /** 0.2.24: which client resolved these streams ("visionOS", "visionOS-retry", "android"). */
+    val source: String = "visionOS"
 )
 
 /**

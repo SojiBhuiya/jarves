@@ -266,6 +266,9 @@ internal class GeminiLiveVoice(
     /** 0.2.23: the last video play failure, e.g. "INTERNAL (ExtractionException)". The
      * model paraphrases the spoken reason away, so the exact cause lives here instead. */
     @Volatile private var lastVideoFailure = "none"
+    /** 0.2.24: which client resolved the last played video ("visionOS", "visionOS-retry",
+     * "android") — so a phone test says which path worked, not just that it played. */
+    @Volatile private var lastVideoSource = "none"
     @Volatile private var lastToolQuery = "none"
     @Volatile private var lastSearchOutcome = "none"
     /** Which search model produced (or last tried for) the most recent search. */
@@ -1140,7 +1143,7 @@ internal class GeminiLiveVoice(
             "Echo: $closeEchoed | Search: ${if (groundingAvailable) "on" else "off"} " +
             "(tool=$searchToolMode, legacyFallback=$groundingFallbackUsed) | " +
             "Setup tools: $setupDeclaredTool | toolCalls: $toolCallCount | " +
-            "Last video failure: $lastVideoFailure | " +
+            "Last video failure: $lastVideoFailure | Last video source: $lastVideoSource | " +
             "Skipped frames: ${failureRouter.skippedFrames} (last: $lastSkippedFrame) | " +
             failureRouter.describe() + " | " +
             "Send failures: $sendFailureCount (last: $lastSendFailureEvidence) | " +
@@ -1375,7 +1378,8 @@ internal class GeminiLiveVoice(
             onPlayVideo = { video, streams -> onYouTubePlay?.invoke(video, streams) },
             onControl = { action -> onYouTubeControl?.invoke(action) },
             onSearchResults = { videos -> onYouTubeSearchResults?.invoke(videos) },
-            onPlayFailure = { cause -> lastVideoFailure = cause }
+            onPlayFailure = { cause -> lastVideoFailure = cause },
+            onPlaySource = { source -> lastVideoSource = source }
         )
     }
 
