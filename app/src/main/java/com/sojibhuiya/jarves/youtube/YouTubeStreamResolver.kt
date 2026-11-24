@@ -40,7 +40,9 @@ internal fun pickPlaybackStreams(
  */
 class NewPipeStreamResolver(
     private val downloader: OkHttpNewPipeDownloader,
-    private val timeoutMillis: Long = 30_000L
+    // 0.2.22: raised from 30 s to match the runner's cap (see YouTubeToolRunner) — the
+    // phone's connection is slow even on Wi-Fi, and the YouTube page is large.
+    private val timeoutMillis: Long = 60_000L
 ) : YouTubeStreamResolver {
 
     override suspend fun resolve(videoId: String): YouTubeStreams {

@@ -35,7 +35,10 @@ class YouTubeToolRunner(
     private val resolver: YouTubeStreamResolver,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     private val maxConcurrent: Int = 2,
-    private val timeoutMillis: Long = 30_000L,
+    // 0.2.22: raised from 30 s — the phone's connection is slow even on Wi-Fi (the voice
+    // socket took ~5 s to open), and resolving a video fetches a large YouTube page. The
+    // resolver has the same cap; both must move together or the shorter one wins.
+    private val timeoutMillis: Long = 60_000L,
     /** Delivered on a background thread: (callId, functionName, resultText, scheduling). */
     private val onResult: (String, String, String, String) -> Unit,
     /** Short, secret-free status lines for the UI. */
@@ -209,11 +212,16 @@ class YouTubeToolRunner(
                 "When they pick one, call play_video with its videoId at once — do not ask again."
         }
 
+        // 0.2.22: the failure text now names the cause. On the phone every load failure
+        // sounded the same ("লোড করতে ব্যর্থ হয়েছে") and the Wi-Fi test ruled the network
+        // out, so without the cause the next fix would be a guess. The model speaks this
+        // text, so the reason reaches the user in his own language. The EMPTY wording is
+        // kept verbatim: a test asserts the result contains "no playable streams".
         internal fun playFailureText(streams: YouTubeStreams): String = when (streams.failure) {
-            YouTubeFailure.NETWORK -> "The video could not be loaded: no connection."
+            YouTubeFailure.NETWORK -> "The video could not be loaded: no connection (${streams.detail})."
             YouTubeFailure.EMPTY -> "That video has no playable streams."
             YouTubeFailure.HTTP -> "The video could not be loaded (HTTP ${streams.detail})."
-            YouTubeFailure.INTERNAL -> "The video failed to load inside the app."
+            YouTubeFailure.INTERNAL -> "The video failed to load inside the app (${streams.detail})."
             else -> "The video could not be played."
         }
     }

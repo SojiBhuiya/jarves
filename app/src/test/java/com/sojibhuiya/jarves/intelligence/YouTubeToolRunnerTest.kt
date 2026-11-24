@@ -145,6 +145,18 @@ class YouTubeToolRunnerTest {
     }
 
     @Test
+    fun playWithInternalFailureNamesTheCause() {
+        // 0.2.22: the spoken failure must name the cause, or the next fix is a guess.
+        val resolver = FakeResolver(
+            YouTubeStreams(videoId = "bad123", failure = YouTubeFailure.INTERNAL, detail = "ExtractionException")
+        )
+        runner(resolver = resolver).handlePlay(YouTubePlayCall("c1", "bad123", "Bad Song"))
+        val (_, _, result) = awaitResult()
+        assertTrue(result.contains("ExtractionException"))
+        assertNull(played.poll(200, TimeUnit.MILLISECONDS))
+    }
+
+    @Test
     fun controlAcceptsKnownActionsAndRefusesUnknownOnes() {
         val r = runner()
         r.handleControl(YouTubeControlCall("c1", "pause"))
