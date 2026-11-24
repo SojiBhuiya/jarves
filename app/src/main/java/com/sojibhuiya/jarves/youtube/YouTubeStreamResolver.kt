@@ -67,15 +67,15 @@ class NewPipeStreamResolver(
             )
             val videos = info.videoStreams.map {
                 StreamCandidate(
-                    url = it.url,
+                    url = it.url.orEmpty(),
                     height = parseHeight(it.resolution),
-                    bitrate = it.averageBitrate,
+                    bitrate = it.bitrate,
                     hasAudio = !it.isVideoOnly
                 )
             }
             val audios = info.audioStreams.map {
                 StreamCandidate(
-                    url = it.url,
+                    url = it.url.orEmpty(),
                     height = 0,
                     bitrate = it.averageBitrate,
                     hasAudio = true
@@ -93,7 +93,7 @@ class NewPipeStreamResolver(
             YouTubeStreams(
                 videoId = videoId,
                 title = info.name.orEmpty(),
-                durationSeconds = if (info.length > 0) info.length else null,
+                durationSeconds = if (info.duration > 0) info.duration else null,
                 videoUrl = videoUrl,
                 audioUrl = audioUrl,
                 videoOptions = videos.filter { it.hasAudio }.sortedByDescending { it.height }
