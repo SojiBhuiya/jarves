@@ -96,6 +96,16 @@ import com.sojibhuiya.jarves.intelligence.VoiceSearchMode
 import com.sojibhuiya.jarves.chat.Conversation
 import com.sojibhuiya.jarves.storage.ApiProvidersModule
 import com.sojibhuiya.jarves.storage.ConversationModule
+import com.sojibhuiya.jarves.youtube.NewPipeStreamResolver
+import com.sojibhuiya.jarves.youtube.OkHttpNewPipeDownloader
+import com.sojibhuiya.jarves.youtube.YouTubeApiKeyStore
+import com.sojibhuiya.jarves.youtube.YouTubePlayerController
+import com.sojibhuiya.jarves.youtube.YouTubePlayerHolder
+import com.sojibhuiya.jarves.youtube.YouTubePlayerOverlay
+import com.sojibhuiya.jarves.youtube.YouTubePlayerUiState
+import com.sojibhuiya.jarves.youtube.YouTubeSearchClient
+import com.sojibhuiya.jarves.youtube.YouTubeVideo
+import kotlinx.coroutines.flow.first
 import com.sojibhuiya.jarves.ui.chats.ChatsScreen
 import com.sojibhuiya.jarves.storage.AndroidMicSensitivityStore
 import com.sojibhuiya.jarves.storage.AndroidLivePingStore
@@ -202,6 +212,50 @@ private fun AgiApp() {
     var engine by remember { mutableStateOf<GeminiLiveVoice?>(null) }
     var providers by remember { mutableStateOf<List<ApiProviderRecord>>(emptyList()) }
     var providersLoaded by remember { mutableStateOf(false) }
+
+    // ---- 0.2.20: YouTube player. Created once; the voice session reads them through the
+    // callbacks below, and the popup player drives the controller directly.
+    val youTubeSearchClient = remember { YouTubeSearchClient() }
+    val youTubeKeyStore = remember {
+        YouTubeApiKeyStore(
+            readEncrypted = { context.jarvesDataStore.data.first()[PrefKeys.YOUTUBE_API_KEY_ENCRYPTED] },
+            writeEncrypted = { value ->
+                context.jarvesDataStore.edit { prefs ->
+                    if (value == null) prefs.remove(PrefKeys.YOUTUBE_API_KEY_ENCRYPTED)
+                    else prefs[PrefKeys.YOUTUBE_API_KEY_ENCRYPTED] = value
+                }
+            },
+            cipher = ApiProvidersModule.credentialCipher()
+        )
+    }
+    val youTubeResolver = remember { NewPipeStreamResolver(OkHttpNewPipeDownloader()) }
+    val youTubeController = remember { YouTubePlayerController(context.applicationContext) }
+    val youTubePlayerState by youTubeController.state.collectAsState()
+    var youTubeUiState by remember { mutableStateOf<YouTubePlayerUiState>(YouTubePlayerUiState.Hidden) }
+    var videoQueue by remember { mutableStateOf<List<YouTubeVideo>>(emptyList()) }
+    var queueIndex by remember { mutableStateOf(-1) }
+
+    /** Plays a video picked from a card or from the queue (next / previous). */
+    fun playYouTubeVideo(video: YouTubeVideo) {
+        scope.launch {
+            val streams = runCatching { youTubeResolver.resolve(video.videoId) }.getOrNull()
+            if (streams == null || streams.failure != null ||
+                (streams.videoUrl == null && streams.audioUrl == null)
+            ) {
+                status = "ভিডিও চালানো যায়নি"
+                return@launch
+            }
+            queueIndex = videoQueue.indexOfFirst { it.videoId == video.videoId }
+            youTubeController.play(video, streams)
+            youTubeUiState = YouTubePlayerUiState.Playing
+        }
+    }
+
+    fun playQueueIndex(index: Int) {
+        val videos = videoQueue
+        if (videos.isEmpty()) return
+        playYouTubeVideo(videos[(index + videos.size) % videos.size])
+    }
 
     // ---- Chats: conversations live in their own store; only ids are held in the UI layer.
     val conversationRepository = remember { ConversationModule.repository(context) }
@@ -406,6 +460,40 @@ private fun AgiApp() {
                 } else {
                     null
                 },
+                // 0.2.20: YouTube player — the session searches and plays through these; the
+                // callbacks below run on the runner's background scope, so they hand UI work
+                // back to the main scope.
+                youtubeSearchClient = youTubeSearchClient,
+                youtubeKeyProvider = { youTubeKeyStore.load() },
+                youtubeResolver = youTubeResolver,
+                onYouTubePlay = { video, streams ->
+                    scope.launch {
+                        queueIndex = videoQueue.indexOfFirst { it.videoId == video.videoId }
+                        youTubeController.play(video, streams)
+                        youTubeUiState = YouTubePlayerUiState.Playing
+                    }
+                },
+                onYouTubeControl = { action ->
+                    scope.launch {
+                        when (action) {
+                            "pause" -> youTubeController.pause()
+                            "resume" -> youTubeController.resume()
+                            "stop" -> {
+                                youTubeController.stop()
+                                youTubeUiState = YouTubePlayerUiState.Hidden
+                            }
+                            "next" -> if (queueIndex >= 0) playQueueIndex(queueIndex + 1)
+                            "previous" -> if (queueIndex >= 0) playQueueIndex(queueIndex - 1)
+                        }
+                    }
+                },
+                onYouTubeSearchResults = { videos ->
+                    scope.launch {
+                        videoQueue = videos
+                        queueIndex = -1
+                        youTubeUiState = YouTubePlayerUiState.Choose(videos)
+                    }
+                },
                 mode = voiceMode,
                 micSensitivity = micSensitivity,
                 environmentProvider = environmentReader,
@@ -521,6 +609,7 @@ private fun AgiApp() {
                         screen == JarvesNavigation.API_PROVIDERS -> ApiProvidersScreen(
                             repository = repository,
                             onBack = { screen = JarvesNavigation.SETTINGS },
+                            youTubeKeyStore = youTubeKeyStore,
                             onRecordsChanged = { updated ->
                                 providers = updated
                                 providersLoaded = true
@@ -654,6 +743,23 @@ private fun AgiApp() {
                             }
                         )
                     }
+                    // ---- 0.2.20: the YouTube player floats above every screen.
+                    YouTubePlayerOverlay(
+                        uiState = youTubeUiState,
+                        playerState = youTubePlayerState,
+                        player = YouTubePlayerHolder.player(context.applicationContext),
+                        onPick = { video -> playYouTubeVideo(video) },
+                        onClose = {
+                            youTubeController.stop()
+                            youTubeUiState = YouTubePlayerUiState.Hidden
+                        },
+                        onPause = { youTubeController.pause() },
+                        onResume = { youTubeController.resume() },
+                        onSeek = { youTubeController.seekTo(it) },
+                        onToggleAudioOnly = { youTubeController.toggleAudioOnly() },
+                        onNext = { if (queueIndex >= 0) playQueueIndex(queueIndex + 1) },
+                        onPrevious = { if (queueIndex >= 0) playQueueIndex(queueIndex - 1) }
+                    )
                 }
             }
         }

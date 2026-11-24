@@ -95,7 +95,8 @@ class NewPipeStreamResolver(
                 title = info.name.orEmpty(),
                 durationSeconds = if (info.length > 0) info.length else null,
                 videoUrl = videoUrl,
-                audioUrl = audioUrl
+                audioUrl = audioUrl,
+                videoOptions = videos.filter { it.hasAudio }.sortedByDescending { it.height }
             )
         } catch (e: IOException) {
             YouTubeStreams(

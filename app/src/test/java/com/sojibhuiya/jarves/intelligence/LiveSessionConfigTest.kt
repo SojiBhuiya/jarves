@@ -34,20 +34,30 @@ class LiveSessionConfigTest {
     )
 
     @Test
-    fun declaresExactlyOneSearchFunctionAndNeverGoogleSearch() {
+    fun declaresSearchFunctionAndVideoFunctionsAndNeverGoogleSearch() {
         val setup = setup(true)["setup"] as Map<*, *>
         val tools = setup["tools"] as List<*>
         assertEquals("exactly one tool entry", 1, tools.size)
         val tool = tools.single() as Map<*, *>
 
-        // Design 4: the only tool is a function the app answers itself.
+        // Design 4: the only tool is functions the app answers itself.
         assertEquals(setOf("functionDeclarations"), tool.keys)
         assertFalse("the built-in Live search tool must never be declared", tool.containsKey("googleSearch"))
         assertNull(tool["googleSearch"])
         assertNull(tool["functionCalling"])
 
-        val declaration = (tool["functionDeclarations"] as List<*>).single() as Map<*, *>
-        assertEquals(LiveSessionConfig.FUNCTION_SEARCH_WEB, declaration["name"])
+        // 0.2.20: search_web plus the three video functions, in one declarations list.
+        val declarations = (tool["functionDeclarations"] as List<*>).map { it as Map<*, *> }
+        assertEquals(
+            listOf(
+                LiveSessionConfig.FUNCTION_SEARCH_WEB,
+                LiveSessionConfig.FUNCTION_SEARCH_VIDEOS,
+                LiveSessionConfig.FUNCTION_PLAY_VIDEO,
+                LiveSessionConfig.FUNCTION_CONTROL_PLAYBACK
+            ),
+            declarations.map { it["name"] }
+        )
+        val declaration = declarations.single { it["name"] == LiveSessionConfig.FUNCTION_SEARCH_WEB }
         assertEquals("search_web", declaration["name"])
         assertEquals("NON_BLOCKING", declaration["behavior"])
 
@@ -58,6 +68,23 @@ class LiveSessionConfigTest {
         val query = (parameters["properties"] as Map<*, *>)["query"] as Map<*, *>
         assertEquals("STRING", query["type"])
         assertTrue((query["description"] as String).isNotBlank())
+
+        // The video functions carry the arguments the runner parses.
+        val searchVideos = declarations.single { it["name"] == LiveSessionConfig.FUNCTION_SEARCH_VIDEOS }
+        assertEquals(
+            listOf("query"),
+            ((searchVideos["parameters"] as Map<*, *>)["required"] as List<*>)
+        )
+        val playVideo = declarations.single { it["name"] == LiveSessionConfig.FUNCTION_PLAY_VIDEO }
+        assertEquals(
+            listOf("videoId"),
+            ((playVideo["parameters"] as Map<*, *>)["required"] as List<*>)
+        )
+        val control = declarations.single { it["name"] == LiveSessionConfig.FUNCTION_CONTROL_PLAYBACK }
+        assertEquals(
+            listOf("action"),
+            ((control["parameters"] as Map<*, *>)["required"] as List<*>)
+        )
     }
 
     @Test
@@ -65,10 +92,14 @@ class LiveSessionConfigTest {
         val blocking = setup(LiveSearchTool.FUNCTION_BLOCKING)["setup"] as Map<*, *>
         val tool = (blocking["tools"] as List<*>).single() as Map<*, *>
         assertFalse(tool.containsKey("googleSearch"))
-        val declaration = (tool["functionDeclarations"] as List<*>).single() as Map<*, *>
-        assertEquals("search_web", declaration["name"])
+        val declarations = (tool["functionDeclarations"] as List<*>).map { it as Map<*, *> }
+        assertEquals(4, declarations.size)
+        val declaration = declarations.single { it["name"] == "search_web" }
         // No `behavior` key at all: the server then applies its blocking default.
         assertFalse("a blocking declaration must not carry behavior", declaration.containsKey("behavior"))
+        declarations.forEach {
+            assertFalse("no blocking declaration carries behavior", it.containsKey("behavior"))
+        }
         // Same schema, so a retry changes nothing the model depends on.
         assertEquals(
             LiveSessionConfig.searchFunctionDeclaration(nonBlocking = true)["parameters"],
@@ -302,8 +333,24 @@ class LiveSessionConfigTest {
             "Jarves", snapshot, LiveSearchTool.FUNCTION_NON_BLOCKING
         )
         // The duplicate paragraph was ~230 characters of the instruction; the one-rule version must
-        // stay below a ceiling so it cannot grow back by accident.
-        assertTrue("instruction length ${text.length}", text.length < 3_000)
+        // stay below a ceiling so it cannot grow back by accident. 0.2.20 raised the ceiling
+        // from 3,000 to 3,300: the VIDEOS rule adds ~280 characters and the instruction is
+        // ~3,220. The guard still catches accidental growth.
+        assertTrue("instruction length ${text.length}", text.length < 3_300)
+    }
+
+    @Test
+    fun videoRulePresentOnlyInFunctionModes() {
+        LiveSearchTool.entries.forEach { mode ->
+            val text = LiveSessionConfig.systemInstruction("Jarves", snapshot, mode)
+            if (mode.declaresFunction) {
+                assertTrue("$mode must carry the video rule", text.contains(LiveSessionConfig.MARK_VIDEO_RULE))
+                assertTrue("$mode must name search_videos", text.contains(LiveSessionConfig.FUNCTION_SEARCH_VIDEOS))
+                assertTrue("$mode must name play_video", text.contains(LiveSessionConfig.FUNCTION_PLAY_VIDEO))
+            } else {
+                assertFalse("$mode must not name an undeclared video function", text.contains(LiveSessionConfig.FUNCTION_SEARCH_VIDEOS))
+            }
+        }
     }
 
     private fun countOf(haystack: String, needle: String): Int {

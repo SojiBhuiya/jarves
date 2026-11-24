@@ -52,6 +52,8 @@ data class YouTubeStreams(
     val videoUrl: String? = null,
     /** Best audio-only stream: used for lock-screen / audio-only playback. */
     val audioUrl: String? = null,
+    /** Every muxed (audio included) video option, best first — used for quality stepping. */
+    val videoOptions: List<StreamCandidate> = emptyList(),
     val failure: YouTubeFailure? = null,
     val detail: String = ""
 )

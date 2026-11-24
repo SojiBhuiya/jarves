@@ -47,8 +47,9 @@ enum class LiveSearchTool {
 /**
  * Builds the Gemini Live session payload and its instruction text.
  *
- * **Tool architecture (Design 4).** The session declares exactly one tool: a function
- * `search_web`. Retrieval happens in [GroundedSearchClient] over REST with
+ * **Tool architecture (Design 4).** The session declares functions the app answers itself:
+ * `search_web` for live facts, and (0.2.20) `search_videos`, `play_video` and
+ * `control_playback` for the YouTube player. Retrieval happens in [GroundedSearchClient] over REST with
  * `tools:[{"google_search":{}}]` on `gemini-2.5-flash`, and the result is handed back to the live
  * session as a `toolResponse`. Consequences:
  *  * the Live setup never contains `googleSearch`, so the quota refusal that kills the whole
@@ -60,6 +61,14 @@ object LiveSessionConfig {
 
     /** Name used in the function declaration and in every `toolResponse`. */
     const val FUNCTION_SEARCH_WEB = "search_web"
+
+    /** Video tools the app answers itself (Design 4, same as `search_web`). */
+    const val FUNCTION_SEARCH_VIDEOS = "search_videos"
+    const val FUNCTION_PLAY_VIDEO = "play_video"
+    const val FUNCTION_CONTROL_PLAYBACK = "control_playback"
+
+    /** Marker the tests use to prove the video rule is present in function modes. */
+    const val MARK_VIDEO_RULE = "VIDEOS:"
 
     /** Kept for the legacy-compatibility test only: this string must never appear in a setup frame. */
     const val TOOL_GOOGLE_SEARCH = "googleSearch"
@@ -193,6 +202,16 @@ object LiveSessionConfig {
                     "never blame a vague \"technical problem\" — if the search fails, say exactly " +
                     "what failed."
             )
+            // 0.2.20: video playback. The model must ask when several versions exist — the
+            // user picks, the app plays. The rule lives here (not in the declarations) so the
+            // choice behaviour is explicit in every function-mode session.
+            appendLine(
+                MARK_VIDEO_RULE + " to play a song, drama, movie or story, call " +
+                    "`$FUNCTION_SEARCH_VIDEOS`. If several versions are listed, ask the user " +
+                    "which one — never play the first result by itself. Then call " +
+                    "`$FUNCTION_PLAY_VIDEO` with the videoId they pick. For pause, resume, " +
+                    "next or previous, call `$FUNCTION_CONTROL_PLAYBACK`."
+            )
         } else {
             appendLine(
                 "Web search is NOT available in this session. For any question about current affairs, " +
@@ -250,6 +269,78 @@ object LiveSessionConfig {
         if (nonBlocking) declaration["behavior"] = BEHAVIOR_NON_BLOCKING
     }
 
+    /** One `search_videos` declaration: find videos for a song, drama, movie or story. */
+    fun searchVideosDeclaration(nonBlocking: Boolean): Map<String, Any?> = linkedMapOf<String, Any?>(
+        "name" to FUNCTION_SEARCH_VIDEOS,
+        "description" to (
+            "Search YouTube for videos. Use when the user asks to play a song, drama, movie " +
+                "or story. Returns a numbered list of matches with their videoIds — present " +
+                "the list and ask which one they want; never play the first result by itself."
+            ),
+        "parameters" to linkedMapOf<String, Any?>(
+            "type" to "OBJECT",
+            "properties" to linkedMapOf<String, Any?>(
+                "query" to linkedMapOf<String, Any?>(
+                    "type" to "STRING",
+                    "description" to "What to play, in the user's own words (song, drama, movie or story)."
+                )
+            ),
+            "required" to listOf("query")
+        )
+    ).also { declaration ->
+        if (nonBlocking) declaration["behavior"] = BEHAVIOR_NON_BLOCKING
+    }
+
+    /** One `play_video` declaration: start playing a video the user picked. */
+    fun playVideoDeclaration(nonBlocking: Boolean): Map<String, Any?> = linkedMapOf<String, Any?>(
+        "name" to FUNCTION_PLAY_VIDEO,
+        "description" to (
+            "Play a video the user picked from a `search_videos` result. " +
+                "The video plays in the app's own player, without ads."
+            ),
+        "parameters" to linkedMapOf<String, Any?>(
+            "type" to "OBJECT",
+            "properties" to linkedMapOf<String, Any?>(
+                "videoId" to linkedMapOf<String, Any?>(
+                    "type" to "STRING",
+                    "description" to "The videoId from the `search_videos` result."
+                ),
+                "title" to linkedMapOf<String, Any?>(
+                    "type" to "STRING",
+                    "description" to "The video title, for the confirmation."
+                )
+            ),
+            "required" to listOf("videoId")
+        )
+    ).also { declaration ->
+        if (nonBlocking) declaration["behavior"] = BEHAVIOR_NON_BLOCKING
+    }
+
+    /** One `control_playback` declaration: pause, resume, next, previous or stop. */
+    fun controlPlaybackDeclaration(nonBlocking: Boolean): Map<String, Any?> = linkedMapOf<String, Any?>(
+        "name" to FUNCTION_CONTROL_PLAYBACK,
+        "description" to "Control the video that is playing now.",
+        "parameters" to linkedMapOf<String, Any?>(
+            "type" to "OBJECT",
+            "properties" to linkedMapOf<String, Any?>(
+                "action" to linkedMapOf<String, Any?>(
+                    "type" to "STRING",
+                    "description" to "One of: pause, resume, next, previous, stop."
+                )
+            ),
+            "required" to listOf("action")
+        )
+    ).also { declaration ->
+        if (nonBlocking) declaration["behavior"] = BEHAVIOR_NON_BLOCKING
+    }
+
+    /** The three video declarations, in the order the model should learn them. */
+    fun youtubeDeclarations(nonBlocking: Boolean): List<Map<String, Any?>> = listOf(
+        searchVideosDeclaration(nonBlocking),
+        playVideoDeclaration(nonBlocking),
+        controlPlaybackDeclaration(nonBlocking)
+    )
+
     /** The `tools` array for a given mode; empty for [LiveSearchTool.NONE]. */
     fun toolsJson(searchTool: LiveSearchTool): List<Map<String, Any?>> = when (searchTool) {
         LiveSearchTool.NONE -> emptyList()
@@ -260,12 +351,15 @@ object LiveSessionConfig {
         )
         LiveSearchTool.FUNCTION_NON_BLOCKING -> listOf(
             linkedMapOf<String, Any?>(
-                "functionDeclarations" to listOf(searchFunctionDeclaration(nonBlocking = true))
+                // 0.2.20: one tool entry, four declarations — search_web plus the video tools.
+                "functionDeclarations" to listOf(searchFunctionDeclaration(nonBlocking = true)) +
+                    youtubeDeclarations(nonBlocking = true)
             )
         )
         LiveSearchTool.FUNCTION_BLOCKING -> listOf(
             linkedMapOf<String, Any?>(
-                "functionDeclarations" to listOf(searchFunctionDeclaration(nonBlocking = false))
+                "functionDeclarations" to listOf(searchFunctionDeclaration(nonBlocking = false)) +
+                    youtubeDeclarations(nonBlocking = false)
             )
         )
     }
