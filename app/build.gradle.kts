@@ -83,9 +83,9 @@ dependencies {
     // 0.2.20: YouTube player — ad-free playback through our own player (ExoPlayer).
     implementation("androidx.compose.material:material-icons-extended")
     implementation("io.coil-kt:coil-compose:2.7.0")
-    implementation("androidx.media3:media3-exoplayer:1.11.1")
-    implementation("androidx.media3:media3-session:1.11.1")
-    implementation("androidx.media3:media3-ui-compose:1.11.1")
+    implementation("androidx.media3:media3-exoplayer:1.9.0")
+    implementation("androidx.media3:media3-session:1.9.0")
+    implementation("androidx.media3:media3-ui-compose:1.9.0")
     // NewPipe Extractor via JitPack (see settings.gradle.kts). GPL-3.0; personal use only.
     implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.27.1")
     // Design 4 uses runInterruptible() and withTimeoutOrNull() directly, so the coroutines
