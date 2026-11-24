@@ -98,24 +98,78 @@ class YouTubeStreamResolverTest {
     }
 
     @Test
-    fun `non-bot failure does not retry`() = runBlocking {
+    fun `non-bot failure tries the android fallback`() = runBlocking {
+        // 0.2.26: the old rule (only a bot-check ever reached Android) hid the fix —
+        // the phone's signed-in 0.2.25 test failed visionOS with a plain
+        // ExtractionException and Android was never tried.
         val android = FakeAndroid(okStreams(source = "android"))
         val resolver = ScriptedResolver(
             ArrayDeque(
                 listOf(
                     YouTubeStreams(
                         videoId = "abc123",
-                        failure = YouTubeFailure.NETWORK,
-                        detail = "IOException"
+                        failure = YouTubeFailure.INTERNAL,
+                        detail = "ExtractionException"
                     )
                 )
             ),
             androidClient = android
         )
         val streams = resolver.resolve("abc123")
-        assertEquals(YouTubeFailure.NETWORK, streams.failure)
+        assertNull(streams.failure)
+        assertEquals("https://example.test/v.mp4", streams.videoUrl)
+        assertEquals("android", streams.source)
         assertEquals(1, resolver.calls)
-        assertEquals(0, android.calls)
+        assertEquals(1, android.calls)
+    }
+
+    @Test
+    fun `non-bot failure and android fails returns combined failure`() = runBlocking {
+        val android = FakeAndroid(botFailure())
+        val resolver = ScriptedResolver(
+            ArrayDeque(
+                listOf(
+                    YouTubeStreams(
+                        videoId = "abc123",
+                        failure = YouTubeFailure.INTERNAL,
+                        detail = "ExtractionException"
+                    )
+                )
+            ),
+            androidClient = android
+        )
+        val streams = resolver.resolve("abc123")
+        assertEquals(YouTubeFailure.INTERNAL, streams.failure)
+        assertEquals(
+            "ExtractionException; android INTERNAL (SignInConfirmNotBotException)",
+            streams.detail
+        )
+        assertEquals(1, resolver.calls)
+        assertEquals(1, android.calls)
+    }
+
+    @Test
+    fun `failure detail includes the exception message`() {
+        assertEquals(
+            "ExtractionException: could not parse player response",
+            describeFailure(
+                org.schabi.newpipe.extractor.exceptions.ExtractionException(
+                    "could not parse player response"
+                )
+            )
+        )
+        assertEquals(
+            "IllegalStateException",
+            describeFailure(IllegalStateException())
+        )
+        assertEquals(
+            "IllegalStateException: first line second line",
+            describeFailure(IllegalStateException("first line\nsecond line"))
+        )
+        assertEquals(
+            "RuntimeException: " + "x".repeat(200),
+            describeFailure(RuntimeException("x".repeat(500)))
+        )
     }
 
     @Test

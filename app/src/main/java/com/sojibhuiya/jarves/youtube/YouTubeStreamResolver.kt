@@ -42,6 +42,9 @@ internal fun pickPlaybackStreams(
  * a bot" — what the phone hit on mobile data in 0.2.23), the visionOS attempt is
  * retried once after a short pause (the block is often transient), and then the
  * [AndroidPlayerClient] is tried: its requests look like the official YouTube app's.
+ * 0.2.26: the Android attempt now runs on ANY visionOS failure, not only the
+ * bot-check — the phone's signed-in 0.2.25 test threw a plain ExtractionException
+ * from visionOS and the old code never tried Android at all.
  */
 open class NewPipeStreamResolver(
     private val downloader: OkHttpNewPipeDownloader,
@@ -72,20 +75,32 @@ open class NewPipeStreamResolver(
     private fun fetch(videoId: String): YouTubeStreams {
         val first = tryVisionOs(videoId)
         if (first.failure == null) return first
-        if (first.detail != BOT_CHECK) return first
-        try {
-            Thread.sleep(retryDelayMillis)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-            return first
+        if (first.detail.startsWith(BOT_CHECK)) {
+            try {
+                Thread.sleep(retryDelayMillis)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return first
+            }
+            val retried = tryVisionOs(videoId)
+            if (retried.failure == null) return retried.copy(source = "visionOS-retry")
+            val android = androidFallback(videoId)
+            if (android.failure == null) return android
+            // 0.2.25: both ways failed — keep the first cause, but name what the Android
+            // fallback hit too, or the next phone test cannot tell them apart (0.2.24 showed
+            // only the first failure, so the Android result was invisible).
+            return first.copy(
+                detail = "${first.detail}; android ${android.failure} (${android.detail})"
+            )
         }
-        val retried = tryVisionOs(videoId)
-        if (retried.failure == null) return retried.copy(source = "visionOS-retry")
+        // 0.2.26: any other visionOS failure gets the Android attempt too. The phone's
+        // 0.2.25 test proved why: signed in, the bot-check is gone, but visionOS now
+        // throws a plain ExtractionException — the visionOS client plus web cookies is
+        // a combination YouTube answers badly — and the old code returned that failure
+        // without ever trying Android. The Android client plus the signed-in session is
+        // the combination yt-dlp uses.
         val android = androidFallback(videoId)
         if (android.failure == null) return android
-        // 0.2.25: both ways failed — keep the first cause, but name what the Android
-        // fallback hit too, or the next phone test cannot tell them apart (0.2.24 showed
-        // only the first failure, so the Android result was invisible).
         return first.copy(
             detail = "${first.detail}; android ${android.failure} (${android.detail})"
         )
@@ -139,13 +154,13 @@ open class NewPipeStreamResolver(
             YouTubeStreams(
                 videoId = videoId,
                 failure = YouTubeFailure.NETWORK,
-                detail = e.javaClass.simpleName
+                detail = describeFailure(e)
             )
         } catch (e: Exception) {
             YouTubeStreams(
                 videoId = videoId,
                 failure = YouTubeFailure.INTERNAL,
-                detail = e.javaClass.simpleName
+                detail = describeFailure(e)
             )
         }
     }
@@ -166,6 +181,20 @@ open class NewPipeStreamResolver(
          * "confirm you're not a bot" challenge (see `SignInConfirmNotBotException`). */
         private const val BOT_CHECK = "SignInConfirmNotBotException"
     }
+}
+
+/**
+ * 0.2.26: the failure detail carries the exception's message too, not just its class
+ * name — the 0.2.25 phone test showed only "ExtractionException", which says nothing
+ * about what YouTube actually answered. No message means the plain class name, so
+ * existing detail strings are unchanged. The message is bounded to one line so the
+ * diagnostics stay readable.
+ */
+internal fun describeFailure(e: Exception): String {
+    val name = e.javaClass.simpleName
+    val message = e.message?.replace('\n', ' ')?.replace('\r', ' ')?.trim()
+        ?.takeIf { it.isNotBlank() }?.take(200)
+    return if (message == null) name else "$name: $message"
 }
 
 /** "720p", "720p60" → 720. Anything else → 0 (sorts last). */

@@ -197,6 +197,21 @@ open class AndroidPlayerClient(
                     detail = "no streamingData",
                     source = "android"
                 )
+            // 0.2.26: YouTube sometimes replaces the real player response with
+            // another video's ("not available on this app") — NewPipe checks for
+            // exactly this on the visionOS path, and the phone's signed-in 0.2.25
+            // test hit it there. Without the check the app could play the wrong
+            // video; a substituted answer is a failure, not a stream.
+            val details = obj(root, "videoDetails")
+            val responseVideoId = details?.let { str(it, "videoId") }
+            if (responseVideoId != videoId) {
+                return YouTubeStreams(
+                    videoId = videoId,
+                    failure = YouTubeFailure.INTERNAL,
+                    detail = "response videoId mismatch",
+                    source = "android"
+                )
+            }
             val videos = mutableListOf<StreamCandidate>()
             val audios = mutableListOf<StreamCandidate>()
             // `formats` are progressive (muxed); `adaptiveFormats` are video-only or
@@ -226,7 +241,6 @@ open class AndroidPlayerClient(
                     source = "android"
                 )
             }
-            val details = obj(root, "videoDetails")
             return YouTubeStreams(
                 videoId = videoId,
                 title = details?.let { str(it, "title") }.orEmpty(),
