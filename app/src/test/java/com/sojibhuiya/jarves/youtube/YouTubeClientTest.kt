@@ -254,7 +254,7 @@ class OkHttpNewPipeDownloaderTest {
         val response = downloader.execute(request)
         assertEquals(200, response.responseCode())
         assertEquals("hello", response.responseBody())
-        assertEquals(listOf("1"), response.getHeader("X-Test"))
+        assertEquals("1", response.getHeader("X-Test"))
         assertEquals(url, response.latestUrl())
     }
 }
