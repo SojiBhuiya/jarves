@@ -12,8 +12,8 @@ android {
         applicationId = "com.sojibhuiya.jarves"
         minSdk = 26
         targetSdk = 35
-        versionCode = 21
-        versionName = "0.2.19"
+        versionCode = 22
+        versionName = "0.2.20"
     }
 
     // ---- 0.2.7: ONE fixed signing key for every installed APK.
@@ -80,6 +80,14 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // 0.2.20: YouTube player — ad-free playback through our own player (ExoPlayer).
+    implementation("androidx.compose.material:material-icons-extended")
+    implementation("io.coil-kt:coil-compose:2.7.0")
+    implementation("androidx.media3:media3-exoplayer:1.9.0")
+    implementation("androidx.media3:media3-session:1.9.0")
+    implementation("androidx.media3:media3-ui-compose:1.9.0")
+    // NewPipe Extractor via JitPack (see settings.gradle.kts). GPL-3.0; personal use only.
+    implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.27.1")
     // Design 4 uses runInterruptible() and withTimeoutOrNull() directly, so the coroutines
     // runtime must not be left to a transitive version.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")

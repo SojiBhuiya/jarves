@@ -69,6 +69,7 @@ import com.sojibhuiya.jarves.ui.components.JarvesTextField
 import com.sojibhuiya.jarves.ui.icons.JarvesIcons
 import com.sojibhuiya.jarves.ui.theme.JarvesColors
 import com.sojibhuiya.jarves.ui.theme.JarvesDimens
+import com.sojibhuiya.jarves.youtube.YouTubeApiKeyStore
 import kotlinx.coroutines.launch
 
 /**
@@ -82,7 +83,9 @@ import kotlinx.coroutines.launch
 fun ApiProvidersScreen(
     repository: ApiProviderRepository,
     onBack: () -> Unit,
-    onRecordsChanged: (List<ApiProviderRecord>) -> Unit = {}
+    onRecordsChanged: (List<ApiProviderRecord>) -> Unit = {},
+    /** 0.2.20: the YouTube Data API key lives in the same encrypted store as the providers. */
+    youTubeKeyStore: YouTubeApiKeyStore? = null
 ) {
     val scope = rememberCoroutineScope()
     var records by remember { mutableStateOf<List<ApiProviderRecord>?>(null) }
@@ -253,6 +256,12 @@ fun ApiProvidersScreen(
                         }
                     }
                 }
+            }
+            // 0.2.20: pinned below the provider list (and visible even with no providers
+            // saved), so the YouTube key can always be entered here.
+            if (youTubeKeyStore != null) {
+                Spacer(Modifier.height(12.dp))
+                YouTubeKeyCard(store = youTubeKeyStore)
             }
         }
     }
@@ -799,6 +808,76 @@ private fun CategoryOptionRow(category: ApiCategory, selected: Boolean, onClick:
                     .clip(RoundedCornerShape(3.dp))
                     .background(JarvesColors.Accent)
             )
+        }
+    }
+}
+
+/**
+ * 0.2.20: the YouTube Data API key, saved in the same encrypted store as the providers.
+ * The stored key is never shown back — only whether one is saved.
+ */
+@Composable
+private fun YouTubeKeyCard(store: YouTubeApiKeyStore) {
+    val scope = rememberCoroutineScope()
+    var keyInput by remember { mutableStateOf("") }
+    var saved by remember { mutableStateOf<Boolean?>(null) }
+    var saving by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(Unit) { saved = store.hasKey() }
+
+    JarvesCard {
+        Column(Modifier.padding(16.dp)) {
+            Text(
+                "YouTube",
+                color = Color.White,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "ভিডিও খোঁজার জন্য YouTube Data API key লাগে। Google Cloud থেকে ফ্রি key বানিয়ে এখানে দিন।",
+                color = JarvesColors.TextMuted,
+                fontSize = 12.sp,
+                lineHeight = 17.sp
+            )
+            if (saved == true) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Key সংরক্ষিত আছে",
+                    color = JarvesColors.Accent,
+                    fontSize = 12.sp
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+            JarvesTextField(
+                value = keyInput,
+                onValueChange = { keyInput = it; message = null },
+                placeholder = "YouTube API key",
+                visualTransformation = PasswordVisualTransformation()
+            )
+            Spacer(Modifier.height(10.dp))
+            JarvesPrimaryButton(
+                text = if (saving) "সংরক্ষণ হচ্ছে…" else "সংরক্ষণ করুন",
+                onClick = {
+                    scope.launch {
+                        saving = true
+                        runCatching { store.save(keyInput) }.onSuccess {
+                            saved = true
+                            keyInput = ""
+                            message = "YouTube key সংরক্ষিত হয়েছে"
+                        }.onFailure {
+                            message = "সংরক্ষণ করা যায়নি"
+                        }
+                        saving = false
+                    }
+                },
+                enabled = keyInput.isNotBlank() && !saving
+            )
+            message?.let {
+                Spacer(Modifier.height(8.dp))
+                Text(it, color = JarvesColors.TextMuted, fontSize = 12.sp)
+            }
         }
     }
 }

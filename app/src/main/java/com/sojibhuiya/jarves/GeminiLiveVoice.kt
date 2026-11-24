@@ -72,6 +72,14 @@ import com.sojibhuiya.jarves.intelligence.SearchFunctionCall
 import com.sojibhuiya.jarves.intelligence.SearchBackend
 import com.sojibhuiya.jarves.intelligence.SearchBudget
 import com.sojibhuiya.jarves.intelligence.SearchToolRunner
+import com.sojibhuiya.jarves.intelligence.YouTubeControlCall
+import com.sojibhuiya.jarves.intelligence.YouTubePlayCall
+import com.sojibhuiya.jarves.intelligence.YouTubeSearchCall
+import com.sojibhuiya.jarves.intelligence.YouTubeToolRunner
+import com.sojibhuiya.jarves.youtube.YouTubeSearchClient
+import com.sojibhuiya.jarves.youtube.YouTubeStreamResolver
+import com.sojibhuiya.jarves.youtube.YouTubeStreams
+import com.sojibhuiya.jarves.youtube.YouTubeVideo
 import com.sojibhuiya.jarves.intelligence.GroundingAvailability
 import com.sojibhuiya.jarves.intelligence.GroundingPolicy
 import com.sojibhuiya.jarves.intelligence.GroundingReport
@@ -106,6 +114,17 @@ internal class GeminiLiveVoice(
     private val searchBackend: SearchBackend? = null,
     /** Search result for chat (not a transport diagnostics dump). */
     private val onSearchReport: (String) -> Unit = {},
+    /**
+     * 0.2.20: YouTube player. All null by default (voice-only): no video runner is created
+     * and video tool calls are answered "not available". The activity supplies the client,
+     * the key, the resolver and the playback callbacks.
+     */
+    private val youtubeSearchClient: YouTubeSearchClient? = null,
+    private val youtubeKeyProvider: (suspend () -> String?)? = null,
+    private val youtubeResolver: YouTubeStreamResolver? = null,
+    private val onYouTubePlay: ((YouTubeVideo, YouTubeStreams) -> Unit)? = null,
+    private val onYouTubeControl: ((String) -> Unit)? = null,
+    private val onYouTubeSearchResults: ((List<YouTubeVideo>) -> Unit)? = null,
     /**
      * 0.2.6: which voice/search mode this session uses. The model ID and the setup tools both come
      * from the mode, so nothing at a call site can pick a model on its own.
@@ -357,6 +376,7 @@ internal class GeminiLiveVoice(
     private val searchBudget = SearchBudget(MAX_SEARCHES_PER_QUESTION)
     /** Runs `search_web` calls off the WebSocket thread; one per live session. */
     @Volatile private var searchRunner: SearchToolRunner? = null
+    @Volatile private var youtubeRunner: YouTubeToolRunner? = null
     /** Set once a tool-refusal retry starts, so the retry can never repeat. */
     private val retryInFlight = AtomicBoolean(false)
 
@@ -552,6 +572,7 @@ internal class GeminiLiveVoice(
         sessionTimeline.start(now)
         freshFallback.reset()
         startSearchRunner()
+        startYouTubeRunner()
         lastNetworkIdentity = netMonitor.networkIdentity()
         lastNetworkType = netMonitor.snapshot().type
         netMonitor.onAvailable(networkAvailableListener)
@@ -734,6 +755,7 @@ internal class GeminiLiveVoice(
                         val cancelled = LiveToolProtocol.parseCancellations(text)
                         if (cancelled.isNotEmpty()) {
                             searchRunner?.cancel(cancelled)
+                            youtubeRunner?.cancel(cancelled)
                             liveStatus("সার্চ বাতিল হয়েছে — আপনি কথা বলেছেন")
                         }
                         val calls = LiveToolProtocol.parseSearchCalls(text)
@@ -764,6 +786,14 @@ internal class GeminiLiveVoice(
                             lastAutoTrace = "Auto steps: $lastToolCallSeen"
                             liveStatus("৩.৮ মডেল সার্চ চাইছে — দ্বিতীয় সেশন খোলা হচ্ছে…")
                             handleSearchCalls(calls)
+                        }
+
+                        // ---- 0.2.20: video tools -------------------------------------------
+                        val videoSearchCalls = LiveToolProtocol.parseYouTubeSearchCalls(text)
+                        val playCalls = LiveToolProtocol.parseYouTubePlayCalls(text)
+                        val controlCalls = LiveToolProtocol.parseYouTubeControlCalls(text)
+                        if (videoSearchCalls.isNotEmpty() || playCalls.isNotEmpty() || controlCalls.isNotEmpty()) {
+                            handleYouTubeCalls(videoSearchCalls, playCalls, controlCalls)
                         }
                     }
 
@@ -1321,6 +1351,29 @@ internal class GeminiLiveVoice(
         )
     }
 
+    /** Creates the per-session video runner. No-op when no YouTube client was injected (voice only). */
+    private fun startYouTubeRunner() {
+        youtubeRunner?.shutdown()
+        youtubeRunner = null
+        val client = youtubeSearchClient ?: return
+        val keyProvider = youtubeKeyProvider ?: return
+        val resolver = youtubeResolver ?: return
+        youtubeRunner = YouTubeToolRunner(
+            searchClient = client,
+            keyProvider = keyProvider,
+            resolver = resolver,
+            onResult = { callId, functionName, result, scheduling ->
+                sendToolResponse(
+                    LiveToolProtocol.toolResponseJsonFor(callId, functionName, result, scheduling)
+                )
+            },
+            onEvent = { line -> liveStatus(line.substringBefore(':')) },
+            onPlayVideo = { video, streams -> onYouTubePlay?.invoke(video, streams) },
+            onControl = { action -> onYouTubeControl?.invoke(action) },
+            onSearchResults = { videos -> onYouTubeSearchResults?.invoke(videos) }
+        )
+    }
+
     /**
      * Sends one result to the 3.8 session with the scheduling value the caller chose (always
      * `WHEN_IDLE` for search results, see [LiveToolProtocol.schedulingFor]) and arms the 8-second
@@ -1441,6 +1494,49 @@ internal class GeminiLiveVoice(
     }
 
     /**
+     * Answers every `search_videos`, `play_video` and `control_playback` call. Never blocks
+     * the WebSocket reader thread: the runner only schedules coroutines. With no YouTube
+     * client injected the model is answered immediately so it is never left waiting.
+     */
+    private fun handleYouTubeCalls(
+        searches: List<YouTubeSearchCall>,
+        plays: List<YouTubePlayCall>,
+        controls: List<YouTubeControlCall>
+    ) {
+        val runner = youtubeRunner
+        if (runner == null) {
+            val unavailable = "Video playback is not available in this session. Tell the user " +
+                "you cannot play videos right now."
+            searches.forEach { call ->
+                sendToolResponse(
+                    LiveToolProtocol.toolResponseJsonFor(
+                        call.callId, LiveSessionConfig.FUNCTION_SEARCH_VIDEOS, unavailable
+                    )
+                )
+            }
+            plays.forEach { call ->
+                sendToolResponse(
+                    LiveToolProtocol.toolResponseJsonFor(
+                        call.callId, LiveSessionConfig.FUNCTION_PLAY_VIDEO, unavailable
+                    )
+                )
+            }
+            controls.forEach { call ->
+                sendToolResponse(
+                    LiveToolProtocol.toolResponseJsonFor(
+                        call.callId, LiveSessionConfig.FUNCTION_CONTROL_PLAYBACK, unavailable
+                    )
+                )
+            }
+            return
+        }
+        liveStatus("ভিডিও খোঁজা হচ্ছে…")
+        searches.forEach { runner.handleSearch(it) }
+        plays.forEach { runner.handlePlay(it) }
+        controls.forEach { runner.handleControl(it) }
+    }
+
+    /**
      * Recovery when the server refuses `behavior: NON_BLOCKING`: reconnect once with the same
      * function declared as a normal (blocking) function, and report exactly what the server said.
      * Search keeps working; the user simply cannot talk over it. Runs at most once per process
@@ -1457,6 +1553,8 @@ internal class GeminiLiveVoice(
         onState(LiveState.CONNECTING)
         searchRunner?.shutdown()
         searchRunner = null
+        youtubeRunner?.shutdown()
+        youtubeRunner = null
         flight.retire("search tool rejected")
         flight.request(0L) { connect(attempt = 0, reconnecting = false) }
     }
@@ -1981,6 +2079,8 @@ internal class GeminiLiveVoice(
         reportMicGaps("final partial minute")
         searchRunner?.shutdown()
         searchRunner = null
+        youtubeRunner?.shutdown()
+        youtubeRunner = null
         playbackActive.set(false)
         playbackQueue.clear()
         playbackThread?.interrupt()

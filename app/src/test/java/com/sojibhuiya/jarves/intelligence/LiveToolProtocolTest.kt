@@ -197,5 +197,71 @@ class LiveToolProtocolTest {
         assertEquals(LiveSessionConfig.FUNCTION_SEARCH_WEB, "search_web")
         assertTrue(LiveToolProtocol.toolResponseJson("i", "r").contains("\"name\":\"search_web\""))
     }
+
+    // ---- 0.2.20: video tools -----------------------------------------------------------
+
+    private fun videoToolCallFrame(
+        id: String = "call-v1",
+        name: String = "search_videos",
+        args: String = "\"query\":\"old song\""
+    ) =
+        """
+        {"toolCall":{"functionCalls":[{"id":"$id","name":"$name","args":{$args}}]}}
+        """.trimIndent()
+
+    @Test
+    fun readsVideoSearchCallsAndIgnoresOtherFunctions() {
+        val calls = LiveToolProtocol.parseYouTubeSearchCalls(
+            videoToolCallFrame(name = "search_videos", args = "\"query\":\"old song\"")
+        )
+        assertEquals(1, calls.size)
+        assertEquals("call-v1", calls.single().callId)
+        assertEquals("old song", calls.single().query)
+        // A search_web frame is not a video search.
+        assertTrue(LiveToolProtocol.parseYouTubeSearchCalls(toolCallFrame()).isEmpty())
+        // A play_video frame is not a video search.
+        assertTrue(
+            LiveToolProtocol.parseYouTubeSearchCalls(
+                videoToolCallFrame(name = "play_video", args = "\"videoId\":\"abc123\"")
+            ).isEmpty()
+        )
+    }
+
+    @Test
+    fun readsPlayVideoCallsWithVideoIdAndTitle() {
+        val calls = LiveToolProtocol.parseYouTubePlayCalls(
+            videoToolCallFrame(name = "play_video", args = "\"videoId\":\"abc123\",\"title\":\"Old Song\"")
+        )
+        assertEquals("abc123", calls.single().videoId)
+        assertEquals("Old Song", calls.single().title)
+        // Missing videoId is dropped, not guessed.
+        assertTrue(
+            LiveToolProtocol.parseYouTubePlayCalls(
+                videoToolCallFrame(name = "play_video", args = "\"title\":\"Old Song\"")
+            ).isEmpty()
+        )
+    }
+
+    @Test
+    fun readsPlaybackControlCalls() {
+        val calls = LiveToolProtocol.parseYouTubeControlCalls(
+            videoToolCallFrame(name = "control_playback", args = "\"action\":\"pause\"")
+        )
+        assertEquals("pause", calls.single().action)
+        assertTrue(
+            LiveToolProtocol.parseYouTubeControlCalls(
+                videoToolCallFrame(name = "control_playback", args = "\"action\":\"\"")
+            ).isEmpty()
+        )
+    }
+
+    @Test
+    fun videoToolResponseCarriesTheVideoFunctionName() {
+        val json = LiveToolProtocol.toolResponseJsonFor(
+            "call-v1", LiveSessionConfig.FUNCTION_PLAY_VIDEO, "Playing Old Song."
+        )
+        assertTrue(json.contains("\"name\":\"play_video\""))
+        assertTrue(json.contains("Playing Old Song."))
+    }
 }
 

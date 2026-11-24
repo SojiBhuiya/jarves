@@ -21,6 +21,9 @@ object PrefKeys {
     /** Legacy Gemini ciphertext (Android Keystore alias `agi_gemini_key_v1`). */
     val GEMINI_KEY_ENCRYPTED = stringPreferencesKey("gemini_key_encrypted")
 
+    /** YouTube Data API key, AES-GCM ciphertext — never stored or logged in plain text. */
+    val YOUTUBE_API_KEY_ENCRYPTED = stringPreferencesKey("youtube_key_encrypted")
+
     /** Serialized, encrypted API provider records. */
     val API_PROVIDERS_JSON = stringPreferencesKey("api_providers_json")
 

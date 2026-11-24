@@ -17,6 +17,7 @@
          type-specific one); POST_NOTIFICATIONS (Android 13+) is needed for the visible notification. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 0.2.7 in-app updater: needed to hand a downloaded APK to the system installer.
          https://developer.android.com/guide/topics/manifest/uses-permission#android.permission.REQUEST_INSTALL_PACKAGES -->
@@ -47,6 +48,17 @@
             android:name=".LiveSessionService"
             android:exported="false"
             android:foregroundServiceType="microphone" />
+
+        <!-- 0.2.20: YouTube player — the foreground media service keeps audio playing when
+             the phone is locked, and puts play/pause/next on the lock screen. -->
+        <service
+            android:name=".youtube.YouTubePlaybackService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaSessionService" />
+            </intent-filter>
+        </service>
 
         <!-- The updater downloads into the app cache and shares that one file with the installer. -->
         <provider

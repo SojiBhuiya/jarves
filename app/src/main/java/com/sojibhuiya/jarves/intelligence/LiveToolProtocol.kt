@@ -14,6 +14,26 @@ data class SearchFunctionCall(
     val forceRefresh: Boolean = false
 )
 
+/** One `search_videos` call requested by the model. */
+data class YouTubeSearchCall(
+    val callId: String,
+    val query: String
+)
+
+/** One `play_video` call requested by the model. */
+data class YouTubePlayCall(
+    val callId: String,
+    val videoId: String,
+    val title: String = ""
+)
+
+/** One `control_playback` call requested by the model. */
+data class YouTubeControlCall(
+    val callId: String,
+    /** pause, resume, next, previous or stop. */
+    val action: String
+)
+
 /**
  * Wire format for Design 4: parsing the model's `toolCall` and building the `toolResponse`.
  *
@@ -47,15 +67,59 @@ object LiveToolProtocol {
      * malformed frames are ignored rather than guessed at — an unanswered call simply times out on
      * the server side, which is safer than inventing a correlation id.
      */
-    fun parseSearchCalls(message: String?): List<SearchFunctionCall> {
+    fun parseSearchCalls(message: String?): List<SearchFunctionCall> =
+        parseCalls(message, LiveSessionConfig.FUNCTION_SEARCH_WEB) { callId, args ->
+            val query = (args?.get("query") as? String)?.trim().orEmpty()
+            if (query.isEmpty()) return@parseCalls null
+            // 0.2.19: the re-verify flag. Absent or anything but `true` means a normal search.
+            SearchFunctionCall(
+                callId = callId,
+                query = query.take(MAX_QUERY_CHARS),
+                forceRefresh = args?.get("forceRefresh") == true
+            )
+        }
+
+    /** Extracts every `search_videos` call from a server message. */
+    fun parseYouTubeSearchCalls(message: String?): List<YouTubeSearchCall> =
+        parseCalls(message, LiveSessionConfig.FUNCTION_SEARCH_VIDEOS) { callId, args ->
+            val query = (args?.get("query") as? String)?.trim().orEmpty()
+            if (query.isEmpty()) return@parseCalls null
+            YouTubeSearchCall(callId = callId, query = query.take(MAX_QUERY_CHARS))
+        }
+
+    /** Extracts every `play_video` call from a server message. */
+    fun parseYouTubePlayCalls(message: String?): List<YouTubePlayCall> =
+        parseCalls(message, LiveSessionConfig.FUNCTION_PLAY_VIDEO) { callId, args ->
+            val videoId = (args?.get("videoId") as? String)?.trim().orEmpty()
+            if (videoId.isEmpty()) return@parseCalls null
+            val title = (args?.get("title") as? String)?.trim().orEmpty()
+            YouTubePlayCall(callId = callId, videoId = videoId, title = title)
+        }
+
+    /** Extracts every `control_playback` call from a server message. Unknown actions are kept — the runner refuses them with a plain answer. */
+    fun parseYouTubeControlCalls(message: String?): List<YouTubeControlCall> =
+        parseCalls(message, LiveSessionConfig.FUNCTION_CONTROL_PLAYBACK) { callId, args ->
+            val action = (args?.get("action") as? String)?.trim().orEmpty()
+            if (action.isEmpty()) return@parseCalls null
+            YouTubeControlCall(callId = callId, action = action)
+        }
+
+    /**
+     * Shared frame parser for one function name. [build] turns a call's id and args into a call
+     * object, or null to drop it (missing/empty argument).
+     */
+    private fun <T> parseCalls(
+        message: String?,
+        functionName: String,
+        build: (callId: String, args: Map<*, *>?) -> T?
+    ): List<T> {
         if (message.isNullOrBlank() || !message.contains(KEY_TOOL_CALL)) return emptyList()
         val root = runCatching { MiniJson.parse(message) }.getOrNull() as? Map<*, *> ?: return emptyList()
         val toolCall = root[KEY_TOOL_CALL] as? Map<*, *> ?: return emptyList()
         val calls = toolCall[KEY_FUNCTION_CALLS] as? List<*> ?: return emptyList()
         return calls.mapNotNull { entry ->
             val call = entry as? Map<*, *> ?: return@mapNotNull null
-            val name = call["name"] as? String
-            if (name != LiveSessionConfig.FUNCTION_SEARCH_WEB) return@mapNotNull null
+            if (call["name"] as? String != functionName) return@mapNotNull null
             val id = (call["id"] as? String)?.trim().orEmpty()
             if (id.isEmpty()) return@mapNotNull null
             // `args` is documented as an object; a pre-encoded string is accepted too rather than
@@ -65,11 +129,7 @@ object LiveToolProtocol {
                 is String -> runCatching { MiniJson.parse(raw) }.getOrNull() as? Map<*, *>
                 else -> null
             }
-            val query = (args?.get("query") as? String)?.trim().orEmpty()
-            if (query.isEmpty()) return@mapNotNull null
-            // 0.2.19: the re-verify flag. Absent or anything but `true` means a normal search.
-            val forceRefresh = args?.get("forceRefresh") == true
-            SearchFunctionCall(callId = id, query = query.take(MAX_QUERY_CHARS), forceRefresh = forceRefresh)
+            build(id, args)
         }
     }
 
@@ -90,13 +150,21 @@ object LiveToolProtocol {
         callId: String,
         result: String,
         scheduling: String = SCHEDULING_WHEN_IDLE
+    ): String = toolResponseJsonFor(callId, LiveSessionConfig.FUNCTION_SEARCH_WEB, result, scheduling)
+
+    /** Same frame for any function name (0.2.20: the video tools answer the same way). */
+    fun toolResponseJsonFor(
+        callId: String,
+        functionName: String,
+        result: String,
+        scheduling: String = SCHEDULING_WHEN_IDLE
     ): String = MiniJson.encode(
         linkedMapOf<String, Any?>(
             "toolResponse" to linkedMapOf<String, Any?>(
                 KEY_FUNCTION_RESPONSES to listOf(
                     linkedMapOf<String, Any?>(
                         "id" to callId,
-                        "name" to LiveSessionConfig.FUNCTION_SEARCH_WEB,
+                        "name" to functionName,
                         // The result object. It carries the human-readable summary and nothing else.
                         "response" to linkedMapOf<String, Any?>("result" to result),
                         // 0.2.12 (B7): `scheduling` is sent in exactly one place — the place the
