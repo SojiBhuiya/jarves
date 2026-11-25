@@ -177,4 +177,71 @@ class AndroidPlayerClientFetchTest {
         )
         assertEquals("3", playerRequest.getHeader("X-YouTube-Client-Name"))
     }
+
+    @Test
+    fun `player 400 retries anonymously and plays`() {
+        // 0.2.27: a signed-in session can go stale and YouTube answers the
+        // authenticated player request with HTTP 400 (phone's 0.2.26 test) while
+        // the identical request without cookies returns 200 (verified live).
+        // The retry must carry no session at all — and it must play.
+        server.enqueue(
+            MockResponse().setBody("""{"responseContext": {"visitorData": "CgtfSmVjVmlnUEVTZg"}}""")
+        )
+        server.enqueue(MockResponse().setResponseCode(400))
+        server.enqueue(
+            MockResponse().setBody("""{"responseContext": {"visitorData": "CgtfSmVjVmlnUEVTZg"}}""")
+        )
+        server.enqueue(MockResponse().setBody(playerJson))
+        val signedIn = OkHttpNewPipeDownloader(
+            authCookiesProvider = { "SID=dummySid; SAPISID=AbC123xYz" }
+        )
+        val client = AndroidPlayerClient(
+            signedIn,
+            visitorIdUrl = server.url("/visitor_id").toString(),
+            playerUrlBase = server.url("/player").toString(),
+            anonymousDownloader = OkHttpNewPipeDownloader()
+        )
+        val streams = client.fetch("abc123")
+        assertNull(streams.failure)
+        assertEquals("https://example.test/v18.mp4", streams.videoUrl)
+        assertEquals("android", streams.source)
+
+        assertEquals(4, server.requestCount)
+        server.takeRequest() // visitor_id, signed in
+        val firstPlayer = server.takeRequest()
+        assertTrue(firstPlayer.getHeader("Cookie")!!.contains("SAPISID=AbC123xYz"))
+        assertTrue(firstPlayer.getHeader("Authorization")!!.startsWith("SAPISIDHASH "))
+        server.takeRequest() // visitor_id, anonymous retry
+        val retryPlayer = server.takeRequest()
+        assertNull(retryPlayer.getHeader("Cookie"))
+        assertNull(retryPlayer.getHeader("Authorization"))
+    }
+
+    @Test
+    fun `player 400 and anonymous retry also fails returns combined detail`() {
+        // 0.2.27: when the anonymous retry fails too, the detail must carry
+        // both results, so the next diagnosis is not blind.
+        server.enqueue(
+            MockResponse().setBody("""{"responseContext": {"visitorData": "CgtfSmVjVmlnUEVTZg"}}""")
+        )
+        server.enqueue(MockResponse().setResponseCode(400))
+        server.enqueue(
+            MockResponse().setBody("""{"responseContext": {"visitorData": "CgtfSmVjVmlnUEVTZg"}}""")
+        )
+        server.enqueue(MockResponse().setResponseCode(400))
+        val signedIn = OkHttpNewPipeDownloader(
+            authCookiesProvider = { "SID=dummySid; SAPISID=AbC123xYz" }
+        )
+        val client = AndroidPlayerClient(
+            signedIn,
+            visitorIdUrl = server.url("/visitor_id").toString(),
+            playerUrlBase = server.url("/player").toString(),
+            anonymousDownloader = OkHttpNewPipeDownloader()
+        )
+        val streams = client.fetch("abc123")
+        assertEquals(YouTubeFailure.HTTP, streams.failure)
+        assertEquals("400; anonymous HTTP (400)", streams.detail)
+        assertEquals("android", streams.source)
+        assertEquals(4, server.requestCount)
+    }
 }
