@@ -21,6 +21,9 @@ import org.schabi.newpipe.extractor.localization.Localization
  * adaptive formats are usually `signatureCipher`-only, so they are skipped — the
  * fallback plays at 360p, but it plays.
  *
+ * 0.2.27: when the signed-in player request is answered with HTTP 400, the same
+ * request is tried once more with no session at all (see [fetch]).
+ *
  * Blocking; call on Dispatchers.IO (the resolver does). [fetch] never throws: every
  * failure comes back as a [YouTubeStreams] with `failure` set and `source` "android".
  */
@@ -29,12 +32,42 @@ open class AndroidPlayerClient(
     /** Injectable for tests: a MockWebServer URL replaces the real endpoint. */
     private val visitorIdUrl: String = VISITOR_ID_URL,
     /** Injectable for tests; `?prettyPrint=false&t=…&id=…` is appended. */
-    private val playerUrlBase: String = PLAYER_URL_BASE
+    private val playerUrlBase: String = PLAYER_URL_BASE,
+    /**
+     * 0.2.27: the downloader for the anonymous retry (no session cookies). When null
+     * a plain [OkHttpNewPipeDownloader] is created on first use. Injectable for
+     * tests so the retry can be pointed at the same MockWebServer.
+     */
+    private val anonymousDownloader: OkHttpNewPipeDownloader? = null
 ) {
+    /** Created once, on first use — a plain downloader with no auth provider. */
+    private val anonDownloader: OkHttpNewPipeDownloader by lazy {
+        anonymousDownloader ?: OkHttpNewPipeDownloader()
+    }
 
+    /**
+     * 0.2.27: when the signed-in player request is answered with HTTP 400, the
+     * request is tried once more with no session at all. A session can go stale
+     * (the phone's 0.2.26 test: signed in at 00:01, player 400 at 10:50) and
+     * YouTube answers a mismatched session with 400 while the identical request
+     * without cookies returns 200 (verified live). A stale sign-in must never
+     * block playback — and the retry's result is visible in the detail either
+     * way, so the next diagnosis is not blind.
+     */
     open fun fetch(videoId: String): YouTubeStreams {
+        val first = fetchWith(downloader, videoId)
+        if (first.failure == YouTubeFailure.HTTP && first.detail == "400") {
+            val anon = fetchWith(anonDownloader, videoId)
+            if (anon.failure == null) return anon
+            return first.copy(detail = "400; anonymous ${anon.failure} (${anon.detail})")
+        }
+        return first
+    }
+
+    /** One visitor_id → player attempt with the given downloader. Never throws. */
+    private fun fetchWith(downloader: OkHttpNewPipeDownloader, videoId: String): YouTubeStreams {
         return try {
-            val visitorData = visitorData()
+            val visitorData = visitorData(downloader)
                 ?: return YouTubeStreams(
                     videoId = videoId,
                     failure = YouTubeFailure.INTERNAL,
@@ -79,7 +112,7 @@ open class AndroidPlayerClient(
         }
     }
 
-    private fun visitorData(): String? {
+    private fun visitorData(downloader: OkHttpNewPipeDownloader): String? {
         val body = MiniJson.encode(contextJson(null)).toByteArray(Charsets.UTF_8)
         val response = downloader.postWithContentTypeJson(
             visitorIdUrl, headers(), body, Localization.DEFAULT
