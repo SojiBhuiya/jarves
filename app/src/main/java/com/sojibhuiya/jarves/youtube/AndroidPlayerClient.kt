@@ -15,14 +15,24 @@ import org.schabi.newpipe.extractor.localization.Localization
  * for the player response (yt-dlp: PLAYER_PO_TOKEN_POLICY required=false).
  *
  * What it sends (values verified live, 2026-11-24): a `visitor_id` POST for fresh
- * visitorData, then a `player` POST on www.youtube.com — both with the Android client
- * context (yt-dlp's current values) and the `X-YouTube-Client-Name/Version` headers.
+ * visitorData, then a `player` POST on youtubei.googleapis.com (GAPIS) — both with
+ * the Android client context (yt-dlp's current values) and the
+ * `X-YouTube-Client-Name/Version` headers.
  * The player response's progressive formats carry direct URLs (itag 18, 360p muxed);
  * adaptive formats are usually `signatureCipher`-only, so they are skipped — the
  * fallback plays at 360p, but it plays.
  *
  * 0.2.27: when the signed-in player request is answered with HTTP 400, the same
  * request is tried once more with no session at all (see [fetch]).
+ *
+ * 0.2.28: the Android client moved from www.youtube.com to GAPIS, and the anonymous
+ * (no-session) attempt is now the PRIMARY one, with the signed-in attempt as the
+ * fallback. Why: the phone's 0.2.27 test proved the www signed-in request gets
+ * HTTP 400 and the anonymous www retry gets LOGIN_REQUIRED, while GAPIS answers
+ * the anonymous Android player request with HTTP 200, playability OK — verified
+ * live from the VM 2026-11-28 for dQw4w9WgXcQ, with no cookies and no visitorData.
+ * A failed visitor_id no longer blocks the player attempt either: the GAPIS player
+ * answers without visitorData, so the attempt goes ahead with none.
  *
  * Blocking; call on Dispatchers.IO (the resolver does). [fetch] never throws: every
  * failure comes back as a [YouTubeStreams] with `failure` set and `source` "android".
@@ -46,34 +56,32 @@ open class AndroidPlayerClient(
     }
 
     /**
-     * 0.2.27: when the signed-in player request is answered with HTTP 400, the
-     * request is tried once more with no session at all. A session can go stale
-     * (the phone's 0.2.26 test: signed in at 00:01, player 400 at 10:50) and
-     * YouTube answers a mismatched session with 400 while the identical request
-     * without cookies returns 200 (verified live). A stale sign-in must never
-     * block playback — and the retry's result is visible in the detail either
-     * way, so the next diagnosis is not blind.
+     * 0.2.28: the anonymous GAPIS attempt is PRIMARY — it is tried first, with no
+     * session at all (no cookies, no SAPISIDHASH/Origin headers). The phone's
+     * 0.2.27 test proved the signed-in www request gets HTTP 400 and the anonymous
+     * www retry gets LOGIN_REQUIRED, while GAPIS answers the anonymous Android
+     * player request with HTTP 200 (verified live 2026-11-28). Only if the
+     * anonymous attempt fails is the signed-in attempt tried, as a fallback — and
+     * the combined detail names both results, so the next diagnosis is not blind.
      */
     open fun fetch(videoId: String): YouTubeStreams {
-        val first = fetchWith(downloader, videoId)
-        if (first.failure == YouTubeFailure.HTTP && first.detail == "400") {
-            val anon = fetchWith(anonDownloader, videoId)
-            if (anon.failure == null) return anon
-            return first.copy(detail = "400; anonymous ${anon.failure} (${anon.detail})")
-        }
-        return first
+        val anon = fetchWith(anonDownloader, videoId)
+        if (anon.failure == null) return anon
+        val signedIn = fetchWith(downloader, videoId)
+        if (signedIn.failure == null) return signedIn
+        return anon.copy(
+            detail = "anonymous ${anon.failure} (${anon.detail}); " +
+                "signed-in ${signedIn.failure} (${signedIn.detail})"
+        )
     }
 
     /** One visitor_id → player attempt with the given downloader. Never throws. */
     private fun fetchWith(downloader: OkHttpNewPipeDownloader, videoId: String): YouTubeStreams {
         return try {
+            // 0.2.28: a failed visitor_id must not block the player attempt — the
+            // GAPIS player answers 200 without visitorData (verified live
+            // 2026-11-28 for dQw4w9WgXcQ), so the attempt goes ahead with none.
             val visitorData = visitorData(downloader)
-                ?: return YouTubeStreams(
-                    videoId = videoId,
-                    failure = YouTubeFailure.INTERNAL,
-                    detail = "no visitorData",
-                    source = "android"
-                )
             val body = MiniJson.encode(playerBody(videoId, visitorData))
                 .toByteArray(Charsets.UTF_8)
             val response = downloader.postWithContentTypeJson(
@@ -131,9 +139,13 @@ open class AndroidPlayerClient(
         const val ANDROID_USER_AGENT =
             "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip"
 
-        private const val VISITOR_ID_URL =
-            "https://www.youtube.com/youtubei/v1/visitor_id?prettyPrint=false"
-        private const val PLAYER_URL_BASE = "https://www.youtube.com/youtubei/v1/player"
+        // 0.2.28: GAPIS (youtubei.googleapis.com) instead of www.youtube.com — the
+        // anonymous Android player request answers 200 there (verified live
+        // 2026-11-28), while www answers the phone's signed-in request with 400
+        // and its anonymous retry with LOGIN_REQUIRED (0.2.27 phone test).
+        internal const val VISITOR_ID_URL =
+            "https://youtubei.googleapis.com/youtubei/v1/visitor_id?prettyPrint=false"
+        internal const val PLAYER_URL_BASE = "https://youtubei.googleapis.com/youtubei/v1/player"
 
         private const val TOKEN_ALPHABET =
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
@@ -173,7 +185,7 @@ open class AndroidPlayerClient(
             )
         }
 
-        internal fun playerBody(videoId: String, visitorData: String): Map<String, Any?> {
+        internal fun playerBody(videoId: String, visitorData: String?): Map<String, Any?> {
             val body = contextJson(visitorData).toMutableMap()
             body["videoId"] = videoId
             body["cpn"] = randomToken(16)
