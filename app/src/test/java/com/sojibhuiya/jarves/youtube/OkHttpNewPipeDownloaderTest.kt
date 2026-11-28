@@ -18,7 +18,7 @@ import org.schabi.newpipe.extractor.downloader.Request
  * youtubei.googleapis.com / www.youtube.com URLs and read the exact headers
  * that would go out on the phone.
  */
-class OkHttpNewPipeDownloaderTest {
+class OkHttpNewPipeDownloaderOriginTest {
 
     private val cookies = "SID=dummySid; SAPISID=AbC123xYz"
 
