@@ -24,6 +24,45 @@ class YouTubeAuthTest {
     }
 
     @Test
+    fun `sapisidHash matches the verified GAPIS vector`() {
+        // 0.2.29: the hash for a GAPIS request is computed for the GAPIS origin.
+        // Vector computed with Python's hashlib
+        // (sha1("1700000000 AbC123xYz https://youtubei.googleapis.com")).
+        assertEquals(
+            "SAPISIDHASH 1700000000_d30169db32e3b40549789d3879ee1f84cf5fb9dc",
+            YouTubeAuth.sapisidHash(
+                sapisid = "AbC123xYz",
+                origin = "https://youtubei.googleapis.com",
+                timestampSeconds = 1_700_000_000L
+            )
+        )
+    }
+
+    @Test
+    fun `authHeaders with GAPIS origin carry GAPIS origin and hash`() {
+        // 0.2.29: a signed-in GAPIS request must carry the GAPIS origin, and the
+        // hash must be the one computed for that origin — a www-origin hash
+        // would not match, and YouTube would answer HTTP 400.
+        val headers = YouTubeAuth.authHeaders(
+            "SID=aaa; SAPISID=AbC123xYz; LOGIN_INFO=xyz",
+            origin = "https://youtubei.googleapis.com"
+        )
+        assertEquals("https://youtubei.googleapis.com", headers["Origin"])
+        assertEquals("https://youtubei.googleapis.com", headers["X-Origin"])
+        val authorization = headers["Authorization"]!!
+        val timestamp = authorization
+            .removePrefix("SAPISIDHASH ").substringBefore("_").toLong()
+        assertEquals(
+            YouTubeAuth.sapisidHash(
+                sapisid = "AbC123xYz",
+                origin = "https://youtubei.googleapis.com",
+                timestampSeconds = timestamp
+            ),
+            authorization
+        )
+    }
+
+    @Test
     fun `authHeaders carry cookie sapisidhash origin`() {
         val headers = YouTubeAuth.authHeaders(
             "SID=aaa; SAPISID=AbC123xYz; LOGIN_INFO=xyz"
