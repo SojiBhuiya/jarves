@@ -87,6 +87,7 @@ import com.sojibhuiya.jarves.intelligence.LiveCloseFlow
 import com.sojibhuiya.jarves.intelligence.LiveRejection
 import com.sojibhuiya.jarves.intelligence.LiveState
 import com.sojibhuiya.jarves.intelligence.LiveSessionConfig
+import com.sojibhuiya.jarves.intelligence.LiveVoice
 import com.sojibhuiya.jarves.intelligence.Rejection
 import com.sojibhuiya.jarves.intelligence.TimeContext
 
@@ -130,6 +131,11 @@ internal class GeminiLiveVoice(
      * from the mode, so nothing at a call site can pick a model on its own.
      */
     private val mode: VoiceSearchMode = VoiceSearchMode.VOICE_ONLY,
+    /**
+     * 0.2.28: the chosen Live voice (Settings → Voice). Default Aoede, so the
+     * video test stays clean — the default voice is unchanged.
+     */
+    private val voice: LiveVoice = LiveVoice.DEFAULT,
     /**
      * 0.2.8: how eagerly microphone input is treated as speech. Settings → Advanced → Mic
      * sensitivity; a conservative value keeps nearby voices and faint noise from starting a turn.
@@ -641,7 +647,7 @@ internal class GeminiLiveVoice(
                 )
                 val setup = LiveSessionConfig.setupJson(
                     model = LiveModels.modelFor(activeMode),
-                    voiceName = VOICE_NAME,
+                    voiceName = voice.voiceName,
                     systemInstruction = instruction,
                     searchTool = searchToolMode,
                     micSensitivity = micSensitivity,

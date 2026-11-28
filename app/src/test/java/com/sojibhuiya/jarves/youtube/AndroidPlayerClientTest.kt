@@ -108,6 +108,22 @@ class AndroidPlayerClientTest {
     }
 
     @Test
+    fun `gapis urls are the endpoints`() {
+        // 0.2.28: the Android client moved from www.youtube.com to GAPIS —
+        // GAPIS answers the anonymous Android player request with HTTP 200,
+        // while www answers the phone's signed-in request with 400 and its
+        // anonymous retry with LOGIN_REQUIRED (0.2.27 phone test).
+        assertEquals(
+            "https://youtubei.googleapis.com/youtubei/v1/player",
+            AndroidPlayerClient.PLAYER_URL_BASE
+        )
+        assertEquals(
+            "https://youtubei.googleapis.com/youtubei/v1/visitor_id?prettyPrint=false",
+            AndroidPlayerClient.VISITOR_ID_URL
+        )
+    }
+
+    @Test
     fun `android client constants match the verified values`() {
         assertEquals("21.26.364", AndroidPlayerClient.ANDROID_CLIENT_VERSION)
         assertEquals(
@@ -179,11 +195,41 @@ class AndroidPlayerClientFetchTest {
     }
 
     @Test
-    fun `player 400 retries anonymously and plays`() {
-        // 0.2.27: a signed-in session can go stale and YouTube answers the
-        // authenticated player request with HTTP 400 (phone's 0.2.26 test) while
-        // the identical request without cookies returns 200 (verified live).
-        // The retry must carry no session at all — and it must play.
+    fun `anonymous GAPIS attempt plays first without a session`() {
+        // 0.2.28: the anonymous attempt is PRIMARY — it is tried first, with no
+        // session at all, because GAPIS answers the anonymous Android player
+        // request with HTTP 200 (verified live 2026-11-28) while the phone's
+        // signed-in www request got HTTP 400 (0.2.27 test). The signed-in
+        // attempt must not run at all when the anonymous one plays.
+        server.enqueue(
+            MockResponse().setBody("""{"responseContext": {"visitorData": "CgtfSmVjVmlnUEVTZg"}}""")
+        )
+        server.enqueue(MockResponse().setBody(playerJson))
+        val signedIn = OkHttpNewPipeDownloader(
+            authCookiesProvider = { "SID=dummySid; SAPISID=AbC123xYz" }
+        )
+        val client = AndroidPlayerClient(
+            signedIn,
+            visitorIdUrl = server.url("/visitor_id").toString(),
+            playerUrlBase = server.url("/player").toString(),
+            anonymousDownloader = OkHttpNewPipeDownloader()
+        )
+        val streams = client.fetch("abc123")
+        assertNull(streams.failure)
+        assertEquals("https://example.test/v18.mp4", streams.videoUrl)
+        assertEquals("android", streams.source)
+
+        assertEquals(2, server.requestCount)
+        server.takeRequest() // visitor_id, anonymous
+        val playerRequest = server.takeRequest()
+        assertNull(playerRequest.getHeader("Cookie"))
+        assertNull(playerRequest.getHeader("Authorization"))
+    }
+
+    @Test
+    fun `anonymous fails but signed-in succeeds plays`() {
+        // 0.2.28: the signed-in attempt is the fallback — it runs only when the
+        // anonymous GAPIS attempt fails, and it can still play.
         server.enqueue(
             MockResponse().setBody("""{"responseContext": {"visitorData": "CgtfSmVjVmlnUEVTZg"}}""")
         )
@@ -207,20 +253,38 @@ class AndroidPlayerClientFetchTest {
         assertEquals("android", streams.source)
 
         assertEquals(4, server.requestCount)
+        server.takeRequest() // visitor_id, anonymous
+        server.takeRequest() // player, anonymous, 400
         server.takeRequest() // visitor_id, signed in
-        val firstPlayer = server.takeRequest()
-        assertTrue(firstPlayer.getHeader("Cookie")!!.contains("SAPISID=AbC123xYz"))
-        assertTrue(firstPlayer.getHeader("Authorization")!!.startsWith("SAPISIDHASH "))
-        server.takeRequest() // visitor_id, anonymous retry
-        val retryPlayer = server.takeRequest()
-        assertNull(retryPlayer.getHeader("Cookie"))
-        assertNull(retryPlayer.getHeader("Authorization"))
+        val fallbackPlayer = server.takeRequest()
+        assertTrue(fallbackPlayer.getHeader("Cookie")!!.contains("SAPISID=AbC123xYz"))
     }
 
     @Test
-    fun `player 400 and anonymous retry also fails returns combined detail`() {
-        // 0.2.27: when the anonymous retry fails too, the detail must carry
-        // both results, so the next diagnosis is not blind.
+    fun `visitor_id failure still tries the player`() {
+        // 0.2.28 (Arena's minor gap): a failed visitor_id must not block the
+        // player attempt — the GAPIS player answers 200 without visitorData
+        // (verified live 2026-11-28 for dQw4w9WgXcQ).
+        server.enqueue(MockResponse().setResponseCode(500))
+        server.enqueue(MockResponse().setBody(playerJson))
+        val client = AndroidPlayerClient(
+            OkHttpNewPipeDownloader(),
+            visitorIdUrl = server.url("/visitor_id").toString(),
+            playerUrlBase = server.url("/player").toString()
+        )
+        val streams = client.fetch("abc123")
+        assertNull(streams.failure)
+        assertEquals("https://example.test/v18.mp4", streams.videoUrl)
+        assertEquals("android", streams.source)
+        assertEquals(2, server.requestCount)
+    }
+
+    @Test
+    fun `both attempts fail returns combined detail`() {
+        // 0.2.28: when the anonymous GAPIS attempt and the signed-in fallback
+        // both fail, the detail must carry both results, so the next diagnosis
+        // is not blind. (0.2.27's "400; anonymous HTTP (400)" shape, with the
+        // anonymous attempt now first.)
         server.enqueue(
             MockResponse().setBody("""{"responseContext": {"visitorData": "CgtfSmVjVmlnUEVTZg"}}""")
         )
@@ -240,7 +304,7 @@ class AndroidPlayerClientFetchTest {
         )
         val streams = client.fetch("abc123")
         assertEquals(YouTubeFailure.HTTP, streams.failure)
-        assertEquals("400; anonymous HTTP (400)", streams.detail)
+        assertEquals("anonymous HTTP (400); signed-in HTTP (400)", streams.detail)
         assertEquals("android", streams.source)
         assertEquals(4, server.requestCount)
     }

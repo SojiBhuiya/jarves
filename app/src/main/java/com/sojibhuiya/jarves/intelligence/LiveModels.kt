@@ -139,6 +139,57 @@ class VoiceSearchModeSettings(private val store: VoiceModeStore = InMemoryVoiceM
 }
 
 /**
+ * 0.2.28: the Live voice the user picks in Settings → Voice. All four are
+ * Google's prebuilt Chirp 3 HD voices (female); Aoede stays the default, so the
+ * video test stays clean — the default voice is unchanged. The three new ones are
+ * the soft voices Sojeeb asked for (2026-11-28) so he can try which sounds best;
+ * switching voice is also this version's fix attempt for the robotic feel.
+ */
+enum class LiveVoice(val voiceName: String, val detail: String) {
+    AOEDE("Aoede", "এখনকার কণ্ঠ — হালকা, প্রাণবন্ত"),
+    ACHERNAR("Achernar", "মেয়ের নরম কণ্ঠ"),
+    VINDEMIATRIX("Vindemiatrix", "মেয়ের কোমল কণ্ঠ"),
+    SULAFAT("Sulafat", "মেয়ের উষ্ণ, মিষ্টি কণ্ঠ");
+
+    companion object {
+        val DEFAULT: LiveVoice = AOEDE
+
+        /** Lenient parse: anything unknown (or blank) falls back to the default. */
+        fun fromStored(raw: String?): LiveVoice {
+            val value = raw?.trim().orEmpty()
+            return entries.firstOrNull { it.voiceName.equals(value, ignoreCase = true) }
+                ?: DEFAULT
+        }
+    }
+}
+
+/** Persistence seam for the chosen [LiveVoice]. SharedPreferences on device. */
+interface LiveVoiceStore {
+    fun read(): String?
+
+    fun write(value: String)
+}
+
+/** Test/no-op store. */
+class InMemoryLiveVoiceStore(private var value: String? = null) : LiveVoiceStore {
+    override fun read(): String? = value
+
+    override fun write(value: String) {
+        this.value = value
+    }
+}
+
+/** Reads/writes the voice through a [LiveVoiceStore], always returning a usable voice. */
+class LiveVoiceSettings(private val store: LiveVoiceStore = InMemoryLiveVoiceStore()) {
+
+    fun current(): LiveVoice = LiveVoice.fromStored(store.read())
+
+    fun save(voice: LiveVoice) {
+        store.write(voice.voiceName)
+    }
+}
+
+/**
  * Why a Live session ended, in terms the user can act on.
  *
  * Close codes 1007 (invalid payload — e.g. the setup was rejected), 1008 (policy violation — e.g.

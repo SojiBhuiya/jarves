@@ -169,6 +169,8 @@ class OkHttpLiveSearchTransport(
 class LiveSearchSession(
     private val transport: LiveSearchTransport,
     val model: String = LiveModels.SEARCH_NATIVE_AUDIO,
+    /** 0.2.28: the chosen Live voice (Settings → Voice). Default Aoede. */
+    private val voice: LiveVoice = LiveVoice.DEFAULT,
     private val timeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS,
     private val setupTimeoutMillis: Long = DEFAULT_SETUP_TIMEOUT_MILLIS,
     private val clock: () -> Long = { System.currentTimeMillis() },
@@ -484,7 +486,7 @@ class LiveSearchSession(
 
     /** Setup frame: built-in Google Search only, no function declarations. */
     fun setupFrame(): String =
-        LiveSessionConfig.searchSessionSetupJson(model = model, voiceName = LiveModels.VOICE_NAME)
+        LiveSessionConfig.searchSessionSetupJson(model = model, voiceName = voice.voiceName)
 
     /** One text turn with `turnComplete = true`, sent only after `setupComplete`. */
     fun textTurn(query: String): String = LiveSessionConfig.clientContentJson(query, turnComplete = true)

@@ -113,6 +113,9 @@ import com.sojibhuiya.jarves.storage.AndroidMicSensitivityStore
 import com.sojibhuiya.jarves.storage.AndroidLivePingStore
 import com.sojibhuiya.jarves.intelligence.LivePingSetting
 import com.sojibhuiya.jarves.intelligence.LivePingSettings
+import com.sojibhuiya.jarves.intelligence.LiveVoice
+import com.sojibhuiya.jarves.intelligence.LiveVoiceSettings
+import com.sojibhuiya.jarves.storage.AndroidLiveVoiceStore
 import com.sojibhuiya.jarves.system.AndroidLiveWakeLock
 import com.sojibhuiya.jarves.system.AndroidNetworkMonitor
 import com.sojibhuiya.jarves.system.SessionEnvironmentReader
@@ -153,6 +156,10 @@ private fun AgiApp() {
     // Settings selector and the session start can never disagree.
     val modeSettings = remember { VoiceSearchModeSettings(AndroidVoiceModeStore(context.applicationContext)) }
     var voiceMode by remember { mutableStateOf(modeSettings.current()) }
+    // 0.2.28: the Live voice is read once from its own prefs file and kept in state, like the
+    // mode, so Settings and the session start can never disagree. Default Aoede.
+    val voiceSettings = remember { LiveVoiceSettings(AndroidLiveVoiceStore(context.applicationContext)) }
+    var liveVoice by remember { mutableStateOf(voiceSettings.current()) }
     // 0.2.8: mic sensitivity is read once, like the mode, so Settings and the session agree.
     val micSettings = remember { MicSensitivitySettings(AndroidMicSensitivityStore(context.applicationContext)) }
     var micSensitivity by remember { mutableStateOf(micSettings.current()) }
@@ -479,7 +486,12 @@ private fun AgiApp() {
                 // The REST GroundedSearchClient is deliberately NOT wired here; it stays in the
                 // code base as a fallback but is off the default path.
                 searchBackend = if (voiceMode.usesSecondSearchSession) {
-                    CachedSearchBackend(LiveSearchSession(OkHttpLiveSearchTransport(credentialKey)))
+                    CachedSearchBackend(
+                        LiveSearchSession(
+                            OkHttpLiveSearchTransport(credentialKey),
+                            voice = liveVoice
+                        )
+                    )
                 } else {
                     null
                 },
@@ -518,6 +530,7 @@ private fun AgiApp() {
                     }
                 },
                 mode = voiceMode,
+                voice = liveVoice,
                 micSensitivity = micSensitivity,
                 environmentProvider = environmentReader,
                 networkMonitor = networkMonitor,
@@ -726,6 +739,7 @@ private fun AgiApp() {
                             onBack = { screen = JarvesNavigation.HOME },
                             onOpenApiProviders = { screen = JarvesNavigation.API_PROVIDERS },
                             voiceMode = voiceMode,
+                            liveVoice = liveVoice,
                             micSensitivity = micSensitivity,
                             onSelectMicSensitivity = { chosen ->
                                 micSensitivity = chosen
@@ -742,6 +756,11 @@ private fun AgiApp() {
                                 voiceMode = chosen
                                 modeSettings.save(chosen)
                                 status = "Voice and search mode: ${chosen.label} — পরের সেশন থেকে কার্যকর"
+                            },
+                            onSelectVoice = { chosen ->
+                                liveVoice = chosen
+                                voiceSettings.save(chosen)
+                                status = "Voice: ${chosen.voiceName} — পরের সেশন থেকে কার্যকর"
                             },
                             onSaveName = { newName ->
                                 scope.launch {
@@ -910,6 +929,9 @@ private fun SettingsScreen(
     onSaveName: (String) -> Unit,
     voiceMode: VoiceSearchMode = VoiceSearchMode.DEFAULT,
     onSelectMode: (VoiceSearchMode) -> Unit = {},
+    // 0.2.28: the chosen Live voice; default Aoede.
+    liveVoice: LiveVoice = LiveVoice.DEFAULT,
+    onSelectVoice: (LiveVoice) -> Unit = {},
     micSensitivity: MicSensitivity = MicSensitivity.DEFAULT,
     onSelectMicSensitivity: (MicSensitivity) -> Unit = {},
     // 0.2.13 (task 3): the hidden ping experiment, 0 = off.
@@ -925,7 +947,8 @@ private fun SettingsScreen(
     val context = LocalContext.current
     val diagnostics = buildString {
         append("Jarves $appVersionName").append('\n')
-        append("mode=").append(voiceMode.label).append(" | mic=").append(micSensitivity.label).append('\n')
+        append("mode=").append(voiceMode.label).append(" | mic=").append(micSensitivity.label)
+            .append(" | voice=").append(liveVoice.voiceName).append('\n')
         append(lastAutoTrace).append('\n')
         append("--- শেষ সেশন ---").append('\n')
         append(lastEndDiagnostics).append('\n')
@@ -1046,6 +1069,24 @@ private fun SettingsScreen(
                         mode = entry,
                         selected = entry == voiceMode,
                         onSelect = { onSelectMode(entry) }
+                    )
+                }
+            }
+        }
+
+        // ---------------- 3b. Voice (0.2.28) ------------------------------------------
+        // The Live voice, listed inline like the mode above — no new screen, no redesign.
+        // Default Aoede; the three soft voices are the ones Sojeeb asked to try.
+        Spacer(Modifier.height(JarvesDimens.SectionGap))
+        SectionLabel("Voice")
+        Spacer(Modifier.height(8.dp))
+        JarvesCard {
+            Column(Modifier.padding(horizontal = JarvesDimens.CardPadding)) {
+                LiveVoice.entries.forEach { entry ->
+                    LiveVoiceRow(
+                        voice = entry,
+                        selected = entry == liveVoice,
+                        onSelect = { onSelectVoice(entry) }
                     )
                 }
             }
@@ -1411,6 +1452,52 @@ private fun VoiceModeRow(
             Text(mode.label, color = JarvesColors.TextPrimary, fontSize = 13.5.sp)
             Text(mode.detail, color = JarvesColors.TextMuted, fontSize = 10.5.sp, lineHeight = 14.sp)
             Text(mode.model, color = JarvesColors.TextMuted, fontSize = 10.sp)
+        }
+    }
+}
+
+/**
+ * 0.2.28: one selectable Live voice. Radio-style, like [VoiceModeRow]: the dot shows
+ * which voice the next session uses.
+ */
+@Composable
+private fun LiveVoiceRow(
+    voice: LiveVoice,
+    selected: Boolean,
+    onSelect: () -> Unit
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = JarvesDimens.TouchTarget)
+            .clickable(onClickLabel = "Select ${voice.voiceName} voice", onClick = onSelect)
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            Modifier
+                .size(16.dp)
+                .clip(androidx.compose.foundation.shape.CircleShape)
+                .border(
+                    1.5.dp,
+                    if (selected) JarvesColors.Accent else JarvesColors.Border,
+                    androidx.compose.foundation.shape.CircleShape
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            if (selected) {
+                Box(
+                    Modifier
+                        .size(8.dp)
+                        .clip(androidx.compose.foundation.shape.CircleShape)
+                        .background(JarvesColors.Accent)
+                )
+            }
+        }
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Text(voice.voiceName, color = JarvesColors.TextPrimary, fontSize = 13.5.sp)
+            Text(voice.detail, color = JarvesColors.TextMuted, fontSize = 10.5.sp, lineHeight = 14.sp)
         }
     }
 }
