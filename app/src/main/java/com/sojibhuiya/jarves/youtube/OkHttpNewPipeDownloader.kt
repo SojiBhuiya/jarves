@@ -1,6 +1,7 @@
 package com.sojibhuiya.jarves.youtube
 
 import java.util.concurrent.TimeUnit
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -20,6 +21,13 @@ import org.schabi.newpipe.extractor.downloader.Response
  * every request — Cookie + SAPISIDHASH + Origin + X-Origin. A bare Cookie alone is
  * ignored by InnerTube, so the hash is what makes the session count. Requests made
  * without a session are unchanged.
+ *
+ * 0.2.29: the origin is derived from the request host ([originForUrl]) — GAPIS
+ * requests carry Origin/X-Origin = https://youtubei.googleapis.com, everything else
+ * keeps the www origin. YouTube rejects a signed-in GAPIS request with HTTP 400
+ * ("Origin doesn't match Host for XD3") when it carries the www origin (proven by
+ * VM replay 2026-11-29: the same request returns 200 once the origin matches the
+ * GAPIS host). The SAPISIDHASH is computed for the same origin.
  */
 class OkHttpNewPipeDownloader(
     private val client: OkHttpClient = defaultClient(),
@@ -36,6 +44,19 @@ class OkHttpNewPipeDownloader(
             .readTimeout(60, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)
             .build()
+
+        /** 0.2.29: the GAPIS host and the origin a signed-in request to it must carry. */
+        const val GAPIS_HOST = "youtubei.googleapis.com"
+        const val GAPIS_ORIGIN = "https://youtubei.googleapis.com"
+
+        /**
+         * 0.2.29: the origin for a request URL — the GAPIS origin only when the URL's
+         * host is the GAPIS host, the www origin ([YouTubeAuth.ORIGIN]) everywhere
+         * else (including an unparseable URL). The origin must match the host, or
+         * YouTube rejects the signed-in request with HTTP 400.
+         */
+        fun originForUrl(url: String): String =
+            if (url.toHttpUrlOrNull()?.host == GAPIS_HOST) GAPIS_ORIGIN else YouTubeAuth.ORIGIN
     }
 
     override fun execute(request: Request): Response {
@@ -50,10 +71,13 @@ class OkHttpNewPipeDownloader(
         // 0.2.25: attach the signed-in session, if any. A Cookie the extractor already
         // set (e.g. the WEB consent cookie) is kept and the session cookies are
         // appended to it, never replaced.
+        // 0.2.29: the origin must match the request host — a signed-in GAPIS
+        // request carrying the www origin gets HTTP 400 ("Origin doesn't match
+        // Host for XD3"). The hash is computed for the same origin.
         val authCookies = runCatching { authCookiesProvider() }.getOrNull()
             ?.takeIf { it.isNotBlank() }
         if (authCookies != null) {
-            val headers = YouTubeAuth.authHeaders(authCookies)
+            val headers = YouTubeAuth.authHeaders(authCookies, originForUrl(request.url()))
             val mergedCookie = if (existingCookie.isNullOrBlank()) {
                 headers["Cookie"]
             } else {
